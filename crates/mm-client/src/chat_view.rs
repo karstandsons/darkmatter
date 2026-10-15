@@ -1,14 +1,15 @@
 //! Chat screen views.
 
 use iced::widget::{
-    Column, button, center, column, container, hover, image, markdown, row, rule, scrollable, space, stack, text,
-    text_input,
+    Column, button, center, column, container, hover, image, markdown, pane_grid, row, rule, scrollable, space, stack,
+    text, text_input,
 };
 use iced::{Element, Length, Theme};
 use mm_api::models::{Channel, ChannelType, FileInfo, Post};
 
 use crate::app::Message;
-use crate::chat::{COMPOSER, Chat, THREAD, THREAD_COMPOSER, TIMELINE};
+use crate::chat::{Chat, THREAD};
+use crate::pane::PaneView;
 use crate::media;
 use crate::store::Entry;
 use crate::style::{Colors, bold, italic};
@@ -25,7 +26,7 @@ pub const INLINE_REPLIES: usize = 5;
 const PANE_FOOTER: iced::Padding = iced::Padding { top: 0.0, right: 20.0, bottom: 16.0, left: 20.0 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Pane {
+enum Kind {
     Channel,
     Thread,
 }
@@ -36,7 +37,11 @@ impl Chat {
         if self.store.teams.len() > 1 {
             layout = layout.push(self.team_rail(c));
         }
-        layout = layout.push(self.sidebar(c)).push(self.main(c, theme));
+        let grid = pane_grid::PaneGrid::new(&self.panes, |pane, pv, _| {
+            pane_grid::Content::new(self.main(pv, c, theme).map(move |m| Message::InPane(pane, Box::new(m))))
+        })
+        .on_click(Message::FocusPane);
+        layout = layout.push(self.sidebar(c)).push(grid);
         if let Some(root) = self.pane_thread() {
             layout = layout.push(rule::vertical(1)).push(self.thread_pane(root, c, theme));
         } else if let Some(panel) = &self.panel {
@@ -102,7 +107,7 @@ impl Chat {
                 .width(Length::Fill)
                 .padding([5, 10])
                 .on_press(Message::SelectChannel(ch.id.clone()))
-                .style(c.row_button(ch.id == self.channel))
+                .style(c.row_button(ch.id == self.focused().channel))
                 .into()
         };
         let section = |label: &'static str| text(label).size(11).font(bold()).color(c.muted);
@@ -149,8 +154,8 @@ impl Chat {
         .into()
     }
 
-    fn main<'a>(&'a self, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
-        let Some(channel) = self.store.channels.get(&self.channel) else {
+    fn main<'a>(&'a self, pv: &'a PaneView, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
+        let Some(channel) = self.store.channels.get(&pv.channel) else {
             return center(text("No channel selected").color(c.muted)).into();
         };
         let mut header = row![text(self.store.channel_label(channel)).size(17).font(bold()).color(c.fg_bright)]
@@ -171,27 +176,27 @@ impl Chat {
             );
         }
 
-        let timeline: Element<'_, Message> = match self.store.timelines.get(&self.channel) {
+        let timeline: Element<'_, Message> = match self.store.timelines.get(&pv.channel) {
             Some(t) if t.loaded => {
                 let top = if t.has_more {
                     if t.loading_older { "Loading older messages…".to_string() } else { String::new() }
                 } else {
                     format!("Beginning of {}", self.store.channel_label(channel))
                 };
-                self.timeline(&t.entries, Some(top), Pane::Channel, c, theme)
+                self.timeline(pv, &t.entries, Some(top), Kind::Channel, c, theme)
             }
             _ => center(text("Loading…").color(c.muted)).into(),
         };
 
-        let composer = text_input(&format!("Message {}", self.store.channel_label(channel)), self.draft())
-            .id(COMPOSER)
+        let composer = text_input(&format!("Message {}", self.store.channel_label(channel)), self.draft_in(pv))
+            .id(pv.composer())
             .on_input(Message::Draft)
             .on_submit(Message::Send)
             .padding(12)
             .style(c.input());
 
         let mut col = column![container(header).padding([12, 20]), rule::horizontal(1), timeline];
-        if self.store.timelines.get(&self.channel).is_some_and(|t| t.has_newer) {
+        if self.store.timelines.get(&pv.channel).is_some_and(|t| t.has_newer) {
             col = col.push(
                 container(
                     row![
@@ -212,9 +217,9 @@ impl Chat {
             .on_press(Message::PickFiles)
             .style(c.chip(false));
         let composer = row![attach, composer].spacing(8).align_y(iced::Center);
-        let typing = self.editing_note(&self.channel, c).unwrap_or_else(|| self.typing_line(&self.channel, "", c));
+        let typing = self.editing_note(&pv.channel, c).unwrap_or_else(|| self.typing_line(&pv.channel, "", c));
         let mut footer = column![typing].spacing(6);
-        if let Some(chips) = self.attachment_chips(c) {
+        if let Some(chips) = self.attachment_chips(&pv.channel, c) {
             footer = footer.push(chips);
         }
         col.push(container(footer.push(composer)).padding(PANE_FOOTER))
@@ -240,11 +245,11 @@ impl Chat {
         .align_y(iced::Center);
 
         let body: Element<'_, Message> = match self.store.threads.get(root_id) {
-            Some(t) if t.loaded => self.timeline(&t.entries, None, Pane::Thread, c, theme),
+            Some(t) if t.loaded => self.timeline(self.focused(), &t.entries, None, Kind::Thread, c, theme),
             _ => center(text("Loading…").color(c.muted)).into(),
         };
-        let composer = text_input("Reply…", self.thread_draft())
-            .id(THREAD_COMPOSER)
+        let composer = text_input("Reply…", self.thread_draft_in(self.focused()))
+            .id(self.focused().thread_composer())
             .on_input(Message::ThreadDraft)
             .on_submit(Message::SendReply)
             .padding(12)
@@ -268,11 +273,11 @@ impl Chat {
         .into()
     }
 
-    fn attachment_chips(&self, c: Colors) -> Option<Element<'_, Message>> {
+    fn attachment_chips(&self, channel: &str, c: Colors) -> Option<Element<'_, Message>> {
         let chips: Vec<Element<'_, Message>> = self
             .attachments
             .iter()
-            .filter(|a| a.channel_id == self.channel)
+            .filter(|a| a.channel_id == channel)
             .map(|a| {
                 let (status, color) = match &a.state {
                     media::Upload::Uploading => ("uploading…".to_string(), c.muted),
@@ -321,9 +326,10 @@ impl Chat {
 
     fn timeline<'a>(
         &'a self,
+        pv: &'a PaneView,
         entries: &'a [Entry],
         top: Option<String>,
-        pane: Pane,
+        kind: Kind,
         c: Colors,
         theme: &'a Theme,
     ) -> Element<'a, Message> {
@@ -336,7 +342,7 @@ impl Chat {
         }
         let mut prev: Option<&Post> = None;
         // "New messages" goes above the first post from someone else since the last visit.
-        let new_since = (pane == Pane::Channel).then(|| self.viewed_before.get(&self.channel)).flatten();
+        let new_since = (kind == Kind::Channel).then(|| self.viewed_before.get(&pv.channel)).flatten();
         let first_new = new_since.and_then(|since| {
             entries
                 .iter()
@@ -374,38 +380,38 @@ impl Chat {
                     // In a thread, keep the root post visually separate from its replies.
                     && p.is_reply() == post.is_reply()
             });
-            col = col.push(self.post_view(entry, continued, pane, c, md_settings));
+            col = col.push(self.post_view(pv, entry, continued, kind, c, md_settings));
             prev = Some(post);
-            if pane == Pane::Channel && self.expanded.contains(&post.id) && self.is_inline(&post.id) {
-                col = col.push(self.inline_thread(&post.id, c, md_settings));
+            if kind == Kind::Channel && pv.expanded.contains(&post.id) && self.is_inline_in(pv, &post.id) {
+                col = col.push(self.inline_thread(pv, &post.id, c, md_settings));
                 // Whatever follows the thread starts a fresh group.
                 prev = None;
             }
         }
-        let id = match pane {
-            Pane::Channel => TIMELINE,
-            Pane::Thread => THREAD,
+        let id = match kind {
+            Kind::Channel => pv.timeline(),
+            Kind::Thread => iced::widget::Id::from(THREAD),
         };
         // Shrink to the messages and sit at the bottom, so a short channel's
         // few messages are next to the composer rather than at the top.
         let scroll = scrollable(col).id(id).anchor_bottom().height(Length::Shrink);
-        let scroll = match pane {
-            Pane::Channel => scroll.on_scroll(Message::TimelineScrolled),
-            Pane::Thread => scroll,
+        let scroll = match kind {
+            Kind::Channel => scroll.on_scroll(Message::TimelineScrolled),
+            Kind::Thread => scroll,
         };
         container(scroll).height(Length::Fill).align_bottom(Length::Fill).into()
     }
 
     /// Replies shown under their root, indented behind an accent bar, with the
     /// reply box when this is the thread being replied to.
-    fn inline_thread<'a>(&'a self, root_id: &'a str, c: Colors, md: markdown::Settings) -> Element<'a, Message> {
+    fn inline_thread<'a>(&'a self, pv: &'a PaneView, root_id: &'a str, c: Colors, md: markdown::Settings) -> Element<'a, Message> {
         // Replies get their own column so the reply box keeps its place in the
         // widget tree (and its focus) when they finish loading.
         let mut replies = Column::new().spacing(2);
         match self.store.threads.get(root_id) {
             Some(t) if t.loaded => {
                 let all: Vec<&Entry> = t.entries.iter().filter(|e| e.post.is_reply()).collect();
-                let hidden = if self.all_replies.contains(root_id) { 0 } else { all.len().saturating_sub(INLINE_REPLIES) };
+                let hidden = if pv.all_replies.contains(root_id) { 0 } else { all.len().saturating_sub(INLINE_REPLIES) };
                 if hidden > 0 {
                     let label = if hidden == 1 { "↑ Show 1 earlier reply".to_string() } else { format!("↑ Show {hidden} earlier replies") };
                     replies = replies.push(
@@ -419,16 +425,16 @@ impl Chat {
                 for entry in &all[hidden..] {
                     let post = &entry.post;
                     let continued = prev.is_some_and(|p| p.user_id == post.user_id && post.create_at - p.create_at < 5 * 60 * 1000);
-                    replies = replies.push(self.post_view(entry, continued, Pane::Thread, c, md));
+                    replies = replies.push(self.post_view(pv, entry, continued, Kind::Thread, c, md));
                     prev = Some(post);
                 }
             }
             _ => replies = replies.push(text("Loading replies…").size(12).color(c.muted)),
         }
         let mut col = column![replies];
-        if self.thread.as_deref() == Some(root_id) {
-            let composer = text_input("Reply…", self.thread_draft())
-                .id(THREAD_COMPOSER)
+        if pv.thread.as_deref() == Some(root_id) {
+            let composer = text_input("Reply…", self.thread_draft_in(pv))
+                .id(pv.thread_composer())
                 .on_input(Message::ThreadDraft)
                 .on_submit(Message::SendReply)
                 .padding(10)
@@ -459,9 +465,10 @@ impl Chat {
 
     fn post_view<'a>(
         &'a self,
+        pv: &'a PaneView,
         entry: &'a Entry,
         continued: bool,
-        pane: Pane,
+        kind: Kind,
         c: Colors,
         md: markdown::Settings,
     ) -> Element<'a, Message> {
@@ -486,8 +493,8 @@ impl Chat {
             body = body.push(reactions);
         }
         let thread_root = if post.is_reply() { &post.root_id } else { &post.id };
-        if pane == Pane::Channel && !post.is_reply() && post.reply_count > 0 {
-            let open = self.expanded.contains(&post.id) && self.is_inline(&post.id);
+        if kind == Kind::Channel && !post.is_reply() && post.reply_count > 0 {
+            let open = pv.expanded.contains(&post.id) && self.is_inline_in(pv, &post.id);
             let label = match (open, post.reply_count) {
                 (true, _) => "▾ Hide replies".to_string(),
                 (false, 1) => "💬 1 reply".to_string(),
@@ -517,7 +524,7 @@ impl Chat {
         // Actions appear in the top-right corner on hover.
         let chip = |label: &'static str, msg: Message| button(text(label).size(12)).padding([2, 8]).on_press(msg).style(c.chip(false));
         let mut actions = row![chip("☺+", Message::OpenEmoji(post.id.clone()))].spacing(4);
-        if pane == Pane::Channel {
+        if kind == Kind::Channel {
             actions = actions.push(chip("↩ Reply", Message::OpenThread(thread_root.clone())));
         }
         if post.user_id == self.store.me.id {
@@ -529,17 +536,17 @@ impl Chat {
                     .on_press(Message::DeletePost(post.id.clone()))
                     .style(c.chip(confirming)),
             );
-        } else if pane == Pane::Channel {
+        } else if kind == Kind::Channel {
             actions = actions.push(chip("Unread", Message::MarkUnread(post.id.clone())));
         }
         let post_el = hover(content, container(actions).width(Length::Fill).align_x(iced::alignment::Horizontal::Right));
-        let highlighted = self.highlight.as_ref().is_some_and(|(id, _)| *id == post.id);
-        if !highlighted && self.jump_target.as_deref() != Some(post.id.as_str()) {
+        let highlighted = pv.highlight.as_ref().is_some_and(|(id, _)| *id == post.id);
+        if !highlighted && pv.jump_target.as_deref() != Some(post.id.as_str()) {
             return post_el;
         }
         let mut wrapped = container(post_el).width(Length::Fill);
-        if self.jump_target.as_deref() == Some(post.id.as_str()) {
-            wrapped = wrapped.id(crate::chat::JUMP_TARGET);
+        if pv.jump_target.as_deref() == Some(post.id.as_str()) {
+            wrapped = wrapped.id(pv.jump_target_id());
         }
         if highlighted {
             let tint = iced::Color { a: 0.18, ..c.accent };

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use iced::Task;
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::operation;
+use iced::widget::{Id, operation, pane_grid};
 use mm_api::models::{NewPost, Post};
 use mm_api::{Client, PostsQuery, ws};
 
@@ -13,16 +13,13 @@ use crate::app::{Message, bootstrap, err};
 use crate::session::Session;
 use crate::emoji_picker::{self, EmojiPicker};
 use crate::media;
+use crate::pane::{Jump, PaneView};
 use crate::store::Store;
 use crate::switcher::{self, Item, Switcher};
 
-pub const COMPOSER: &str = "composer";
-pub const TIMELINE: &str = "timeline";
+/// The side thread pane's scrollable (only the focused pane's thread shows there).
 pub const THREAD: &str = "thread";
-pub const THREAD_COMPOSER: &str = "thread-composer";
 pub const SEARCH_INPUT: &str = "search-input";
-/// The post being jumped to gets this container id so it can be found.
-pub const JUMP_TARGET: &str = "jump-target";
 
 /// What the right side shows when no thread is open on top of it.
 pub enum Panel {
@@ -44,21 +41,18 @@ const HIGHLIGHT_FOR: Duration = Duration::from_secs(4);
 /// Posts loaded on each side of a jump target that isn't already loaded.
 const AROUND: u32 = 30;
 
-/// A message being jumped to. If its thread root isn't loaded, the channel
-/// shows the stretch around it instead (paging newer as you scroll down).
-pub struct Jump {
-    channel: String,
-    root: String,
-    post: String,
-    window_requested: bool,
-}
 
 pub struct Chat {
     pub session: Session,
     pub client: Client,
     pub store: Store,
     pub team: String,
-    pub channel: String,
+    /// The tiled views. `focus` gets keys and sidebar picks; `cur` is the pane
+    /// the message being handled belongs to (the focused one unless routed).
+    pub panes: pane_grid::State<PaneView>,
+    pub focus: pane_grid::Pane,
+    cur: pane_grid::Pane,
+    next_pane: usize,
     /// Unsent text per composer: channel id, or `thread:<root id>`.
     pub drafts: HashMap<String, String>,
     /// The last message handed to the server, restored to its composer if sending fails.
@@ -66,25 +60,8 @@ pub struct Chat {
     pub online: bool,
     /// (channel id, user id, thread root or "") -> when they last typed.
     pub typing: HashMap<(String, String, String), Instant>,
-    /// Root post id of the thread being read and replied to: in the right pane,
-    /// or expanded inline with the reply box under it.
-    pub thread: Option<String>,
     /// Threads expand under their message instead of opening a side pane.
     pub inline_threads: bool,
-    /// Roots whose replies are expanded inline.
-    pub expanded: HashSet<String>,
-    /// Inline threads showing every reply rather than the latest few.
-    pub all_replies: HashSet<String>,
-    pub jump: Option<Jump>,
-    /// The post scrolled to, and until when it's highlighted.
-    pub highlight: Option<(String, Instant)>,
-    /// The post whose position the jump scrolls to (the reply itself inline,
-    /// or its root when threads open in the pane).
-    pub jump_target: Option<String>,
-    /// Latest timeline viewport, and while a thread expands or collapses above
-    /// the bottom, the (content height, offset from bottom) to keep the top still.
-    viewport: Option<iced::widget::scrollable::Viewport>,
-    hold_top: Option<(f32, f32)>,
     pub switcher: Option<Switcher>,
     pub panel: Option<Panel>,
     pub media: media::Cache,
@@ -117,27 +94,55 @@ fn thread_key(root: &str) -> String {
 }
 
 impl Chat {
+    /// The pane the current message is for.
+    pub fn pv(&self) -> &PaneView {
+        self.panes.get(self.cur).expect("current pane exists")
+    }
+
+    pub fn pv_mut(&mut self) -> &mut PaneView {
+        self.panes.get_mut(self.cur).expect("current pane exists")
+    }
+
+    /// Whether any pane shows `channel`.
+    pub fn showing(&self, channel: &str) -> bool {
+        self.panes.iter().any(|(_, p)| p.channel == channel)
+    }
+
+    /// The pane with keyboard focus.
+    pub fn focused(&self) -> &PaneView {
+        self.panes.get(self.focus).expect("focused pane exists")
+    }
+
     pub fn draft(&self) -> &str {
-        self.drafts.get(&self.channel).map_or("", String::as_str)
+        self.draft_in(self.pv())
+    }
+
+    pub fn draft_in(&self, pv: &PaneView) -> &str {
+        self.drafts.get(&pv.channel).map_or("", String::as_str)
     }
 
     /// Whether `root` shows inline: inline layout and it's in the open channel.
     /// Threads from elsewhere (search, the threads inbox) still use the pane.
     pub fn is_inline(&self, root: &str) -> bool {
-        self.inline_threads && self.store.timelines.get(&self.channel).is_some_and(|t| t.entries.iter().any(|e| e.post.id == root))
+        self.is_inline_in(self.pv(), root)
     }
 
-    /// The thread to show in the side pane, if any.
+    pub fn is_inline_in(&self, pv: &PaneView, root: &str) -> bool {
+        self.inline_threads && self.store.timelines.get(&pv.channel).is_some_and(|t| t.entries.iter().any(|e| e.post.id == root))
+    }
+
+    /// The focused pane's thread to show in the side pane, if any.
     pub fn pane_thread(&self) -> Option<&String> {
-        self.thread.as_ref().filter(|r| !self.is_inline(r))
+        let pv = self.focused();
+        pv.thread.as_ref().filter(|r| !self.is_inline_in(pv, r))
     }
 
     pub fn set_inline_threads(&mut self, inline: bool) -> Task<Message> {
         self.inline_threads = inline;
-        match self.thread.clone() {
+        match self.pv().thread.clone() {
             Some(root) if self.is_inline(&root) => {
-                self.expanded.insert(root);
-                operation::focus(THREAD_COMPOSER)
+                self.pv_mut().expanded.insert(root);
+                operation::focus(self.pv().thread_composer())
             }
             _ => Task::none(),
         }
@@ -146,20 +151,23 @@ impl Chat {
     /// Take the next step of a pending jump: load older history until the
     /// thread root is in the channel, then highlight the post and scroll to it.
     fn continue_jump(&mut self) -> Task<Message> {
-        let Some(j) = &mut self.jump else { return Task::none() };
-        if self.channel != j.channel {
-            self.jump = None; // went somewhere else meanwhile
+        let Some(j) = &self.pv().jump else { return Task::none() };
+        let (channel, root, requested) = (j.channel.clone(), j.root.clone(), j.window_requested);
+        if self.pv().channel != channel {
+            self.pv_mut().jump = None; // went somewhere else meanwhile
             return Task::none();
         }
-        let found = self.store.timelines.get(&j.channel).is_some_and(|t| t.loaded && t.entries.iter().any(|e| e.post.id == j.root));
+        let found = self.store.timelines.get(&channel).is_some_and(|t| t.loaded && t.entries.iter().any(|e| e.post.id == root));
         if !found {
-            if j.window_requested {
-                self.jump = None;
+            if requested {
+                self.pv_mut().jump = None;
                 self.error = Some("That message isn't in the channel any more".into());
                 return Task::none();
             }
-            j.window_requested = true;
-            let (client, channel, root) = (self.client.clone(), j.channel.clone(), j.root.clone());
+            if let Some(j) = &mut self.pv_mut().jump {
+                j.window_requested = true;
+            }
+            let client = self.client.clone();
             return Task::perform(
                 async move {
                     let before = client.posts(&channel, PostsQuery::Before { post_id: root.clone(), per_page: AROUND }, true);
@@ -171,27 +179,27 @@ impl Chat {
                 |(channel, root, r)| Message::JumpWindow(channel, root, r),
             );
         }
-        let Some(Jump { root, post, .. }) = self.jump.take() else { return Task::none() };
-        self.hold_top = None;
-        self.highlight = Some((post.clone(), Instant::now() + HIGHLIGHT_FOR));
+        let Some(Jump { root, post, .. }) = self.pv_mut().jump.take() else { return Task::none() };
+        self.pv_mut().hold_top = None;
+        self.pv_mut().highlight = Some((post.clone(), Instant::now() + HIGHLIGHT_FOR));
         if root == post {
-            self.jump_target = Some(post);
-            return locate();
+            self.pv_mut().jump_target = Some(post);
+            return locate(self.pv());
         }
         if self.inline_threads {
             // Show the whole thread so the reply is there to scroll to.
-            self.jump_target = Some(post);
-            self.expanded.insert(root.clone());
-            self.all_replies.insert(root.clone());
-            return if self.store.threads.get(&root).is_some_and(|t| t.loaded) { locate() } else { self.load_thread(root) };
+            self.pv_mut().jump_target = Some(post);
+            self.pv_mut().expanded.insert(root.clone());
+            self.pv_mut().all_replies.insert(root.clone());
+            return if self.store.threads.get(&root).is_some_and(|t| t.loaded) { locate(self.pv()) } else { self.load_thread(root) };
         }
-        self.jump_target = Some(root.clone());
-        Task::batch([self.update(Message::OpenThread(root)), locate()])
+        self.pv_mut().jump_target = Some(root.clone());
+        Task::batch([self.update(Message::OpenThread(root)), locate(self.pv())])
     }
 
     /// Fetch the page after the newest loaded post, while viewing an older stretch.
     fn load_newer(&mut self) -> Task<Message> {
-        let id = self.channel.clone();
+        let id = self.pv().channel.clone();
         let Some(newest) = self.store.newest(&id).map(|p| p.id.clone()) else { return Task::none() };
         let Some(t) = self.store.timelines.get_mut(&id) else { return Task::none() };
         if !t.has_newer || t.loading_newer {
@@ -210,10 +218,11 @@ impl Chat {
 
     /// Drop an older stretch and show the channel's newest messages.
     fn reload_latest(&mut self) -> Task<Message> {
-        self.store.timelines.remove(&self.channel);
-        self.hold_top = None;
-        let id = self.channel.clone();
-        Task::batch([self.load_history(id), to_latest(TIMELINE)])
+        let channel = self.pv().channel.clone();
+        self.store.timelines.remove(&channel);
+        self.pv_mut().hold_top = None;
+        let id = self.pv().channel.clone();
+        Task::batch([self.load_history(id), to_latest(self.pv().timeline())])
     }
 
     fn load_thread(&self, root: String) -> Task<Message> {
@@ -232,15 +241,19 @@ impl Chat {
     /// otherwise push it up and out of view). The newest message is the
     /// exception when you're at the bottom: staying there keeps its reply box in view.
     fn hold_view(&mut self, root: &str) {
-        let newest = self.store.timelines.get(&self.channel).and_then(|t| t.entries.last()).is_some_and(|e| e.post.id == root);
-        self.hold_top = self
-            .viewport
+        let newest = self.store.timelines.get(&self.pv().channel).and_then(|t| t.entries.last()).is_some_and(|e| e.post.id == root);
+        let viewport = self.pv().viewport;
+        self.pv_mut().hold_top = viewport
             .map(|v| (v.content_bounds().height, v.absolute_offset().y))
             .filter(|(_, from_bottom)| !newest || *from_bottom > 4.0);
     }
 
     pub fn thread_draft(&self) -> &str {
-        self.thread.as_ref().and_then(|r| self.drafts.get(&thread_key(r))).map_or("", String::as_str)
+        self.thread_draft_in(self.pv())
+    }
+
+    pub fn thread_draft_in(&self, pv: &PaneView) -> &str {
+        pv.thread.as_ref().and_then(|r| self.drafts.get(&thread_key(r))).map_or("", String::as_str)
     }
 
     /// Build the chat screen from a fresh bootstrap. The returned task does follow-up loads.
@@ -251,25 +264,21 @@ impl Chat {
         store.add_channels(b.channels, b.members);
         store.add_users(b.users);
         let team = store.teams.first().map(|t| t.id.clone()).unwrap_or_default();
+        let (panes, first) = pane_grid::State::new(PaneView::new(0, String::new()));
         let chat = Chat {
             session: b.session,
             client,
             store,
             team,
-            channel: String::new(),
+            panes,
+            focus: first,
+            cur: first,
+            next_pane: 1,
             drafts: HashMap::new(),
             sending: None,
             online: false,
             typing: HashMap::new(),
-            thread: None,
             inline_threads: true,
-            expanded: HashSet::new(),
-            all_replies: HashSet::new(),
-            jump: None,
-            highlight: None,
-            jump_target: None,
-            viewport: None,
-            hold_top: None,
             switcher: None,
             panel: None,
             media: media::Cache::default(),
@@ -325,12 +334,12 @@ impl Chat {
     }
 
     fn select_channel(&mut self, id: String) -> Task<Message> {
-        if self.thread.as_ref().is_some_and(|r| self.is_inline(r)) {
-            self.thread = None;
+        if self.pv().thread.as_ref().is_some_and(|r| self.is_inline(r)) {
+            self.pv_mut().thread = None;
         }
-        self.viewport = None;
-        self.hold_top = None;
-        let prev = std::mem::replace(&mut self.channel, id.clone());
+        self.pv_mut().viewport = None;
+        self.pv_mut().hold_top = None;
+        let prev = std::mem::replace(&mut self.pv_mut().channel, id.clone());
         self.marked_unread.remove(&id);
         if let Some(m) = self.store.members.get_mut(&id) {
             // Unread posts are the ones after this; remember it before marking read.
@@ -348,7 +357,7 @@ impl Chat {
             let prev = if self.marked_unread.remove(&prev) { None } else { Some(prev) };
             Task::future(async move { client.view_channel(&id, prev.as_deref()).await }).discard()
         };
-        let jumping = self.jump.as_ref().is_some_and(|j| j.channel == id);
+        let jumping = self.pv().jump.as_ref().is_some_and(|j| j.channel == id);
         // Coming back to a channel left on an older stretch shows the latest again.
         if !jumping && self.store.timelines.get(&id).is_some_and(|t| t.has_newer) {
             self.store.timelines.remove(&id);
@@ -356,7 +365,7 @@ impl Chat {
         let loaded = self.store.timelines.get(&id).is_some_and(|t| t.loaded);
         // A jump loads its own stretch if the message isn't already here.
         let history = if loaded || jumping { Task::none() } else { self.load_history(id) };
-        Task::batch([view, history, to_latest(TIMELINE), operation::focus(COMPOSER)])
+        Task::batch([view, history, to_latest(self.pv().timeline()), operation::focus(self.pv().composer())])
     }
 
     fn load_history(&self, id: String) -> Task<Message> {
@@ -372,7 +381,7 @@ impl Chat {
 
     /// Fetch the page before the oldest loaded post, once at a time.
     fn load_older(&mut self) -> Task<Message> {
-        let id = self.channel.clone();
+        let id = self.pv().channel.clone();
         let Some(oldest) = self.store.oldest(&id).map(|p| p.id.clone()) else { return Task::none() };
         let Some(t) = self.store.timelines.get_mut(&id) else { return Task::none() };
         if !t.has_more || t.loading_older {
@@ -381,7 +390,7 @@ impl Chat {
         }
         tracing::debug!("loading posts before {oldest} in {id}");
         t.loading_older = true;
-        self.hold_top = None;
+        self.pv_mut().hold_top = None;
         let client = self.client.clone();
         Task::perform(
             async move {
@@ -401,18 +410,18 @@ impl Chat {
         }
         self.cancel_edit();
         let (key, composer) = if post.is_reply() {
-            self.thread = Some(post.root_id.clone());
-            self.expanded.insert(post.root_id.clone());
+            self.pv_mut().thread = Some(post.root_id.clone());
+            self.pv_mut().expanded.insert(post.root_id.clone());
             // Show the reply being edited if it's older than the latest few.
             let newer = self.store.threads.get(&post.root_id).map_or(0, |t| {
                 t.entries.iter().filter(|e| e.post.is_reply() && e.post.create_at > post.create_at).count()
             });
             if newer >= crate::chat_view::INLINE_REPLIES {
-                self.all_replies.insert(post.root_id.clone());
+                self.pv_mut().all_replies.insert(post.root_id.clone());
             }
-            (thread_key(&post.root_id), THREAD_COMPOSER)
+            (thread_key(&post.root_id), self.pv().thread_composer())
         } else {
-            (post.channel_id.clone(), COMPOSER)
+            (post.channel_id.clone(), self.pv().composer())
         };
         let saved_draft = self.drafts.insert(key.clone(), post.message.clone());
         self.editing = Some(Editing { post_id: post.id, key, saved_draft });
@@ -495,20 +504,39 @@ impl Chat {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        let task = self.handle(message);
+        let pane = self.cur;
+        let task = match message {
+            // From a pane's widgets, or a result for it: handle it as that pane.
+            Message::InPane(p, m) => {
+                if self.panes.get(p).is_none() {
+                    return Task::none(); // closed meanwhile
+                }
+                let prev = std::mem::replace(&mut self.cur, p);
+                let task = self.update(*m);
+                self.cur = prev;
+                task
+            }
+            message => self.handle(message),
+        };
+        // Results that belong to a pane find their way back to it.
+        let task = task.map(move |m| m.for_pane(pane));
         Task::batch([task, self.fetch_media()])
     }
 
     /// Avatars, image previews and custom emoji needed by what's on screen
     /// and not fetched yet.
     fn fetch_media(&mut self) -> Task<Message> {
-        // Inline threads are on screen too.
-        let visible: Vec<&String> = [&self.channel].into_iter().chain(self.thread.as_ref()).chain(&self.expanded).collect();
+        // Every pane's channel, and the threads open in them (inline ones are on screen too).
+        let timelines = self.panes.iter().filter_map(|(_, p)| self.store.timelines.get(&p.channel));
+        let threads = self
+            .panes
+            .iter()
+            .flat_map(|(_, p)| p.thread.iter().chain(&p.expanded))
+            .filter_map(|root| self.store.threads.get(root));
         let mut keys = Vec::new();
         let mut learned = Vec::new();
-        for (i, id) in visible.into_iter().enumerate() {
-            let timeline = if i == 0 { self.store.timelines.get(id) } else { self.store.threads.get(id) };
-            for post in timeline.into_iter().flat_map(|t| &t.entries).map(|e| &e.post) {
+        for timeline in timelines.chain(threads).collect::<Vec<_>>() {
+            for post in timeline.entries.iter().map(|e| &e.post) {
                 for e in &post.metadata.emojis {
                     learned.push((e.name.clone(), e.id.clone()));
                     keys.push(media::Key::Emoji(e.id.clone()));
@@ -546,7 +574,11 @@ impl Chat {
                 tracing::debug!("history for {id}: {} posts, prev={:?}, first={first}", list.order.len(), list.prev_post_id);
                 self.store.set_history(&id, list);
                 let users = self.load_missing_users();
-                if first { Task::batch([users, to_latest(TIMELINE)]) } else { users }
+                if !first {
+                    return users;
+                }
+                let scrolls = self.panes.iter().filter(|(_, p)| p.channel == id).map(|(_, p)| to_latest(p.timeline())).collect::<Vec<_>>();
+                Task::batch([users].into_iter().chain(scrolls))
             }
             Message::TimelineScrolled(viewport) => {
                 // With anchor_bottom() iced measures the offset from the bottom, so
@@ -555,22 +587,22 @@ impl Chat {
                 let height = viewport.content_bounds().height;
                 let from_top = height - viewport.bounds().height - from_bottom;
                 tracing::trace!("timeline scrolled: {from_top}px from top, {from_bottom}px from bottom");
-                self.viewport = Some(viewport);
-                if let Some((held_height, held_offset)) = self.hold_top {
+                self.pv_mut().viewport = Some(viewport);
+                if let Some((held_height, held_offset)) = self.pv().hold_top {
                     let grew = height - held_height;
                     if grew.abs() > 0.5 {
                         // A thread opened or closed: shift by the change so the top stays put.
-                        self.hold_top = Some((height, held_offset + grew));
-                        return operation::scroll_by(TIMELINE, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: grew });
+                        self.pv_mut().hold_top = Some((height, held_offset + grew));
+                        return operation::scroll_by(self.pv().timeline(), iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: grew });
                     }
                     if (from_bottom - held_offset).abs() > 1.0 {
                         // The user scrolled; stop holding.
-                        self.hold_top = None;
+                        self.pv_mut().hold_top = None;
                     } else {
                         return Task::none();
                     }
                 }
-                let has_newer = self.store.timelines.get(&self.channel).is_some_and(|t| t.has_newer);
+                let has_newer = self.store.timelines.get(&self.pv().channel).is_some_and(|t| t.has_newer);
                 if has_newer && from_bottom < 400.0 {
                     self.load_newer()
                 } else if from_top < 400.0 {
@@ -606,17 +638,17 @@ impl Chat {
                 Task::none()
             }
             Message::Draft(d) => {
-                self.drafts.insert(self.channel.clone(), d);
+                self.drafts.insert(self.pv().channel.clone(), d);
                 Task::none()
             }
-            Message::Send if self.editing.as_ref().is_some_and(|e| e.key == self.channel) => self.save_edit(),
-            Message::SendReply if self.editing.as_ref().is_some_and(|e| Some(&e.key) == self.thread.as_ref().map(|r| thread_key(r)).as_ref()) => {
+            Message::Send if self.editing.as_ref().is_some_and(|e| e.key == self.pv().channel) => self.save_edit(),
+            Message::SendReply if self.editing.as_ref().is_some_and(|e| Some(&e.key) == self.pv().thread.as_ref().map(|r| thread_key(r)).as_ref()) => {
                 self.save_edit()
             }
             Message::Send => {
                 self.last_in_thread = false;
                 let message = self.draft().trim().to_string();
-                let here = |a: &&media::Pending| a.channel_id == self.channel;
+                let here = |a: &&media::Pending| a.channel_id == self.pv().channel;
                 if self.attachments.iter().filter(here).any(|a| matches!(a.state, media::Upload::Uploading)) {
                     self.error = Some("Wait for uploads to finish".into());
                     return Task::none();
@@ -630,16 +662,17 @@ impl Chat {
                         _ => None,
                     })
                     .collect();
-                if (message.is_empty() && file_ids.is_empty()) || self.channel.is_empty() {
+                if (message.is_empty() && file_ids.is_empty()) || self.pv().channel.is_empty() {
                     return Task::none();
                 }
-                let text = self.drafts.remove(&self.channel).unwrap_or_default();
-                self.sending = Some((self.channel.clone(), text));
+                let channel = self.pv().channel.clone();
+                let text = self.drafts.remove(&channel).unwrap_or_default();
+                self.sending = Some((self.pv().channel.clone(), text));
                 self.error = None;
-                let channel = self.channel.clone();
+                let channel = self.pv().channel.clone();
                 self.attachments.retain(|a| a.channel_id != channel);
                 let post = NewPost {
-                    channel_id: self.channel.clone(),
+                    channel_id: self.pv().channel.clone(),
                     message,
                     file_ids,
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
@@ -652,15 +685,15 @@ impl Chat {
                 self.sending = None;
                 let in_thread = post.is_reply();
                 self.store.sent(post);
-                if !in_thread && self.store.timelines.get(&self.channel).is_some_and(|t| t.has_newer) {
+                if !in_thread && self.store.timelines.get(&self.pv().channel).is_some_and(|t| t.has_newer) {
                     return self.reload_latest();
                 }
-                to_latest(if in_thread { THREAD } else { TIMELINE })
+                if in_thread { to_latest(THREAD) } else { to_latest(self.pv().timeline()) }
             }
             Message::JumpTo(channel, root, post) => {
                 // Set first: select_channel skips loading the newest page for it.
-                self.jump = Some(Jump { channel: channel.clone(), root, post, window_requested: false });
-                let select = if self.channel != channel { self.select_channel(channel) } else { Task::none() };
+                self.pv_mut().jump = Some(Jump { channel: channel.clone(), root, post, window_requested: false });
+                let select = if self.pv().channel != channel { self.select_channel(channel) } else { Task::none() };
                 Task::batch([select, self.continue_jump()])
             }
             Message::JumpWindow(channel, root, Ok((before, after, thread))) => {
@@ -671,19 +704,19 @@ impl Chat {
                 if let Some(p) = thread.posts.get(&root) {
                     list.posts.insert(root.clone(), p.clone());
                 }
-                self.hold_top = None;
+                self.pv_mut().hold_top = None;
                 self.store.set_window(&channel, list, has_more, has_newer);
                 self.store.set_thread(&root, thread);
                 Task::batch([self.load_missing_users(), self.continue_jump()])
             }
             Message::JumpWindow(channel, _, Err(e)) => {
-                self.jump = None;
+                self.pv_mut().jump = None;
                 self.error = Some(format!("Couldn't load that message: {e}"));
                 if self.store.timelines.get(&channel).is_some_and(|t| t.loaded) { Task::none() } else { self.load_history(channel) }
             }
             Message::Newer(id, Ok(list)) => {
                 // Posts appended below would push the view up: hold it still.
-                self.hold_top = self.viewport.map(|v| (v.content_bounds().height, v.absolute_offset().y));
+                self.pv_mut().hold_top = self.pv().viewport.map(|v| (v.content_bounds().height, v.absolute_offset().y));
                 self.store.add_newer(&id, list);
                 self.load_missing_users()
             }
@@ -695,6 +728,13 @@ impl Chat {
                 Task::none()
             }
             Message::JumpToLatest => self.reload_latest(),
+            Message::FocusPane(p) => {
+                if self.panes.get(p).is_some() {
+                    self.focus = p;
+                    self.cur = p;
+                }
+                Task::none()
+            }
             Message::CustomEmoji(Ok(list)) => {
                 self.store.custom_emoji.extend(list.into_iter().filter(|e| e.delete_at == 0).map(|e| (e.name, e.id)));
                 self.fetch_media()
@@ -705,30 +745,30 @@ impl Chat {
                 Task::none()
             }
             Message::JumpLocated(Some(from_bottom)) => {
-                operation::scroll_to(TIMELINE, iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(from_bottom) })
+                operation::scroll_to(self.pv().timeline(), iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(from_bottom) })
             }
             Message::JumpLocated(None) => Task::none(),
             Message::ShowAllReplies(root) => {
                 self.hold_view(&root);
-                self.all_replies.insert(root);
+                self.pv_mut().all_replies.insert(root);
                 Task::none()
             }
-            Message::ToggleThread(root) if self.expanded.contains(&root) => {
+            Message::ToggleThread(root) if self.pv().expanded.contains(&root) => {
                 self.hold_view(&root);
-                self.expanded.remove(&root);
-                self.all_replies.remove(&root);
-                if self.thread.as_ref() == Some(&root) {
-                    self.thread = None;
+                self.pv_mut().expanded.remove(&root);
+                self.pv_mut().all_replies.remove(&root);
+                if self.pv().thread.as_ref() == Some(&root) {
+                    self.pv_mut().thread = None;
                 }
                 Task::none()
             }
             Message::ToggleThread(root) => self.update(Message::OpenThread(root)),
             Message::OpenThread(root) => {
-                if self.is_inline(&root) && !self.expanded.contains(&root) {
+                if self.is_inline(&root) && !self.pv().expanded.contains(&root) {
                     self.hold_view(&root);
-                    self.expanded.insert(root.clone());
+                    self.pv_mut().expanded.insert(root.clone());
                 }
-                self.thread = Some(root.clone());
+                self.pv_mut().thread = Some(root.clone());
                 let mark_read = match self.store.user_threads.iter().find(|t| t.id == root) {
                     Some(t) if t.unread_replies > 0 || t.unread_mentions > 0 => {
                         self.store.thread_read(&root, 0, 0);
@@ -747,22 +787,32 @@ impl Chat {
                 } else {
                     self.load_thread(root)
                 };
-                Task::batch([load, mark_read, to_latest(THREAD), operation::focus(THREAD_COMPOSER)])
+                Task::batch([load, mark_read, to_latest(THREAD), operation::focus(self.pv().thread_composer())])
             }
             Message::CloseThread => {
-                if let Some(root) = self.thread.take().filter(|r| self.is_inline(r)) {
+                if let Some(root) = self.pv_mut().thread.take().filter(|r| self.is_inline(r)) {
                     self.hold_view(&root);
-                    self.expanded.remove(&root);
-                    self.all_replies.remove(&root);
+                    self.pv_mut().expanded.remove(&root);
+                    self.pv_mut().all_replies.remove(&root);
                 }
-                operation::focus(COMPOSER)
+                operation::focus(self.pv().composer())
             }
             Message::Thread(root, Ok(list)) => {
                 self.store.set_thread(&root, list);
-                let locate = match &self.jump_target {
-                    Some(t) if self.expanded.contains(&root) && self.store.threads.get(&root).is_some_and(|th| th.entries.iter().any(|e| e.post.id == *t)) => locate(),
-                    _ => Task::none(),
-                };
+                let thread = self.store.threads.get(&root);
+                let locate = Task::batch(
+                    self.panes
+                        .iter()
+                        .filter(|(_, p)| {
+                            p.expanded.contains(&root)
+                                && p.jump_target.as_ref().is_some_and(|t| thread.is_some_and(|th| th.entries.iter().any(|e| e.post.id == *t)))
+                        })
+                        .map(|(pane, p)| {
+                            let pane = *pane;
+                            locate(p).map(move |m| Message::InPane(pane, Box::new(m)))
+                        })
+                        .collect::<Vec<_>>(),
+                );
                 Task::batch([self.load_missing_users(), to_latest(THREAD), locate])
             }
             Message::Thread(_, Err(e)) => {
@@ -770,7 +820,7 @@ impl Chat {
                 Task::none()
             }
             Message::ThreadDraft(d) => {
-                if let Some(root) = &self.thread {
+                if let Some(root) = &self.pv().thread {
                     self.drafts.insert(thread_key(root), d);
                 }
                 Task::none()
@@ -778,7 +828,7 @@ impl Chat {
             Message::SendReply => {
                 self.last_in_thread = true;
                 let message = self.thread_draft().trim().to_string();
-                let Some(root) = self.thread.clone() else { return Task::none() };
+                let Some(root) = self.pv().thread.clone() else { return Task::none() };
                 let Some(channel_id) = self.store.post(&root).map(|p| p.channel_id.clone()) else {
                     return Task::none();
                 };
@@ -817,7 +867,7 @@ impl Chat {
                 Message::Attach,
             ),
             Message::Attach(paths) => {
-                if self.channel.is_empty() {
+                if self.pv().channel.is_empty() {
                     return Task::none();
                 }
                 let tasks: Vec<_> = paths
@@ -828,11 +878,11 @@ impl Chat {
                         let local_id = self.next_local_id;
                         self.attachments.push(media::Pending {
                             local_id,
-                            channel_id: self.channel.clone(),
+                            channel_id: self.pv().channel.clone(),
                             name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
                             state: media::Upload::Uploading,
                         });
-                        Task::perform(media::upload(self.client.clone(), self.channel.clone(), path), move |r| {
+                        Task::perform(media::upload(self.client.clone(), self.pv().channel.clone(), path), move |r| {
                             Message::Uploaded(local_id, r)
                         })
                     })
@@ -960,22 +1010,22 @@ impl Chat {
                         results: Some(Ok(Vec::new())),
                     }));
                 }
-                self.thread = None;
+                self.pv_mut().thread = None;
                 operation::focus(SEARCH_INPUT)
             }
             Message::OpenMentions => {
-                self.thread = None;
+                self.pv_mut().thread = None;
                 let terms = format!("@{}", self.store.me.username);
                 self.search(terms, true)
             }
             Message::OpenThreads => {
-                self.thread = None;
+                self.pv_mut().thread = None;
                 self.panel = Some(Panel::Threads);
                 self.load_user_threads()
             }
             Message::ClosePanel => {
                 self.panel = None;
-                operation::focus(COMPOSER)
+                operation::focus(self.pv().composer())
             }
             Message::SearchInput(text) => {
                 if let Some(Panel::Search(p)) = &mut self.panel {
@@ -1017,7 +1067,7 @@ impl Chat {
                 tracing::warn!("couldn't load threads: {e}");
                 Task::none()
             }
-            Message::Escape if self.thread.is_none() && self.panel.is_some() => self.update(Message::ClosePanel),
+            Message::Escape if self.pv().thread.is_none() && self.panel.is_some() => self.update(Message::ClosePanel),
             Message::OpenSwitcher => {
                 let mut sw = Switcher::default();
                 sw.refresh(&self.store);
@@ -1026,7 +1076,7 @@ impl Chat {
             }
             Message::CloseSwitcher => {
                 self.switcher = None;
-                operation::focus(COMPOSER)
+                operation::focus(self.pv().composer())
             }
             Message::SwitcherQuery(q) => {
                 let Some(sw) = &mut self.switcher else { return Task::none() };
@@ -1134,7 +1184,7 @@ impl Chat {
                 self.store.channels.remove(&id);
                 self.store.members.remove(&id);
                 self.store.timelines.remove(&id);
-                if self.channel == id { self.open_default_channel() } else { Task::none() }
+                if self.pv().channel == id { self.open_default_channel() } else { Task::none() }
             }
             Message::Left(_, Err(e)) => {
                 self.error = Some(format!("Couldn't leave: {e}"));
@@ -1172,13 +1222,13 @@ impl Chat {
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(named @ (Named::PageUp | Named::PageDown)), .. }) => {
                 // Offsets count up from the bottom (anchor_bottom), so PageUp is positive.
                 let dy = if named == Named::PageUp { 500.0 } else { -500.0 };
-                operation::scroll_by(TIMELINE, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: dy })
+                operation::scroll_by(self.pv().timeline(), iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: dy })
             }
             // Mattermost's Ctrl+Shift+\\: react to the latest message.
             Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
                 if modifiers.command() && modifiers.shift() && matches!(k.as_str(), "\\" | "|") =>
             {
-                let last = self.store.timelines.get(&self.channel).and_then(|t| {
+                let last = self.store.timelines.get(&self.pv().channel).and_then(|t| {
                     t.entries.iter().rev().map(|e| &e.post).find(|p| !p.is_system()).map(|p| p.id.clone())
                 });
                 match last {
@@ -1190,11 +1240,11 @@ impl Chat {
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::ArrowUp), modifiers, .. })
                 if modifiers.is_empty() && self.switcher.is_none() && self.editing.is_none() =>
             {
-                let in_thread = self.last_in_thread && self.thread.is_some();
+                let in_thread = self.last_in_thread && self.pv().thread.is_some();
                 let (draft, timeline) = if in_thread {
-                    (self.thread_draft(), self.thread.as_ref().and_then(|r| self.store.threads.get(r)))
+                    (self.thread_draft(), self.pv().thread.as_ref().and_then(|r| self.store.threads.get(r)))
                 } else {
-                    (self.draft(), self.store.timelines.get(&self.channel))
+                    (self.draft(), self.store.timelines.get(&self.pv().channel))
                 };
                 if !draft.is_empty() {
                     return Task::none();
@@ -1210,7 +1260,7 @@ impl Chat {
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::ArrowUp), modifiers, .. })
                 if modifiers.shift() && !modifiers.alt() =>
             {
-                let last = self.store.timelines.get(&self.channel).and_then(|t| {
+                let last = self.store.timelines.get(&self.pv().channel).and_then(|t| {
                     t.entries.iter().rev().map(|e| &e.post).find(|p| !p.is_system())
                 });
                 match last {
@@ -1222,7 +1272,7 @@ impl Chat {
                 }
             }
             Message::Escape if self.switcher.is_some() => self.update(Message::CloseSwitcher),
-            Message::Escape if self.thread.is_some() => self.update(Message::CloseThread),
+            Message::Escape if self.pv().thread.is_some() => self.update(Message::CloseThread),
             Message::React(post_id, emoji, add) => {
                 let client = self.client.clone();
                 let me = self.store.me.id.clone();
@@ -1238,9 +1288,11 @@ impl Chat {
             Message::Ws(msg) => self.on_ws(msg),
             Message::Tick => {
                 self.typing.retain(|_, at| at.elapsed() < TYPING_TTL);
-                if self.highlight.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
-                    self.highlight = None;
-                    self.jump_target = None;
+                for (_, p) in self.panes.iter_mut() {
+                    if p.highlight.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
+                        p.highlight = None;
+                        p.jump_target = None;
+                    }
                 }
                 Task::none()
             }
@@ -1252,7 +1304,7 @@ impl Chat {
                 };
                 let (regular, direct) = self.store.sidebar(&self.team);
                 let ids: Vec<String> = regular.iter().chain(&direct).map(|c| c.id.clone()).collect();
-                let Some(pos) = ids.iter().position(|id| *id == self.channel) else { return Task::none() };
+                let Some(pos) = ids.iter().position(|id| *id == self.pv().channel) else { return Task::none() };
                 let next = (pos as isize + step).rem_euclid(ids.len() as isize) as usize;
                 self.select_channel(ids[next].clone())
             }
@@ -1280,20 +1332,23 @@ impl Chat {
                 // Events were lost: drop cached history and reload the sidebar.
                 self.store.timelines.clear();
                 let session = self.session.clone();
-                let channel = self.channel.clone();
-                Task::batch([bootstrap(session), self.load_history(channel)])
+                let mut channels: Vec<String> = self.panes.iter().map(|(_, p)| p.channel.clone()).filter(|c| !c.is_empty()).collect();
+                channels.sort();
+                channels.dedup();
+                let loads = channels.into_iter().map(|c| self.load_history(c));
+                Task::batch([bootstrap(session)].into_iter().chain(loads))
             }
             M::Event(Event::Posted { post, mentions, .. }) => {
-                let viewing = post.channel_id == self.channel;
+                let viewing = self.showing(&post.channel_id);
                 // Arriving while you're looking isn't "new": keep the marker off
                 // unless one is already showing for messages from before.
                 if viewing && post.user_id != self.store.me.id {
-                    let since = self.viewed_before.get(&self.channel).copied().unwrap_or(i64::MAX);
-                    let marker_showing = self.store.timelines.get(&self.channel).is_some_and(|t| {
+                    let since = self.viewed_before.get(&post.channel_id).copied().unwrap_or(i64::MAX);
+                    let marker_showing = self.store.timelines.get(&post.channel_id).is_some_and(|t| {
                         t.entries.iter().any(|e| e.post.create_at > since && e.post.user_id != self.store.me.id)
                     });
                     if !marker_showing {
-                        self.viewed_before.insert(self.channel.clone(), post.create_at);
+                        self.viewed_before.insert(post.channel_id.clone(), post.create_at);
                     }
                 }
                 self.typing.retain(|(ch, user, _), _| !(*ch == post.channel_id && *user == post.user_id));
@@ -1332,7 +1387,7 @@ impl Chat {
             M::Event(Event::ThreadUpdated(thread)) => {
                 let mut thread = *thread;
                 // Reading it right now: don't count it as unread.
-                if self.thread.as_deref() == Some(thread.id.as_str()) {
+                if self.pv().thread.as_deref() == Some(thread.id.as_str()) {
                     thread.unread_replies = 0;
                     thread.unread_mentions = 0;
                 }
@@ -1371,12 +1426,13 @@ fn notify_mention(store: &Store, post: &Post) {
 
 /// Find the jump target in the timeline, as the offset from the bottom that
 /// puts it a little below the top of the view.
-fn locate() -> Task<Message> {
-    use iced::advanced::widget::{Id, Operation, operation::Outcome, operation::Scrollable};
+fn locate(pv: &PaneView) -> Task<Message> {
+    use iced::advanced::widget::{Operation, operation::Outcome, operation::Scrollable};
     use iced::{Rectangle, Vector};
 
-    #[derive(Default)]
     struct Find {
+        timeline_id: Id,
+        target_id: Id,
         timeline: Option<(Rectangle, Rectangle)>,
         target: Option<Rectangle>,
     }
@@ -1385,13 +1441,13 @@ fn locate() -> Task<Message> {
             operate(self);
         }
         fn scrollable(&mut self, id: Option<&Id>, bounds: Rectangle, content: Rectangle, _: Vector, _: &mut dyn Scrollable) {
-            if id == Some(&Id::from(TIMELINE)) {
+            if id == Some(&self.timeline_id) {
                 self.timeline = Some((bounds, content));
             }
         }
         fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
             // The channel comes before the side pane, so its copy wins.
-            if id == Some(&Id::from(JUMP_TARGET)) && self.target.is_none() {
+            if id == Some(&self.target_id) && self.target.is_none() {
                 self.target = Some(bounds);
             }
         }
@@ -1404,12 +1460,13 @@ fn locate() -> Task<Message> {
             }))
         }
     }
-    iced::advanced::widget::operate(Find::default()).map(Message::JumpLocated)
+    let find = Find { timeline_id: pv.timeline(), target_id: pv.jump_target_id(), timeline: None, target: None };
+    iced::advanced::widget::operate(find).map(Message::JumpLocated)
 }
 
 /// Scroll a bottom-anchored list to its newest post. Offsets count from the
 /// bottom with anchor_bottom(), so this is 0 (`snap_to_end` would go to the top).
-fn to_latest(id: &'static str) -> Task<Message> {
+fn to_latest(id: impl Into<Id>) -> Task<Message> {
     operation::scroll_to(id, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 })
 }
 
@@ -1429,7 +1486,7 @@ mod tests {
             users: vec![],
         };
         let (mut chat, _) = Chat::start(b).unwrap();
-        chat.channel = "c1".into();
+        chat.pv_mut().channel = "c1".into();
         chat
     }
 
@@ -1462,10 +1519,10 @@ mod tests {
     fn drafts_are_per_channel_and_survive_failed_sends() {
         let mut chat = chat();
         let _ = chat.handle(Message::Draft("for c1".into()));
-        chat.channel = "c2".into();
+        chat.pv_mut().channel = "c2".into();
         assert_eq!(chat.draft(), "");
         let _ = chat.handle(Message::Draft("for c2".into()));
-        chat.channel = "c1".into();
+        chat.pv_mut().channel = "c1".into();
         assert_eq!(chat.draft(), "for c1");
 
         let _ = chat.handle(Message::Send);
@@ -1567,7 +1624,7 @@ mod tests {
         assert_eq!(chat.store.thread_unreads(), (0, 0));
         // Esc closes the thread first, then the inbox behind it.
         let _ = chat.handle(Message::Escape);
-        assert!(chat.thread.is_none() && chat.panel.is_some());
+        assert!(chat.pv().thread.is_none() && chat.panel.is_some());
         let _ = chat.handle(Message::Escape);
         assert!(chat.panel.is_none());
     }
@@ -1577,19 +1634,19 @@ mod tests {
         let mut chat = chat();
         with_post(&mut chat, "root", "bob", 1);
         let _ = chat.handle(Message::ToggleThread("root".into()));
-        assert!(chat.expanded.contains("root"));
-        assert_eq!(chat.thread.as_deref(), Some("root"), "the reply box goes under it");
+        assert!(chat.pv().expanded.contains("root"));
+        assert_eq!(chat.pv().thread.as_deref(), Some("root"), "the reply box goes under it");
         assert!(chat.pane_thread().is_none());
         let _ = chat.handle(Message::ShowAllReplies("root".into()));
-        assert!(chat.all_replies.contains("root"));
+        assert!(chat.pv().all_replies.contains("root"));
         let _ = chat.handle(Message::ToggleThread("root".into()));
-        assert!(!chat.expanded.contains("root") && chat.thread.is_none());
-        assert!(chat.all_replies.is_empty(), "reopening shows the latest few again");
+        assert!(!chat.pv().expanded.contains("root") && chat.pv().thread.is_none());
+        assert!(chat.pv().all_replies.is_empty(), "reopening shows the latest few again");
 
         // Esc collapses the thread being replied to.
         let _ = chat.handle(Message::OpenThread("root".into()));
         let _ = chat.handle(Message::Escape);
-        assert!(!chat.expanded.contains("root") && chat.thread.is_none());
+        assert!(!chat.pv().expanded.contains("root") && chat.pv().thread.is_none());
 
         // A thread from another channel (search, inbox) still opens in the pane.
         let _ = chat.handle(Message::OpenThread("elsewhere".into()));
@@ -1600,7 +1657,7 @@ mod tests {
         let _ = chat.set_inline_threads(false);
         assert_eq!(chat.pane_thread().map(String::as_str), Some("root"));
         let _ = chat.set_inline_threads(true);
-        assert!(chat.pane_thread().is_none() && chat.expanded.contains("root"));
+        assert!(chat.pane_thread().is_none() && chat.pv().expanded.contains("root"));
     }
 
     #[test]
@@ -1641,7 +1698,7 @@ mod tests {
         assert_eq!(chat.attachments.len(), 1);
 
         // Sending in another channel leaves c1's attachment alone.
-        chat.channel = "c2".into();
+        chat.pv_mut().channel = "c2".into();
         chat.drafts.insert("c2".into(), "hi".into());
         let _ = chat.handle(Message::Send);
         assert_eq!(chat.attachments.len(), 1);

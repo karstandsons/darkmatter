@@ -4,6 +4,7 @@ mod chat_view;
 mod config;
 mod emoji_picker;
 mod media;
+mod pane;
 mod panels;
 mod session;
 mod store;

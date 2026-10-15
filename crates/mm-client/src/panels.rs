@@ -103,7 +103,7 @@ impl Chat {
                 .width(Length::Fill)
                 .padding([8, 12])
                 .on_press(Message::OpenThread(t.id.clone()))
-                .style(c.row_button(self.thread.as_deref() == Some(t.id.as_str())))
+                .style(c.row_button(self.focused().thread.as_deref() == Some(t.id.as_str())))
                 .into()
         });
         scrollable(Column::with_children(rows).spacing(4).padding([8, 8])).height(Length::Fill).into()
@@ -124,7 +124,7 @@ impl Chat {
             .width(Length::Fill)
             .padding([5, 10])
             .on_press(Message::OpenThreads)
-            .style(c.row_button(matches!(self.panel, Some(Panel::Threads)) && self.thread.is_none()))
+            .style(c.row_button(matches!(self.panel, Some(Panel::Threads)) && self.focused().thread.is_none()))
             .into()
     }
 }

@@ -107,6 +107,10 @@ pub enum Message {
     JumpToLatest,
     /// The server's custom emoji.
     CustomEmoji(Result<Vec<mm_api::models::CustomEmoji>, String>),
+    /// A message from a pane's widgets, or a result for that pane.
+    InPane(iced::widget::pane_grid::Pane, Box<Message>),
+    /// A click in a pane gives it focus.
+    FocusPane(iced::widget::pane_grid::Pane),
     /// Switch threads between inline and the side pane.
     ToggleThreadLayout,
     CloseThread,
@@ -410,7 +414,7 @@ impl App {
         match &self.screen {
             Screen::Chat(chat) => {
                 let unread = chat.store.channels.keys().map(|id| chat.store.unread(id).mentions).sum::<i64>();
-                let name = chat.store.channels.get(&chat.channel).map(|c| chat.store.channel_label(c));
+                let name = chat.store.channels.get(&chat.focused().channel).map(|c| chat.store.channel_label(c));
                 match (unread, name) {
                     (0, Some(n)) => format!("{n} — Mattermost"),
                     (m, Some(n)) => format!("({m}) {n} — Mattermost"),
@@ -556,7 +560,7 @@ impl App {
         ];
         if let Screen::Chat(chat) = &self.screen {
             subs.push(Subscription::run_with(chat.session.clone(), ws_events).map(Message::Ws));
-            if !chat.typing.is_empty() || chat.highlight.is_some() {
+            if !chat.typing.is_empty() || chat.panes.iter().any(|(_, p)| p.highlight.is_some()) {
                 subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
             }
         }
@@ -764,5 +768,16 @@ impl LoginForm {
             .width(Length::Fill)
             .style(c.primary_button());
         center(form.push(submit)).into()
+    }
+}
+
+impl Message {
+    /// Tag a task's result with the pane that started it, if it only makes
+    /// sense there (a jump's scroll position, a page for its older stretch).
+    pub fn for_pane(self, pane: iced::widget::pane_grid::Pane) -> Message {
+        match self {
+            m @ (Message::JumpLocated(_) | Message::JumpWindow(..) | Message::Newer(..)) => Message::InPane(pane, Box::new(m)),
+            m => m,
+        }
     }
 }
