@@ -2,7 +2,7 @@
 # Move/click the pointer inside the mm-rust window, ONLY if it's focused.
 # On a tiling desktop the window's tile moves, and focus follows the mouse,
 # so the position is read fresh and the point must fall inside the tile.
-#   dev/click.sh <pid> <x> <y> [move|click|right|scroll <steps>]
+#   dev/click.sh <pid> <x> <y> [move|click|right|scroll <steps>|drag <x2> <y2>]
 # x/y are logical pixels from the window's top-left (screenshots from
 # `grim -g` at scale 2 are twice that: halve their coordinates).
 set -euo pipefail
@@ -31,4 +31,12 @@ if (( cover > 0 )); then
 fi
 # The virtual pointer's absolute coordinates span the whole monitor layout.
 read -r lw lh < <(hyprctl monitors -j | jq -r '"\(map(.x + (.width/.scale|floor)) | max) \(map(.y + (.height/.scale|floor)) | max)"')
+if [[ ${1:-} == drag ]]; then
+  x2=$2 y2=$3
+  if (( x2 < 0 || y2 < 0 || x2 >= ww || y2 >= wh )); then
+    echo "refusing: drag end ($x2,$y2) is outside the window" >&2
+    exit 1
+  fi
+  set -- drag $((wx + x2)) $((wy + y2))
+fi
 "$bin" "$ax" "$ay" "$lw" "$lh" "${@:-move}"

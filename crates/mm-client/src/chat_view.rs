@@ -37,21 +37,42 @@ impl Chat {
         if self.store.teams.len() > 1 {
             layout = layout.push(self.team_rail(c));
         }
+        let many = self.panes.len() > 1;
         let grid = pane_grid::PaneGrid::new(&self.panes, |pane, pv, _| {
-            pane_grid::Content::new(self.main(pv, c, theme).map(move |m| Message::InPane(pane, Box::new(m))))
+            let wrap = move |m| Message::InPane(pane, Box::new(m));
+            let mut title = pane_grid::TitleBar::new(self.pane_header(pv, c).map(wrap)).padding([12, 20]);
+            if let Some(controls) = self.pane_controls(pv, many, c) {
+                title = title.controls(pane_grid::Controls::new(controls.map(wrap))).always_show_controls();
+            }
+            // With several panes, the focused one is outlined in the accent color.
+            let border = if many && pane == self.focus { c.accent } else { iced::Color::TRANSPARENT };
+            pane_grid::Content::new(self.main(pv, c, theme).map(wrap)).title_bar(title).style(move |_: &Theme| container::Style {
+                border: iced::Border { color: border, width: 1.0, radius: 4.0.into() },
+                ..Default::default()
+            })
         })
-        .on_click(Message::FocusPane);
+        .spacing(6)
+        .on_click(Message::FocusPane)
+        .on_drag(Message::PaneDragged)
+        .on_resize(8, Message::PaneResized);
         layout = layout.push(self.sidebar(c)).push(grid);
         if let Some(root) = self.pane_thread() {
             layout = layout.push(rule::vertical(1)).push(self.thread_pane(root, c, theme));
         } else if let Some(panel) = &self.panel {
             layout = layout.push(rule::vertical(1)).push(self.panel_view(panel, c, theme));
         }
-        match (&self.switcher, &self.emoji_picker) {
-            (Some(sw), _) => stack![layout, sw.view(&self.store, c)].into(),
-            (None, Some(picker)) => stack![layout, picker.view(c, &self.media)].into(),
-            (None, None) => layout.into(),
+        // Always a stack, so opening or closing an overlay keeps the widget
+        // state under it (a focus set as the switcher closes would be lost).
+        let overlay = match (&self.switcher, &self.emoji_picker) {
+            (Some(sw), _) => Some(sw.view(&self.store, c)),
+            (None, Some(picker)) => Some(picker.view(c, &self.media)),
+            (None, None) => None,
+        };
+        let mut layers = stack![layout];
+        if let Some(overlay) = overlay {
+            layers = layers.push(overlay);
         }
+        layers.into()
     }
 
     fn team_rail(&self, c: Colors) -> Element<'_, Message> {
@@ -154,28 +175,55 @@ impl Chat {
         .into()
     }
 
-    fn main<'a>(&'a self, pv: &'a PaneView, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
+    /// A pane's title bar: the channel name and topic, and Leave. It's also
+    /// where a pane is grabbed to drag it elsewhere.
+    fn pane_header<'a>(&'a self, pv: &'a PaneView, c: Colors) -> Element<'a, Message> {
         let Some(channel) = self.store.channels.get(&pv.channel) else {
-            return center(text("No channel selected").color(c.muted)).into();
+            return text("No channel").size(17).color(c.muted).into();
         };
         let mut header = row![text(self.store.channel_label(channel)).size(17).font(bold()).color(c.fg_bright)]
             .spacing(12)
             .align_y(iced::Center);
+        // The title bar hides a title that doesn't fit beside the controls,
+        // so keep the topic short.
         let topic = if channel.header.is_empty() { &channel.purpose } else { &channel.header };
+        let topic = topic.lines().next().unwrap_or_default();
         if !topic.is_empty() {
-            header = header.push(text(topic.lines().next().unwrap_or_default()).size(13).color(c.muted));
+            let short: String = topic.chars().take(60).collect();
+            let short = if short.len() < topic.len() { format!("{short}…") } else { short };
+            header = header.push(text(short).size(13).color(c.muted));
         }
+        header.into()
+    }
+
+    /// Buttons at the right of a pane's title bar: Leave, and ✕ when there
+    /// are other panes.
+    fn pane_controls<'a>(&'a self, pv: &'a PaneView, many: bool, c: Colors) -> Option<Element<'a, Message>> {
+        let mut controls = row![].spacing(4).align_y(iced::Center);
+        let channel = self.store.channels.get(&pv.channel);
         // Town Square can't be left; DMs are closed, not left.
-        if matches!(channel.kind, ChannelType::Open | ChannelType::Private) && channel.name != "town-square" {
+        if let Some(channel) = channel.filter(|ch| matches!(ch.kind, ChannelType::Open | ChannelType::Private) && ch.name != "town-square") {
             let confirming = self.confirm_delete.as_deref() == Some(channel.id.as_str());
-            header = header.push(space::horizontal()).push(
+            controls = controls.push(
                 button(text(if confirming { "Leave? click again" } else { "Leave" }).size(12).color(if confirming { c.red } else { c.muted }))
                     .padding([2, 8])
                     .on_press(Message::LeaveChannel(channel.id.clone()))
                     .style(c.row_button(false)),
             );
         }
+        if many {
+            controls = controls.push(
+                button(text("✕").size(13).color(c.muted)).padding([2, 8]).on_press(Message::ClosePane).style(c.row_button(false)),
+            );
+        }
+        (many || channel.is_some_and(|ch| matches!(ch.kind, ChannelType::Open | ChannelType::Private) && ch.name != "town-square"))
+            .then(|| controls.into())
+    }
 
+    fn main<'a>(&'a self, pv: &'a PaneView, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
+        let Some(channel) = self.store.channels.get(&pv.channel) else {
+            return center(text("No channel selected").color(c.muted)).into();
+        };
         let timeline: Element<'_, Message> = match self.store.timelines.get(&pv.channel) {
             Some(t) if t.loaded => {
                 let top = if t.has_more {
@@ -195,7 +243,7 @@ impl Chat {
             .padding(12)
             .style(c.input());
 
-        let mut col = column![container(header).padding([12, 20]), rule::horizontal(1), timeline];
+        let mut col = column![rule::horizontal(1), timeline];
         if self.store.timelines.get(&pv.channel).is_some_and(|t| t.has_newer) {
             col = col.push(
                 container(
@@ -209,7 +257,7 @@ impl Chat {
                 .padding([4, 20]),
             );
         }
-        if let Some(e) = &self.error {
+        if let Some(e) = self.error.as_ref().filter(|_| pv.n == self.focused().n) {
             col = col.push(container(text(e).size(12).color(c.red)).padding([4, 20]));
         }
         let attach = button(text("📎").size(16))
@@ -613,7 +661,8 @@ impl Chat {
             let (w, h) = media::preview_size(f.width, f.height);
             let key = media::Key::Preview(f.id.clone());
             let inner: Element<'_, Message> = match self.media.get(&key) {
-                Some(handle) => image(handle.clone()).width(w).height(h).border_radius(6).into(),
+                // Height follows the width the pane allows, keeping the aspect ratio.
+                Some(handle) => image(handle.clone()).width(w).height(Length::Shrink).border_radius(6).into(),
                 None => container(
                     text(if self.media.failed(&key) { "Preview unavailable" } else { "Loading…" }).size(12).color(c.muted),
                 )

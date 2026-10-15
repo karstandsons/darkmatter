@@ -111,6 +111,13 @@ pub enum Message {
     InPane(iced::widget::pane_grid::Pane, Box<Message>),
     /// A click in a pane gives it focus.
     FocusPane(iced::widget::pane_grid::Pane),
+    /// Split the focused pane; the new one shows the same channel.
+    SplitPane(iced::widget::pane_grid::Axis),
+    /// Close the pane the message is for (never the last one).
+    ClosePane,
+    FocusAdjacent(iced::widget::pane_grid::Direction),
+    PaneResized(iced::widget::pane_grid::ResizeEvent),
+    PaneDragged(iced::widget::pane_grid::DragEvent),
     /// Switch threads between inline and the side pane.
     ToggleThreadLayout,
     CloseThread,

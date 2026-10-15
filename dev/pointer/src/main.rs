@@ -1,4 +1,4 @@
-//! vpointer <x> <y> <layout width> <layout height> [move|click|right|scroll <steps>]
+//! vpointer <x> <y> <layout width> <layout height> [move|click|right|scroll <steps>|drag <x2> <y2>]
 //!
 //! Coordinates are logical pixels in the compositor's layout. Don't call this
 //! directly: dev/click.sh checks that mm-rust is focused and the point is in it.
@@ -66,6 +66,21 @@ fn main() {
             pointer.button(tick(), button, ButtonState::Released);
             pointer.frame();
         }
+        "drag" => {
+            // Press here, glide to (x2, y2) in small steps so the app sees the motion, release.
+            let (x2, y2) = (num(5), num(6));
+            pointer.button(tick(), BTN_LEFT, ButtonState::Pressed);
+            pointer.frame();
+            flush(&mut queue);
+            for i in 1..=10 {
+                let at = |a: u32, b: u32| (a as i64 + (b as i64 - a as i64) * i / 10) as u32;
+                pointer.motion_absolute(tick(), at(x, x2), at(y, y2), w, h);
+                pointer.frame();
+                flush(&mut queue);
+            }
+            pointer.button(tick(), BTN_LEFT, ButtonState::Released);
+            pointer.frame();
+        }
         "scroll" => {
             // Positive steps scroll down, like a mouse wheel.
             let steps: i32 = args.get(5).and_then(|a| a.parse().ok()).unwrap_or_else(|| usage());
@@ -86,6 +101,6 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: vpointer <x> <y> <layout width> <layout height> [move|click|right|scroll <steps>]");
+    eprintln!("usage: vpointer <x> <y> <layout width> <layout height> [move|click|right|scroll <steps>|drag <x2> <y2>]");
     std::process::exit(2)
 }

@@ -511,9 +511,12 @@ impl Chat {
                 if self.panes.get(p).is_none() {
                     return Task::none(); // closed meanwhile
                 }
+                let was_focus = self.cur == self.focus;
                 let prev = std::mem::replace(&mut self.cur, p);
                 let task = self.update(*m);
-                self.cur = prev;
+                // Back to the focused pane (which the message may have moved,
+                // or closed `prev`), or to the pane an outer routed message is for.
+                self.cur = if was_focus || self.panes.get(prev).is_none() { self.focus } else { prev };
                 task
             }
             message => self.handle(message),
@@ -735,6 +738,39 @@ impl Chat {
                 }
                 Task::none()
             }
+            Message::SplitPane(axis) => {
+                let view = PaneView::new(self.next_pane, self.pv().channel.clone());
+                self.next_pane += 1;
+                let Some((pane, _)) = self.panes.split(axis, self.cur, view) else { return Task::none() };
+                self.focus = pane;
+                self.cur = pane;
+                Task::batch([to_latest(self.pv().timeline()), operation::focus(self.pv().composer())])
+            }
+            Message::ClosePane if self.panes.len() > 1 => {
+                let Some((_, sibling)) = self.panes.close(self.cur) else { return Task::none() };
+                // The handler's pane is gone: carry on as the one taking its place.
+                self.focus = sibling;
+                self.cur = sibling;
+                operation::focus(self.pv().composer())
+            }
+            Message::ClosePane => Task::none(),
+            Message::FocusAdjacent(direction) => match self.panes.adjacent(self.focus, direction) {
+                Some(pane) => {
+                    self.focus = pane;
+                    self.cur = pane;
+                    operation::focus(self.pv().composer())
+                }
+                None => Task::none(),
+            },
+            Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
+                self.panes.resize(split, ratio);
+                Task::none()
+            }
+            Message::PaneDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
+                self.panes.drop(pane, target);
+                Task::none()
+            }
+            Message::PaneDragged(_) => Task::none(),
             Message::CustomEmoji(Ok(list)) => {
                 self.store.custom_emoji.extend(list.into_iter().filter(|e| e.delete_at == 0).map(|e| (e.name, e.id)));
                 self.fetch_media()
@@ -1296,6 +1332,29 @@ impl Chat {
                 }
                 Task::none()
             }
+            // Ctrl+D splits right, Ctrl+Shift+D down (like terminal splits); Ctrl+W closes.
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
+                if modifiers.command() && !modifiers.alt() && k.eq_ignore_ascii_case("d") =>
+            {
+                let axis = if modifiers.shift() { pane_grid::Axis::Horizontal } else { pane_grid::Axis::Vertical };
+                self.update(Message::SplitPane(axis))
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
+                if modifiers.command() && !modifiers.shift() && k.as_str() == "w" =>
+            {
+                self.update(Message::ClosePane)
+            }
+            // Ctrl+Alt+arrows move between panes.
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Named(named), modifiers, .. }) if modifiers.command() && modifiers.alt() => {
+                let direction = match named {
+                    Named::ArrowLeft => pane_grid::Direction::Left,
+                    Named::ArrowRight => pane_grid::Direction::Right,
+                    Named::ArrowUp => pane_grid::Direction::Up,
+                    Named::ArrowDown => pane_grid::Direction::Down,
+                    _ => return Task::none(),
+                };
+                self.update(Message::FocusAdjacent(direction))
+            }
             Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) if modifiers.alt() => {
                 let step: isize = match key {
                     Key::Named(Named::ArrowUp) => -1,
@@ -1702,5 +1761,39 @@ mod tests {
         chat.drafts.insert("c2".into(), "hi".into());
         let _ = chat.handle(Message::Send);
         assert_eq!(chat.attachments.len(), 1);
+    }
+
+    #[test]
+    fn panes_split_route_and_close() {
+        use iced::widget::pane_grid::{Axis, Direction};
+        let mut chat = chat();
+        let first = chat.focus;
+        let _ = chat.update(Message::SplitPane(Axis::Vertical));
+        let second = chat.focus;
+        assert_ne!(first, second);
+        assert_eq!(chat.focused().channel, "c1", "a new pane shows the same channel");
+
+        // Typing in the first pane's composer drafts there, and focus stays put.
+        chat.store.add_channels(vec![mm_api::models::Channel { id: "c2".into(), ..Default::default() }], vec![]);
+        let _ = chat.update(Message::SelectChannel("c2".into()));
+        let _ = chat.update(Message::InPane(first, Box::new(Message::Draft("in c1".into()))));
+        assert_eq!(chat.drafts.get("c1").map(String::as_str), Some("in c1"));
+        assert_eq!(chat.focus, second);
+        assert_eq!(chat.panes.get(first).unwrap().channel, "c1");
+        assert_eq!(chat.focused().channel, "c2");
+
+        let _ = chat.update(Message::FocusAdjacent(Direction::Left));
+        assert_eq!(chat.focus, first);
+
+        // Closing the focused pane from its own ✕ leaves the other one in charge.
+        let _ = chat.update(Message::InPane(first, Box::new(Message::ClosePane)));
+        assert_eq!(chat.panes.len(), 1);
+        assert_eq!(chat.focus, second);
+        assert_eq!(chat.pv().channel, "c2", "handling carries on with a live pane");
+        // The last pane can't be closed.
+        let _ = chat.update(Message::ClosePane);
+        assert_eq!(chat.panes.len(), 1);
+        // A late result for the closed pane is dropped.
+        let _ = chat.update(Message::InPane(first, Box::new(Message::JumpLocated(Some(10.0)))));
     }
 }
