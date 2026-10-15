@@ -67,6 +67,7 @@ async fn posts_are_returned_oldest_first() {
         .and(path("/api/v4/channels/c1/posts"))
         .and(query_param("page", "0"))
         .and(query_param("per_page", "2"))
+        .and(query_param("collapsedThreads", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "order": ["p2", "p1"],
             "posts": {
@@ -79,7 +80,7 @@ async fn posts_are_returned_oldest_first() {
         .await;
 
     let client = Client::new(&server.uri()).unwrap().with_token("t");
-    let list = client.posts("c1", PostsQuery::Page { page: 0, per_page: 2 }).await.unwrap();
+    let list = client.posts("c1", PostsQuery::Page { page: 0, per_page: 2 }, true).await.unwrap();
     let msgs: Vec<_> = list.chronological().iter().map(|p| p.message.as_str()).collect();
     assert_eq!(msgs, ["first", "second"]);
     assert!(list.posts["p2"].is_reply());

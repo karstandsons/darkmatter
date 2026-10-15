@@ -1,4 +1,6 @@
 mod app;
+mod chat;
+mod chat_view;
 mod session;
 mod store;
 mod style;

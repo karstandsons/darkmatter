@@ -98,9 +98,12 @@ impl Client {
         self.get(&format!("channels/{channel_id}")).await
     }
 
-    pub async fn posts(&self, channel_id: &str, query: PostsQuery) -> Result<PostList, Error> {
+    /// A channel's posts. With `collapsed_threads` the server returns only root
+    /// posts with accurate `reply_count`s (replies are fetched per thread);
+    /// without it, replies are inline and `reply_count` is always 0.
+    pub async fn posts(&self, channel_id: &str, query: PostsQuery, collapsed_threads: bool) -> Result<PostList, Error> {
         let path = format!("channels/{channel_id}/posts");
-        let req = self.request(Method::GET, &path)?;
+        let req = self.request(Method::GET, &path)?.query(&[("collapsedThreads", collapsed_threads)]);
         let req = match query {
             PostsQuery::Page { page, per_page } => req.query(&[("page", page), ("per_page", per_page)]),
             PostsQuery::Since(since) => req.query(&[("since", since)]),

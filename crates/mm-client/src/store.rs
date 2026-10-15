@@ -1,7 +1,7 @@
 //! Client-side model of the server state, updated from REST loads and WebSocket events.
 //! Kept free of view code so the bookkeeping (unreads, ordering, dedup) is unit-testable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iced::widget::markdown;
 use mm_api::models::{Channel, ChannelMember, ChannelType, Id, Post, PostList, Reaction, Team, User};
@@ -49,7 +49,13 @@ pub struct Store {
     pub channels: HashMap<Id, Channel>,
     pub members: HashMap<Id, ChannelMember>,
     pub users: HashMap<Id, User>,
+    /// Channel histories, keyed by channel id.
     pub timelines: HashMap<Id, Timeline>,
+    /// Open/loaded threads, keyed by root post id. Includes the root post.
+    pub threads: HashMap<Id, Timeline>,
+    /// Replies already counted into their root's `reply_count`, so the REST
+    /// reply to our own send and its WebSocket echo don't both count.
+    counted_replies: HashSet<Id>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +75,8 @@ impl Store {
             members: HashMap::new(),
             users,
             timelines: HashMap::new(),
+            threads: HashMap::new(),
+            counted_replies: HashSet::new(),
         }
     }
 
@@ -93,7 +101,7 @@ impl Store {
             .channels
             .values()
             .filter_map(|c| c.dm_partner(&self.me.id).map(str::to_string))
-            .chain(self.timelines.values().flat_map(|t| t.entries.iter().map(|e| e.post.user_id.clone())))
+            .chain(self.all_timelines().flat_map(|t| t.entries.iter().map(|e| e.post.user_id.clone())))
             .filter(|id| !id.is_empty() && !self.users.contains_key(id))
             .collect();
         ids.sort();
@@ -138,9 +146,10 @@ impl Store {
 
     pub fn unread(&self, channel_id: &str) -> Unread {
         match (self.channels.get(channel_id), self.members.get(channel_id)) {
+            // Collapsed threads: only root posts make a channel unread.
             (Some(c), Some(m)) => Unread {
-                has_unread: m.unread_count(c) > 0 && !m.is_muted(),
-                mentions: m.mention_count,
+                has_unread: c.total_msg_count_root > m.msg_count_root && !m.is_muted(),
+                mentions: m.mention_count_root,
             },
             _ => Unread::default(),
         }
@@ -158,6 +167,51 @@ impl Store {
             })
     }
 
+    fn all_timelines(&self) -> impl Iterator<Item = &Timeline> {
+        self.timelines.values().chain(self.threads.values())
+    }
+
+    fn all_timelines_mut(&mut self) -> impl Iterator<Item = &mut Timeline> {
+        self.timelines.values_mut().chain(self.threads.values_mut())
+    }
+
+    pub fn set_thread(&mut self, root_id: &str, list: PostList) {
+        self.counted_replies.extend(list.posts.values().filter(|p| p.is_reply()).map(|p| p.id.clone()));
+        let t = self.threads.entry(root_id.to_string()).or_default();
+        for p in list.posts.into_values() {
+            t.upsert(p);
+        }
+        t.loaded = true;
+    }
+
+    pub fn post(&self, id: &str) -> Option<&Post> {
+        self.all_timelines().flat_map(|t| &t.entries).map(|e| &e.post).find(|p| p.id == id)
+    }
+
+    /// Put a new or changed post where it is shown. Channels list root posts
+    /// only (collapsed threads); replies go to their thread and bump the root's count.
+    fn place(&mut self, post: Post, is_new: bool) {
+        if !post.is_reply() {
+            if let Some(t) = self.threads.get_mut(&post.id) {
+                t.upsert(post.clone());
+            }
+            if let Some(t) = self.timelines.get_mut(&post.channel_id) {
+                t.upsert(post);
+            }
+            return;
+        }
+        if is_new && self.counted_replies.insert(post.id.clone()) {
+            for t in self.all_timelines_mut() {
+                if let Some(root) = t.post_mut(&post.root_id) {
+                    root.reply_count += 1;
+                }
+            }
+        }
+        if let Some(t) = self.threads.get_mut(&post.root_id) {
+            t.upsert(post);
+        }
+    }
+
     pub fn set_history(&mut self, channel_id: &str, list: PostList) {
         let t = self.timelines.entry(channel_id.to_string()).or_default();
         for p in list.posts.into_values() {
@@ -172,51 +226,55 @@ impl Store {
         let channel_id = post.channel_id.clone();
         let mine = post.user_id == self.me.id;
         let mentioned = !mine && mentions.contains(&self.me.id);
+        let root = !post.is_reply();
         if let Some(c) = self.channels.get_mut(&channel_id) {
             c.total_msg_count += 1;
+            c.total_msg_count_root += root as i64;
             c.last_post_at = c.last_post_at.max(post.create_at);
         }
         if let Some(m) = self.members.get_mut(&channel_id) {
             if mine || viewing {
                 m.msg_count += 1;
+                m.msg_count_root += root as i64;
             } else if mentioned {
                 m.mention_count += 1;
+                m.mention_count_root += root as i64;
             }
         }
-        if let Some(t) = self.timelines.get_mut(&channel_id) {
-            t.upsert(post);
-        }
+        self.place(post, true);
         mentioned && !viewing
     }
 
     /// Our own send succeeded; the `posted` event may arrive before or after this.
     pub fn sent(&mut self, post: Post) {
-        if let Some(t) = self.timelines.get_mut(&post.channel_id) {
-            t.upsert(post);
-        }
+        self.place(post, true);
     }
 
     pub fn edited(&mut self, post: Post) {
-        if let Some(t) = self.timelines.get_mut(&post.channel_id) {
-            t.upsert(post);
-        }
+        self.place(post, false);
     }
 
     pub fn deleted(&mut self, post: &Post) {
-        if let Some(t) = self.timelines.get_mut(&post.channel_id) {
+        for t in self.all_timelines_mut() {
             t.entries.retain(|e| e.post.id != post.id);
+        }
+        if post.is_reply() && self.counted_replies.remove(&post.id) {
+            for t in self.all_timelines_mut() {
+                if let Some(root) = t.post_mut(&post.root_id) {
+                    root.reply_count = (root.reply_count - 1).max(0);
+                }
+            }
         }
     }
 
     pub fn reaction(&mut self, r: Reaction, added: bool) {
-        for t in self.timelines.values_mut() {
+        for t in self.all_timelines_mut() {
             if let Some(p) = t.post_mut(&r.post_id) {
                 let list = &mut p.metadata.reactions;
                 list.retain(|x| !(x.user_id == r.user_id && x.emoji_name == r.emoji_name));
                 if added {
-                    list.push(r);
+                    list.push(r.clone());
                 }
-                return;
             }
         }
     }
@@ -224,7 +282,9 @@ impl Store {
     pub fn mark_viewed(&mut self, channel_id: &str) {
         if let (Some(c), Some(m)) = (self.channels.get(channel_id), self.members.get_mut(channel_id)) {
             m.msg_count = c.total_msg_count;
+            m.msg_count_root = c.total_msg_count_root;
             m.mention_count = 0;
+            m.mention_count_root = 0;
         }
     }
 }
@@ -245,12 +305,19 @@ mod tests {
         let mut s = Store::new(user("me"));
         s.add_channels(
             vec![
-                Channel { id: "c1".into(), team_id: "t".into(), display_name: "Beta".into(), total_msg_count: 2, ..Default::default() },
+                Channel {
+                    id: "c1".into(),
+                    team_id: "t".into(),
+                    display_name: "Beta".into(),
+                    total_msg_count: 2,
+                    total_msg_count_root: 2,
+                    ..Default::default()
+                },
                 Channel { id: "c2".into(), team_id: "t".into(), display_name: "alpha".into(), ..Default::default() },
                 Channel { id: "d1".into(), kind: ChannelType::Direct, name: "me__bob".into(), last_post_at: 5, ..Default::default() },
             ],
             vec![
-                ChannelMember { channel_id: "c1".into(), msg_count: 2, ..Default::default() },
+                ChannelMember { channel_id: "c1".into(), msg_count: 2, msg_count_root: 2, ..Default::default() },
                 ChannelMember { channel_id: "c2".into(), ..Default::default() },
                 ChannelMember { channel_id: "d1".into(), ..Default::default() },
             ],
@@ -315,6 +382,41 @@ mod tests {
 
         s.deleted(&post("mid", "c1", "bob", 15));
         assert_eq!(s.timelines["c1"].entries.len(), 3);
+    }
+
+    #[test]
+    fn replies_reach_open_thread_and_bump_reply_count() {
+        let mut s = store();
+        let mut list = PostList::default();
+        let root = post("root", "c1", "bob", 10);
+        list.order.push(root.id.clone());
+        list.posts.insert(root.id.clone(), root.clone());
+        s.set_history("c1", list.clone());
+        s.set_thread("root", list);
+
+        let reply = Post { root_id: "root".into(), ..post("r1", "c1", "me", 20) };
+        s.sent(reply.clone());
+        s.posted(reply.clone(), &[], true); // the echo must not double count
+        assert_eq!(s.timelines["c1"].entries[0].post.reply_count, 1);
+        assert_eq!(s.threads["root"].entries[0].post.reply_count, 1);
+        let thread: Vec<_> = s.threads["root"].entries.iter().map(|e| e.post.id.as_str()).collect();
+        assert_eq!(thread, ["root", "r1"]);
+        // Collapsed threads: the reply is not shown in the channel itself.
+        assert_eq!(s.timelines["c1"].entries.len(), 1);
+
+        // A reply from someone else doesn't make the channel unread.
+        s.posted(Post { root_id: "root".into(), ..post("r2", "c1", "bob", 30) }, &[], false);
+        assert!(!s.unread("c1").has_unread);
+        assert_eq!(s.timelines["c1"].entries[0].post.reply_count, 2);
+
+        let r = Reaction { user_id: "bob".into(), post_id: "r1".into(), emoji_name: "eyes".into(), create_at: 0 };
+        s.reaction(r, true);
+        assert_eq!(s.threads["root"].entries[1].post.metadata.reactions.len(), 1);
+
+        s.deleted(&reply);
+        assert_eq!(s.threads["root"].entries.len(), 2);
+        assert_eq!(s.timelines["c1"].entries[0].post.reply_count, 1);
+        assert!(s.post("root").is_some());
     }
 
     #[test]

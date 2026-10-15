@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  {name:<40} {:>4} unread", unread);
         }
         if let Some(ch) = channels.iter().find(|c| c.name == "town-square") {
-            let posts = client.posts(&ch.id, PostsQuery::Page { page: 0, per_page: 5 }).await?;
+            let posts = client.posts(&ch.id, PostsQuery::Page { page: 0, per_page: 5 }, true).await?;
             println!("  last posts in ~town-square:");
             for p in posts.chronological() {
                 println!("    {}", p.message.lines().next().unwrap_or_default());

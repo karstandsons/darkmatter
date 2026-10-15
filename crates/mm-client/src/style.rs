@@ -124,6 +124,15 @@ impl Colors {
         }
     }
 
+    /// Text-only button, e.g. "3 replies".
+    pub fn link_button(self) -> impl Fn(&Theme, button::Status) -> button::Style {
+        move |_, status| button::Style {
+            background: None,
+            text_color: if matches!(status, button::Status::Hovered) { self.fg_bright } else { self.accent },
+            ..Default::default()
+        }
+    }
+
     pub fn primary_button(self) -> impl Fn(&Theme, button::Status) -> button::Style {
         move |_, status| button::Style {
             background: Some(Background::Color(match status {

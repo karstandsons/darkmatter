@@ -1,0 +1,337 @@
+//! Chat screen views.
+
+use iced::widget::{
+    Column, button, center, column, container, hover, markdown, row, rule, scrollable, space, text, text_input,
+};
+use iced::{Element, Length, Theme};
+use mm_api::models::{Channel, ChannelType, Post};
+
+use crate::app::Message;
+use crate::chat::{COMPOSER, Chat, THREAD, THREAD_COMPOSER, TIMELINE};
+use crate::store::Entry;
+use crate::style::{Colors, bold, italic};
+use crate::text as fmt;
+
+const PANE_FOOTER: iced::Padding = iced::Padding { top: 0.0, right: 20.0, bottom: 16.0, left: 20.0 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Channel,
+    Thread,
+}
+
+impl Chat {
+    pub fn view<'a>(&'a self, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
+        let mut layout = row![];
+        if self.store.teams.len() > 1 {
+            layout = layout.push(self.team_rail(c));
+        }
+        layout = layout.push(self.sidebar(c)).push(self.main(c, theme));
+        if let Some(root) = &self.thread {
+            layout = layout.push(rule::vertical(1)).push(self.thread_pane(root, c, theme));
+        }
+        layout.into()
+    }
+
+    fn team_rail(&self, c: Colors) -> Element<'_, Message> {
+        let teams = self.store.teams.iter().map(|t| {
+            let initials: String = t.display_name.chars().filter(|ch| ch.is_alphanumeric()).take(2).collect();
+            let unread = self.store.team_unread(&t.id);
+            let label = text(initials).size(15).center().width(Length::Fill);
+            let label = if unread.has_unread { label.font(bold()) } else { label };
+            button(label)
+                .width(40)
+                .height(40)
+                .padding([10, 0])
+                .on_press(Message::SelectTeam(t.id.clone()))
+                .style(c.team_button(t.id == self.team))
+                .into()
+        });
+        container(Column::with_children(teams).spacing(10).padding(10))
+            .height(Length::Fill)
+            .style(c.panel(c.rail))
+            .into()
+    }
+
+    fn sidebar(&self, c: Colors) -> Element<'_, Message> {
+        let team = self.store.teams.iter().find(|t| t.id == self.team);
+        let (regular, direct) = self.store.sidebar(&self.team);
+
+        let item = |ch: &Channel| -> Element<'_, Message> {
+            let unread = self.store.unread(&ch.id);
+            let sigil = match ch.kind {
+                ChannelType::Private => "🔒",
+                ChannelType::Direct => "@",
+                ChannelType::Group => "👥",
+                _ => "#",
+            };
+            let mut name = text(self.store.channel_label(ch)).size(14);
+            name = if unread.has_unread || unread.mentions > 0 {
+                name.font(bold()).color(c.fg_bright)
+            } else {
+                name.color(c.fg)
+            };
+            let mut line = row![text(sigil).size(13).color(c.muted).width(18), name].spacing(6);
+            if unread.mentions > 0 {
+                line = line.push(space::horizontal()).push(
+                    container(text(unread.mentions.to_string()).size(11).font(bold())).padding([1, 7]).style(c.badge()),
+                );
+            }
+            button(line)
+                .width(Length::Fill)
+                .padding([5, 10])
+                .on_press(Message::SelectChannel(ch.id.clone()))
+                .style(c.row_button(ch.id == self.channel))
+                .into()
+        };
+        let section = |label: &'static str| text(label).size(11).font(bold()).color(c.muted);
+
+        let mut list = column![section("CHANNELS")].spacing(2);
+        for ch in regular {
+            list = list.push(item(ch));
+        }
+        list = list.push(space().height(12)).push(section("DIRECT MESSAGES"));
+        for ch in direct {
+            list = list.push(item(ch));
+        }
+
+        let status_color = if self.online { c.green } else { c.yellow };
+        let footer = row![
+            text("●").size(10).color(status_color),
+            text(format!("@{}", self.store.me.username)).size(13).color(c.fg),
+            space::horizontal(),
+            button(text("Log out").size(12).color(c.muted))
+                .padding([2, 6])
+                .on_press(Message::Logout)
+                .style(c.row_button(false)),
+        ]
+        .spacing(8)
+        .align_y(iced::Center);
+
+        container(
+            column![
+                text(team.map_or("", |t| t.display_name.as_str())).size(17).font(bold()).color(c.fg_bright),
+                scrollable(list.padding([0, 4])).height(Length::Fill),
+                footer,
+            ]
+            .spacing(14)
+            .padding(12),
+        )
+        .width(250)
+        .height(Length::Fill)
+        .style(c.panel(c.sidebar))
+        .into()
+    }
+
+    fn main<'a>(&'a self, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
+        let Some(channel) = self.store.channels.get(&self.channel) else {
+            return center(text("No channel selected").color(c.muted)).into();
+        };
+        let mut header = row![text(self.store.channel_label(channel)).size(17).font(bold()).color(c.fg_bright)]
+            .spacing(12)
+            .align_y(iced::Center);
+        let topic = if channel.header.is_empty() { &channel.purpose } else { &channel.header };
+        if !topic.is_empty() {
+            header = header.push(text(topic.lines().next().unwrap_or_default()).size(13).color(c.muted));
+        }
+
+        let timeline: Element<'_, Message> = match self.store.timelines.get(&self.channel) {
+            Some(t) if t.loaded => self.timeline(&t.entries, Pane::Channel, c, theme),
+            _ => center(text("Loading…").color(c.muted)).into(),
+        };
+
+        let composer = text_input(&format!("Message {}", self.store.channel_label(channel)), &self.draft)
+            .id(COMPOSER)
+            .on_input(Message::Draft)
+            .on_submit(Message::Send)
+            .padding(12)
+            .style(c.input());
+
+        let mut col = column![container(header).padding([12, 20]), rule::horizontal(1), timeline];
+        if let Some(e) = &self.error {
+            col = col.push(container(text(e).size(12).color(c.red)).padding([4, 20]));
+        }
+        let typing = self.typing_line(&self.channel, "", c);
+        col.push(container(column![typing, composer].spacing(4)).padding(PANE_FOOTER))
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// Right-hand pane with the open thread and its own reply box.
+    pub(crate) fn thread_pane<'a>(&'a self, root_id: &'a str, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
+        let channel = self
+            .store
+            .post(root_id)
+            .and_then(|p| self.store.channels.get(&p.channel_id))
+            .map(|ch| self.store.channel_label(ch))
+            .unwrap_or_default();
+        let header = row![
+            text("Thread").size(17).font(bold()).color(c.fg_bright),
+            text(channel).size(13).color(c.muted),
+            space::horizontal(),
+            button(text("✕").size(14).color(c.muted)).padding([2, 8]).on_press(Message::CloseThread).style(c.row_button(false)),
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+
+        let body: Element<'_, Message> = match self.store.threads.get(root_id) {
+            Some(t) if t.loaded => self.timeline(&t.entries, Pane::Thread, c, theme),
+            _ => center(text("Loading…").color(c.muted)).into(),
+        };
+        let composer = text_input("Reply…", &self.thread_draft)
+            .id(THREAD_COMPOSER)
+            .on_input(Message::ThreadDraft)
+            .on_submit(Message::SendReply)
+            .padding(12)
+            .style(c.input());
+        let channel_id = self.store.post(root_id).map_or("", |p| p.channel_id.as_str());
+        let typing = self.typing_line(channel_id, root_id, c);
+
+        container(
+            column![
+                container(header).padding([12, 20]),
+                rule::horizontal(1),
+                body,
+                container(column![typing, composer].spacing(4)).padding(PANE_FOOTER),
+            ]
+            .width(Length::Fill),
+        )
+        .width(420)
+        .height(Length::Fill)
+        .style(c.panel(c.sidebar))
+        .into()
+    }
+
+    fn typing_line(&self, channel_id: &str, parent_id: &str, c: Colors) -> Element<'_, Message> {
+        let names: Vec<&str> = self
+            .typing
+            .keys()
+            .filter(|(ch, _, parent)| ch == channel_id && parent == parent_id)
+            .filter_map(|(_, u, _)| self.store.users.get(u).map(|u| u.username.as_str()))
+            .collect();
+        text(match names.len() {
+            0 => String::new(),
+            1 => format!("{} is typing…", names[0]),
+            _ => format!("{} are typing…", names.join(", ")),
+        })
+        .size(12)
+        .color(c.muted)
+        .into()
+    }
+
+    fn timeline<'a>(&'a self, entries: &'a [Entry], pane: Pane, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
+        let md_settings = c.markdown(theme);
+        let now = chrono::Local::now();
+        let mut col = Column::new().spacing(2).padding([12, 20]);
+        let mut prev: Option<&Post> = None;
+        for entry in entries {
+            let post = &entry.post;
+            if prev.is_none_or(|p| !fmt::same_day(p.create_at, post.create_at)) {
+                col = col.push(
+                    row![rule::horizontal(1), text(fmt::day_label(post.create_at, now)).size(12).color(c.muted), rule::horizontal(1)]
+                        .spacing(10)
+                        .align_y(iced::Center)
+                        .padding([8, 0]),
+                );
+                prev = None;
+            }
+            let continued = prev.is_some_and(|p| {
+                p.user_id == post.user_id
+                    && post.create_at - p.create_at < 5 * 60 * 1000
+                    && !p.is_system()
+                    // In a thread, keep the root post visually separate from its replies.
+                    && p.is_reply() == post.is_reply()
+            });
+            col = col.push(self.post_view(entry, continued, pane, c, md_settings));
+            prev = Some(post);
+        }
+        let id = match pane {
+            Pane::Channel => TIMELINE,
+            Pane::Thread => THREAD,
+        };
+        scrollable(col).id(id).anchor_bottom().height(Length::Fill).into()
+    }
+
+    fn post_view<'a>(
+        &'a self,
+        entry: &'a Entry,
+        continued: bool,
+        pane: Pane,
+        c: Colors,
+        md: markdown::Settings,
+    ) -> Element<'a, Message> {
+        let post = &entry.post;
+        if post.is_system() {
+            return container(text(&post.message).size(13).color(c.muted).font(italic()))
+                .padding([4, 0])
+                .into();
+        }
+        let viewer = crate::viewer::PostViewer { colors: c };
+        let mut body = column![markdown::view_with(&entry.markdown, md, &viewer)].spacing(4);
+        if post.edit_at > 0 {
+            body = body.push(text("(edited)").size(11).color(c.muted));
+        }
+        if let Some(reactions) = self.reactions(post, c) {
+            body = body.push(reactions);
+        }
+        let thread_root = if post.is_reply() { &post.root_id } else { &post.id };
+        if pane == Pane::Channel && !post.is_reply() && post.reply_count > 0 {
+            let label = match post.reply_count {
+                1 => "💬 1 reply".to_string(),
+                n => format!("💬 {n} replies"),
+            };
+            body = body.push(
+                button(text(label).size(12).color(c.accent))
+                    .padding([2, 0])
+                    .on_press(Message::OpenThread(post.id.clone()))
+                    .style(c.link_button()),
+            );
+        }
+
+        let content: Element<'_, Message> = if continued {
+            body.into()
+        } else {
+            let name = row![
+                text(self.store.display_name(post)).font(bold()).size(14).color(c.name_color(&post.user_id)),
+                text(fmt::time_of_day(post.create_at)).size(11).color(c.muted),
+            ]
+            .spacing(8)
+            .align_y(iced::Center);
+            container(column![name, body].spacing(2)).padding(iced::Padding { top: 8.0, ..iced::Padding::ZERO }).into()
+        };
+
+        if pane == Pane::Thread {
+            return content;
+        }
+        // Reply action appears in the top-right corner on hover.
+        let reply = button(text("↩ Reply").size(12)).padding([2, 8]).on_press(Message::OpenThread(thread_root.clone())).style(c.chip(false));
+        hover(content, container(reply).width(Length::Fill).align_x(iced::alignment::Horizontal::Right))
+    }
+
+    fn reactions(&self, post: &Post, c: Colors) -> Option<Element<'_, Message>> {
+        let reactions = &post.metadata.reactions;
+        if reactions.is_empty() {
+            return None;
+        }
+        let mut counts: Vec<(&str, usize, bool)> = Vec::new();
+        for r in reactions {
+            let mine = r.user_id == self.store.me.id;
+            match counts.iter_mut().find(|(e, ..)| *e == r.emoji_name) {
+                Some((_, n, m)) => {
+                    *n += 1;
+                    *m |= mine;
+                }
+                None => counts.push((&r.emoji_name, 1, mine)),
+            }
+        }
+        let chips = counts.into_iter().map(|(name, n, mine)| {
+            let glyph = fmt::emoji(name).map_or_else(|| format!(":{name}:"), str::to_string);
+            button(text(format!("{glyph} {n}")).size(12))
+                .padding([2, 8])
+                .on_press(Message::React(post.id.clone(), name.to_string(), !mine))
+                .style(c.chip(mine))
+                .into()
+        });
+        Some(iced::widget::Row::with_children(chips).spacing(6).into())
+    }
+}
