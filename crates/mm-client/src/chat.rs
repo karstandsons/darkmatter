@@ -58,6 +58,8 @@ pub struct Chat {
     pub inline_threads: bool,
     /// Roots whose replies are expanded inline.
     pub expanded: HashSet<String>,
+    /// Inline threads showing every reply rather than the latest few.
+    pub all_replies: HashSet<String>,
     /// Latest timeline viewport, and while a thread expands or collapses above
     /// the bottom, the (content height, offset from bottom) to keep the top still.
     viewport: Option<iced::widget::scrollable::Viewport>,
@@ -120,10 +122,16 @@ impl Chat {
         }
     }
 
-    /// Keep the messages on screen still while a thread above the bottom
-    /// expands or collapses (the bottom anchor would otherwise push them up).
-    fn hold_view(&mut self) {
-        self.hold_top = self.viewport.map(|v| (v.content_bounds().height, v.absolute_offset().y)).filter(|(_, from_bottom)| *from_bottom > 4.0);
+    /// Keep the messages on screen still while `root`'s thread expands or
+    /// collapses, so its replies grow downward from it (the bottom anchor would
+    /// otherwise push it up and out of view). The newest message is the
+    /// exception when you're at the bottom: staying there keeps its reply box in view.
+    fn hold_view(&mut self, root: &str) {
+        let newest = self.store.timelines.get(&self.channel).and_then(|t| t.entries.last()).is_some_and(|e| e.post.id == root);
+        self.hold_top = self
+            .viewport
+            .map(|v| (v.content_bounds().height, v.absolute_offset().y))
+            .filter(|(_, from_bottom)| !newest || *from_bottom > 4.0);
     }
 
     pub fn thread_draft(&self) -> &str {
@@ -151,6 +159,7 @@ impl Chat {
             thread: None,
             inline_threads: true,
             expanded: HashSet::new(),
+            all_replies: HashSet::new(),
             viewport: None,
             hold_top: None,
             switcher: None,
@@ -262,6 +271,13 @@ impl Chat {
         let (key, composer) = if post.is_reply() {
             self.thread = Some(post.root_id.clone());
             self.expanded.insert(post.root_id.clone());
+            // Show the reply being edited if it's older than the latest few.
+            let newer = self.store.threads.get(&post.root_id).map_or(0, |t| {
+                t.entries.iter().filter(|e| e.post.is_reply() && e.post.create_at > post.create_at).count()
+            });
+            if newer >= crate::chat_view::INLINE_REPLIES {
+                self.all_replies.insert(post.root_id.clone());
+            }
             (thread_key(&post.root_id), THREAD_COMPOSER)
         } else {
             (post.channel_id.clone(), COMPOSER)
@@ -486,9 +502,15 @@ impl Chat {
                 self.store.sent(post);
                 to_latest(if in_thread { THREAD } else { TIMELINE })
             }
+            Message::ShowAllReplies(root) => {
+                self.hold_view(&root);
+                self.all_replies.insert(root);
+                Task::none()
+            }
             Message::ToggleThread(root) if self.expanded.contains(&root) => {
-                self.hold_view();
+                self.hold_view(&root);
                 self.expanded.remove(&root);
+                self.all_replies.remove(&root);
                 if self.thread.as_ref() == Some(&root) {
                     self.thread = None;
                 }
@@ -497,7 +519,7 @@ impl Chat {
             Message::ToggleThread(root) => self.update(Message::OpenThread(root)),
             Message::OpenThread(root) => {
                 if self.is_inline(&root) && !self.expanded.contains(&root) {
-                    self.hold_view();
+                    self.hold_view(&root);
                     self.expanded.insert(root.clone());
                 }
                 self.thread = Some(root.clone());
@@ -530,8 +552,9 @@ impl Chat {
             }
             Message::CloseThread => {
                 if let Some(root) = self.thread.take().filter(|r| self.is_inline(r)) {
-                    self.hold_view();
+                    self.hold_view(&root);
                     self.expanded.remove(&root);
+                    self.all_replies.remove(&root);
                 }
                 operation::focus(COMPOSER)
             }
@@ -1311,8 +1334,11 @@ mod tests {
         assert!(chat.expanded.contains("root"));
         assert_eq!(chat.thread.as_deref(), Some("root"), "the reply box goes under it");
         assert!(chat.pane_thread().is_none());
+        let _ = chat.handle(Message::ShowAllReplies("root".into()));
+        assert!(chat.all_replies.contains("root"));
         let _ = chat.handle(Message::ToggleThread("root".into()));
         assert!(!chat.expanded.contains("root") && chat.thread.is_none());
+        assert!(chat.all_replies.is_empty(), "reopening shows the latest few again");
 
         // Esc collapses the thread being replied to.
         let _ = chat.handle(Message::OpenThread("root".into()));

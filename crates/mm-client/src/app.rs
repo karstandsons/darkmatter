@@ -93,6 +93,8 @@ pub enum Message {
     OpenThread(String),
     /// Expand or collapse a thread under its message (inline layout).
     ToggleThread(String),
+    /// Show all of an inline thread's replies, not just the latest few.
+    ShowAllReplies(String),
     /// Switch threads between inline and the side pane.
     ToggleThreadLayout,
     CloseThread,

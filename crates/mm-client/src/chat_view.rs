@@ -18,6 +18,10 @@ use crate::text as fmt;
 const AVATAR: f32 = 34.0;
 const GUTTER: f32 = 46.0;
 
+/// Replies an inline thread shows before "Show N earlier replies", so its
+/// reply box stays near the message instead of a screen or more below it.
+pub const INLINE_REPLIES: usize = 5;
+
 const PANE_FOOTER: iced::Padding = iced::Padding { top: 0.0, right: 20.0, bottom: 16.0, left: 20.0 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -384,8 +388,19 @@ impl Chat {
         let mut replies = Column::new().spacing(2);
         match self.store.threads.get(root_id) {
             Some(t) if t.loaded => {
+                let all: Vec<&Entry> = t.entries.iter().filter(|e| e.post.is_reply()).collect();
+                let hidden = if self.all_replies.contains(root_id) { 0 } else { all.len().saturating_sub(INLINE_REPLIES) };
+                if hidden > 0 {
+                    let label = if hidden == 1 { "↑ Show 1 earlier reply".to_string() } else { format!("↑ Show {hidden} earlier replies") };
+                    replies = replies.push(
+                        button(text(label).size(12).color(c.accent))
+                            .padding([4, 0])
+                            .on_press(Message::ShowAllReplies(root_id.to_string()))
+                            .style(c.link_button()),
+                    );
+                }
                 let mut prev: Option<&Post> = None;
-                for entry in t.entries.iter().filter(|e| e.post.is_reply()) {
+                for entry in &all[hidden..] {
                     let post = &entry.post;
                     let continued = prev.is_some_and(|p| p.user_id == post.user_id && post.create_at - p.create_at < 5 * 60 * 1000);
                     replies = replies.push(self.post_view(entry, continued, Pane::Thread, c, md));
