@@ -5,6 +5,12 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **Theme picker:** clicking a theme now uses it. Before, a click only
+  previewed it, and closing the picker undid it. Picking a theme always
+  applies it right away (Fixed); Auto light/dark is set with its own
+  ☀ Light and ☾ Dark buttons. Previously, in Auto (the default on macOS),
+  a pick quietly went into a slot and seemed to do nothing.
+
 ## [0.1.0] - 2026-10-15
 
 The first release: a Mattermost client for Omarchy and other Linux desktops,

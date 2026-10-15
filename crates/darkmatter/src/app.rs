@@ -63,7 +63,10 @@ pub enum Message {
     OpenThemes,
     CloseThemes,
     ThemeQuery(String),
-    ThemeSelect(usize),
+    /// A click on a theme: choose it (arrow keys only preview; Enter chooses).
+    ThemePick(usize),
+    /// Choose (or stop choosing) the light or dark theme for Auto.
+    ThemeSlot(theme_picker::Slot),
     ThemeCommit,
     ThemeMode(ModeTab),
     ThemeUrl(String),
@@ -302,21 +305,44 @@ impl App {
                 }
                 Task::none()
             }
-            Message::ThemeSelect(i) => {
+            Message::ThemePick(i) => {
                 if let Some(p) = &mut self.picker {
                     p.selected = i;
-                    self.preview = p.current().map(str::to_string);
-                    self.apply_theme();
                 }
-                Task::none()
+                return self.update_picker(Message::ThemeCommit);
             }
             Message::ThemeCommit => {
                 let entry = self.picker.as_ref().and_then(|p| p.current()).and_then(|s| self.catalog.get(s)).cloned();
-                if let Some(entry) = entry {
-                    let choice = theme_picker::commit(&self.choice(), &entry);
-                    self.save_choice(&choice);
+                let Some(entry) = entry else {
+                    self.picker = None;
+                    return ControlFlow::Break(Task::none());
+                };
+                let slot = self.picker.as_ref().and_then(|p| p.slot);
+                let choice = theme_picker::commit(&self.choice(), &entry, slot);
+                self.save_choice(&choice);
+                match (slot, &mut self.picker) {
+                    // Filled an Auto slot: stay open, so the other one can be set too.
+                    (Some(slot), Some(p)) => {
+                        let (icon, which) = if slot == theme_picker::Slot::Light { ("☀", "light") } else { ("☾", "dark") };
+                        p.status = Some((false, format!("{icon} {} is your {which} theme", entry.display_name)));
+                        p.slot = None;
+                        p.refresh(&self.catalog);
+                        p.select_slug(&self.theme.name);
+                    }
+                    _ => self.picker = None,
                 }
-                self.picker = None;
+                Task::none()
+            }
+            Message::ThemeSlot(slot) => {
+                if let Some(p) = &mut self.picker {
+                    p.slot = if p.slot == Some(slot) { None } else { Some(slot) };
+                    p.status = None;
+                    p.refresh(&self.catalog);
+                    // Start on the theme already in that slot.
+                    if let ThemeChoice::Auto { light, dark } = self.config.theme.choice(self.omarchy) {
+                        p.select_slug(if slot == theme_picker::Slot::Light { &light } else { &dark });
+                    }
+                }
                 Task::none()
             }
             Message::ThemeMode(tab) => {

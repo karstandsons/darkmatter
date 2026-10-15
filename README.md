@@ -108,7 +108,7 @@ Darkmatter uses Omarchy's theme format (`colors.toml`) everywhere:
 
 - **On Omarchy** it follows `omarchy theme set` live by default.
 - **Elsewhere** (other distros, macOS) it follows the OS light/dark setting: Tokyo Night when dark, Catppuccin Latte when light.
-- **Ctrl+T** (or "Themes" in the sidebar) opens the picker. Choose Follow Omarchy, Fixed, or Auto light/dark. Arrow keys preview live, Enter keeps the theme (in Auto it fills the light or dark slot), Esc cancels.
+- **Ctrl+T** (or "Themes" in the sidebar) opens the picker. Arrow keys preview live; Enter or a click uses that theme from then on (Fixed), and Esc cancels. Auto light/dark has its own ☀ Light and ☾ Dark buttons: click one, then pick the theme for it.
 - **All 22 Omarchy base themes are built in**, so they work without Omarchy. Themes installed in Omarchy (`~/.config/omarchy/themes`) show up too.
 - **Install from git** in the picker, with the same URLs as `omarchy theme install` (see [omarchy.org/themes](https://omarchy.org/themes/)). Themes go to `~/.config/darkmatter/themes`. On Omarchy, "Also install to Omarchy" runs `omarchy theme install`, which also switches your desktop theme. Only `colors.toml` is read from a theme repo; nothing in it is run.
 

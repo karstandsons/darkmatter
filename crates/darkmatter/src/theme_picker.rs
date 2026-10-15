@@ -22,8 +22,18 @@ pub enum ModeTab {
     Auto,
 }
 
+/// Which half of an Auto (light/dark) pair is being chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    Light,
+    Dark,
+}
+
 #[derive(Default)]
 pub struct ThemePicker {
+    /// Choosing the light or dark theme for Auto; the list shows only those.
+    /// Without a slot, picking a theme uses it right away (Fixed).
+    pub slot: Option<Slot>,
     pub query: String,
     pub selected: usize,
     /// Slugs matching the query, best first.
@@ -48,6 +58,7 @@ impl ThemePicker {
         let mut scored: Vec<(i64, &ThemeEntry)> = catalog
             .entries
             .iter()
+            .filter(|e| self.slot.is_none_or(|slot| e.is_light() == (slot == Slot::Light)))
             .filter_map(|e| Some((score(&self.query, &e.display_name).or_else(|| score(&self.query, &e.slug))?, e)))
             .collect();
         if !self.query.is_empty() {
@@ -110,6 +121,25 @@ impl ThemePicker {
         tabs = tabs
             .push(tab("Fixed", ModeTab::Fixed, matches!(choice, ThemeChoice::Fixed(_))))
             .push(tab("Auto light/dark", ModeTab::Auto, matches!(choice, ThemeChoice::Auto { .. })));
+        // Auto: the two themes it switches between, each chosen on purpose.
+        let slots = match choice {
+            ThemeChoice::Auto { light, dark } => {
+                let slot = |label: String, s: Slot| {
+                    button(text(label).size(13)).padding([5, 12]).on_press(Message::ThemeSlot(s)).style(c.chip(self.slot == Some(s)))
+                };
+                let hint = if self.slot.is_some() { "pick a theme for it" } else { "click one to change it" };
+                Some(
+                    row![
+                        slot(format!("☀ Light: {}", name(light)), Slot::Light),
+                        slot(format!("☾ Dark: {}", name(dark)), Slot::Dark),
+                        text(hint).size(12).color(c.muted),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Center),
+                )
+            }
+            _ => None,
+        };
 
         let filter = text_input("Filter themes…", &self.query)
             .id(FILTER)
@@ -155,16 +185,16 @@ impl ThemePicker {
             row![text("Themes").size(18).font(bold()).color(c.fg_bright), space::horizontal(), text(summary).size(12).color(c.muted)]
                 .align_y(iced::Center),
             tabs,
-            filter,
-            list,
-            actions,
-            install,
         ]
         .spacing(10);
+        if let Some(slots) = slots {
+            body = body.push(slots);
+        }
+        body = body.push(filter).push(list).push(actions).push(install);
         if let Some((is_err, msg)) = &self.status {
             body = body.push(text(msg).size(12).color(if *is_err { c.red } else { c.green }));
         }
-        body = body.push(text("↑↓ preview · Enter use · Tab install field · Esc cancel").size(11).color(c.muted));
+        body = body.push(text("↑↓ preview · Enter or click to use · Tab install field · Esc cancel").size(11).color(c.muted));
 
         let panel = container(body).padding(16).width(680).style(move |_: &Theme| container::Style {
             background: Some(Background::Color(c.sidebar)),
@@ -215,7 +245,7 @@ impl ThemePicker {
         button(line)
             .width(Length::Fill)
             .padding([6, 10])
-            .on_press(Message::ThemeSelect(i))
+            .on_press(Message::ThemePick(i))
             .style(c.row_button(i == self.selected))
             .into()
     }
@@ -226,13 +256,12 @@ fn small(c: Colors, label: &str, msg: Option<Message>) -> Element<'_, Message> {
 }
 
 /// What committing `slug` means for the current mode.
-pub fn commit(choice: &ThemeChoice, entry: &ThemeEntry) -> ThemeChoice {
-    match choice {
-        ThemeChoice::Auto { light, dark } if entry.is_light() => {
-            ThemeChoice::Auto { light: entry.slug.clone(), dark: dark.clone() }
-        }
-        ThemeChoice::Auto { light, .. } => ThemeChoice::Auto { light: light.clone(), dark: entry.slug.clone() },
-        // Picking a theme while following Omarchy pins it.
+/// What picking `entry` does: fill the Auto slot being chosen, or else use
+/// that theme from now on (Fixed), which turns Auto and Follow Omarchy off.
+pub fn commit(choice: &ThemeChoice, entry: &ThemeEntry, slot: Option<Slot>) -> ThemeChoice {
+    match (choice, slot) {
+        (ThemeChoice::Auto { dark, .. }, Some(Slot::Light)) => ThemeChoice::Auto { light: entry.slug.clone(), dark: dark.clone() },
+        (ThemeChoice::Auto { light, .. }, Some(Slot::Dark)) => ThemeChoice::Auto { light: light.clone(), dark: entry.slug.clone() },
         _ => ThemeChoice::Fixed(entry.slug.clone()),
     }
 }
@@ -246,10 +275,13 @@ mod tests {
     fn commit_respects_mode() {
         let cat = Catalog::load_from(&Roots::default());
         let (nord, latte) = (cat.get("nord").unwrap(), cat.get("catppuccin-latte").unwrap());
-        assert_eq!(commit(&ThemeChoice::FollowOmarchy, nord), ThemeChoice::Fixed("nord".into()));
+        assert_eq!(commit(&ThemeChoice::FollowOmarchy, nord, None), ThemeChoice::Fixed("nord".into()));
         let auto = ThemeChoice::Auto { light: "white".into(), dark: "gruvbox".into() };
-        assert_eq!(commit(&auto, nord), ThemeChoice::Auto { light: "white".into(), dark: "nord".into() });
-        assert_eq!(commit(&auto, latte), ThemeChoice::Auto { light: "catppuccin-latte".into(), dark: "gruvbox".into() });
+        // Picking from the list turns Auto off: what you click is what you get.
+        assert_eq!(commit(&auto, latte, None), ThemeChoice::Fixed("catppuccin-latte".into()));
+        // Choosing a slot fills just that slot.
+        assert_eq!(commit(&auto, nord, Some(Slot::Dark)), ThemeChoice::Auto { light: "white".into(), dark: "nord".into() });
+        assert_eq!(commit(&auto, latte, Some(Slot::Light)), ThemeChoice::Auto { light: "catppuccin-latte".into(), dark: "gruvbox".into() });
     }
 
     #[test]
