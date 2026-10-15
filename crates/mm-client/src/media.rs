@@ -119,7 +119,7 @@ pub async fn upload(client: Client, channel_id: String, path: std::path::PathBuf
     result.file_infos.into_iter().next().map(|f| f.id).ok_or_else(|| "server returned no file".into())
 }
 
-/// Download an attachment into the cache dir and open it with the desktop's default app.
+/// Download an attachment into the cache dir and open it with the system's default app.
 pub async fn open_file(client: Client, file_id: String, name: String) -> Result<(), String> {
     // Only the final path component, so a crafted name can't escape the directory.
     let name = std::path::Path::new(&name)
@@ -134,7 +134,7 @@ pub async fn open_file(client: Client, file_id: String, name: String) -> Result<
         tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
         tokio::fs::write(&path, bytes).await.map_err(|e| e.to_string())?;
     }
-    std::process::Command::new("xdg-open").arg(&path).spawn().map_err(|e| e.to_string())?;
+    open::that_detached(&path).map_err(|e| e.to_string())?;
     Ok(())
 }
 

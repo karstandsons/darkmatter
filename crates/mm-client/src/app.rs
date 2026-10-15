@@ -164,7 +164,9 @@ impl App {
             // `mention:` links are @usernames; a profile popover can hook in here later.
             Message::Link(uri) if uri.starts_with("mention:") => Task::none(),
             Message::Link(uri) => {
-                let _ = std::process::Command::new("xdg-open").arg(&uri).spawn();
+                if let Err(e) = open::that_detached(&uri) {
+                    tracing::warn!("couldn't open {uri}: {e}");
+                }
                 Task::none()
             }
             Message::Logout => {

@@ -23,6 +23,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 dirs = "7"
 # iced pulls in `image` with no formats enabled; turn on what Mattermost serves.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+open = "5"
+notify-rust = "4"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 

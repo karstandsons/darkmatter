@@ -478,7 +478,13 @@ impl Chat {
 fn notify_mention(store: &Store, post: &Post) {
     let channel = store.channels.get(&post.channel_id).map(|c| store.channel_label(c)).unwrap_or_default();
     let title = format!("{} in {channel}", store.display_name(post));
-    let _ = std::process::Command::new("notify-send").args(["-a", "Mattermost", &title, &post.message]).spawn();
+    let body = post.message.clone();
+    // D-Bus / macOS notification calls block briefly; keep them off the UI thread.
+    std::thread::spawn(move || {
+        if let Err(e) = notify_rust::Notification::new().appname("Mattermost").summary(&title).body(&body).show() {
+            tracing::warn!("notification failed: {e}");
+        }
+    });
 }
 
 #[cfg(test)]
