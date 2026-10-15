@@ -5,6 +5,8 @@
 # launcher entry, the icon, install.sh, the README and the licenses.
 set -euo pipefail
 bin=$1 arch=$2 out=${3:-dist}
+# A full path, so a bare name ("darkmatter") isn't looked up in PATH.
+bin=$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")
 root=$(cd "$(dirname "$0")/../.." && pwd)
 version=$("$bin" --version | awk '{print $2}')
 name=darkmatter-$version-$arch-linux

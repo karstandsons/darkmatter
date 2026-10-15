@@ -5,6 +5,8 @@
 # codesign, ditto). Signed ad hoc only: Gatekeeper still asks on first open.
 set -euo pipefail
 bin=$1 iconset=$2 out=${3:-dist}
+# A full path, so a bare name ("darkmatter") isn't looked up in PATH.
+bin=$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")
 here=$(cd "$(dirname "$0")" && pwd)
 version=$("$bin" --version | awk '{print $2}')
 stage=$(mktemp -d)
