@@ -1,0 +1,23 @@
+[package]
+name = "mm-client"
+description = "Omarchy-themed Mattermost desktop client"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mm-rust"
+path = "src/main.rs"
+
+[dependencies]
+mm-api = { path = "../mm-api" }
+omarchy-theme = { path = "../omarchy-theme" }
+# No `web-colors`: it gamma-encodes theme colors twice, so #13141c rendered as #4b4d5c.
+iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "crisp", "thread-pool", "linux-theme-detection", "x11", "wayland", "tokio", "markdown", "image", "advanced"] }
+tokio.workspace = true
+serde.workspace = true
+tracing.workspace = true
+toml = "1"
+emojis = "0.9"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "7"
