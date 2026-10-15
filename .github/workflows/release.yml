@@ -7,8 +7,8 @@
 #   builds, uploaded as workflow artifacts, with nothing published.
 #
 # Secrets:
-#   AUR_SSH_KEY        private key of an AUR account that owns darkmatter-bin
-#   HOMEBREW_TAP_TOKEN token that can push to karstandsons/homebrew-tap
+#   AUR_SSH_KEY              private key of an AUR account that owns darkmatter-bin
+#   HOMEBREW_TAP_DEPLOY_KEY  private half of a write deploy key on karstandsons/homebrew-tap
 name: Release
 on:
   push:
@@ -164,20 +164,23 @@ jobs:
     needs: [version, release]
     runs-on: ubuntu-latest
     env:
-      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
       VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-        if: env.HOMEBREW_TAP_TOKEN != ''
+        if: env.TAP_KEY != ''
       - uses: actions/download-artifact@v4
-        if: env.HOMEBREW_TAP_TOKEN != ''
+        if: env.TAP_KEY != ''
         with:
           name: checksums
       - name: Update the cask in karstandsons/homebrew-tap
-        if: env.HOMEBREW_TAP_TOKEN != ''
+        if: env.TAP_KEY != ''
         run: |
           sha=$(awk -v f="darkmatter-$VERSION-macos-universal.zip" '$2 == f { print $1 }' SHA256SUMS)
-          git clone "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/karstandsons/homebrew-tap.git" tap
+          install -d -m700 ~/.ssh
+          printf '%s\n' "$TAP_KEY" > ~/.ssh/tap && chmod 600 ~/.ssh/tap
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap -o StrictHostKeyChecking=accept-new"
+          git clone git@github.com:karstandsons/homebrew-tap.git tap
           mkdir -p tap/Casks
           sed -e "s/^  version \".*\"/  version \"$VERSION\"/" -e "s/^  sha256 .*/  sha256 \"$sha\"/" \
               packaging/homebrew/darkmatter.rb > tap/Casks/darkmatter.rb
