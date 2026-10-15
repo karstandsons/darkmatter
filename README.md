@@ -33,9 +33,33 @@ MM_URL=http://localhost:8065 MM_TOKEN=<token> cargo run -p mm-client   # skip th
 | Alt+Up / Alt+Down | Previous / next channel |
 | Shift+Up | Open the thread of the latest message |
 | Ctrl+U | Attach files (drag-and-drop works too) |
+| Ctrl+T | Theme picker |
 | Esc | Close switcher, then thread pane |
 
-Colors and font follow `omarchy theme set` live. The window class is `mm-rust`, for Hyprland rules.
+The window class is `mm-rust`, for Hyprland rules.
+
+## Themes
+
+mm-rust uses Omarchy's theme format (`colors.toml`) everywhere:
+
+- **On Omarchy** it follows `omarchy theme set` live by default.
+- **Elsewhere** (other distros, macOS) it follows the OS light/dark setting: Tokyo Night when dark, Catppuccin Latte when light.
+- **Ctrl+T** (or "Themes" in the sidebar) opens the picker. Choose Follow Omarchy, Fixed, or Auto light/dark. Arrow keys preview live, Enter keeps the theme (in Auto it fills the light or dark slot), Esc cancels.
+- **All 22 Omarchy base themes are built in**, so they work without Omarchy. Themes installed in Omarchy (`~/.config/omarchy/themes`) show up too.
+- **Install from git** in the picker, with the same URLs as `omarchy theme install` (see [omarchy.org/themes](https://omarchy.org/themes/)). Themes go to `~/.config/mm-rust/themes`. On Omarchy, "Also install to Omarchy" runs `omarchy theme install`, which also switches your desktop theme. Only `colors.toml` is read from a theme repo; nothing in it is run.
+
+Settings live in `~/.config/mm-rust/config.toml`:
+
+```toml
+[theme]
+mode = "auto"              # "omarchy" | "fixed" | "auto"
+name = "gruvbox"           # used by "fixed"
+light = "catppuccin-latte" # used by "auto"
+dark = "tokyo-night"
+font = "JetBrainsMono Nerd Font"  # optional; defaults to the system monospace font
+```
+
+The bundled themes are copied from Omarchy (MIT, see `crates/omarchy-theme/themes/LICENSE`). Refresh them with `dev/sync-omarchy-themes.sh`.
 `RUST_LOG=mm_rust=debug` logs UI messages (tokens and login input are never logged).
 
 `dev/drive.sh <pid|title=…> <wtype args>` sends keystrokes for UI testing, and refuses unless that window has focus.

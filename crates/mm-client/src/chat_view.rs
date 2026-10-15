@@ -109,6 +109,10 @@ impl Chat {
             text("●").size(10).color(status_color),
             text(format!("@{}", self.store.me.username)).size(13).color(c.fg),
             space::horizontal(),
+            button(text("Themes").size(12).color(c.muted))
+                .padding([2, 6])
+                .on_press(Message::OpenThemes)
+                .style(c.row_button(false)),
             button(text("Log out").size(12).color(c.muted))
                 .padding([2, 6])
                 .on_press(Message::Logout)

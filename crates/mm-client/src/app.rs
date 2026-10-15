@@ -1,3 +1,4 @@
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use iced::futures::SinkExt;
@@ -8,6 +9,9 @@ use mm_api::models::{Channel, Post, PostList, Team, User};
 use mm_api::{Client, ws};
 
 use crate::chat::Chat;
+use crate::config::Config;
+use crate::theme_picker::{self, ModeTab, ThemePicker};
+use omarchy_theme::{Catalog, ThemeChoice};
 use crate::session::Session;
 use crate::style::Colors;
 use crate::text as fmt;
@@ -15,10 +19,20 @@ use crate::text as fmt;
 const LOGIN_FIRST: &str = "login-server";
 
 pub struct App {
+    /// The theme on screen, resolved from the user's choice.
     theme: omarchy_theme::Theme,
     colors: Colors,
     iced_theme: Theme,
     screen: Screen,
+    config: Config,
+    catalog: Catalog,
+    /// Running on Omarchy, and the theme it currently renders.
+    omarchy: bool,
+    omarchy_current: Option<omarchy_theme::Theme>,
+    os_mode: omarchy_theme::Mode,
+    picker: Option<ThemePicker>,
+    /// Theme previewed from the picker, not yet saved.
+    preview: Option<String>,
 }
 
 enum Screen {
@@ -43,7 +57,21 @@ struct LoginForm {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// Omarchy switched its desktop theme.
     ThemeChanged(omarchy_theme::Theme),
+    OsTheme(iced::theme::Mode),
+    OpenThemes,
+    CloseThemes,
+    ThemeQuery(String),
+    ThemeSelect(usize),
+    ThemeCommit,
+    ThemeMode(ModeTab),
+    ThemeUrl(String),
+    InstallTheme,
+    InstallToOmarchy,
+    ThemeUpdate(String),
+    ThemeRemove(String),
+    ThemeDone(Result<String, String>),
     Login(LoginField, String),
     /// Enter in a login field: next field, or sign in from the last one.
     LoginNext(LoginField),
@@ -112,14 +140,223 @@ pub(crate) fn err(e: mm_api::Error) -> String {
 
 impl App {
     pub fn new() -> (Self, Task<Message>) {
-        let theme = omarchy_theme::Theme::load_or_fallback();
-        let colors = Colors::from_palette(&theme.palette);
-        let iced_theme = colors.iced_theme(&theme.name);
+        let omarchy = omarchy_theme::omarchy_present();
         let (screen, task) = match Session::load() {
             Some(s) => (Screen::Loading, bootstrap(s)),
             None => (Screen::Login(LoginForm::with_server()), operation::focus(LOGIN_FIRST)),
         };
-        (App { theme, colors, iced_theme, screen }, task)
+        let fallback = omarchy_theme::Theme { name: String::new(), palette: omarchy_theme::Palette::fallback(), font: None };
+        let mut app = App {
+            colors: Colors::from_palette(&fallback.palette),
+            iced_theme: Theme::Dark,
+            theme: fallback,
+            screen,
+            config: Config::load(),
+            catalog: Catalog::load(),
+            omarchy,
+            omarchy_current: if omarchy { omarchy_theme::Theme::load().ok() } else { None },
+            os_mode: omarchy_theme::Mode::Dark,
+            picker: None,
+            preview: None,
+        };
+        app.apply_theme();
+        let os_theme = iced::system::theme().map(Message::OsTheme);
+        (app, Task::batch([task, os_theme]))
+    }
+
+    fn choice(&self) -> ThemeChoice {
+        self.config.theme.choice(self.omarchy)
+    }
+
+    /// Re-resolve the theme after the choice, Omarchy's theme, the OS mode or a preview changed.
+    fn apply_theme(&mut self) {
+        let choice = match &self.preview {
+            Some(slug) => ThemeChoice::Fixed(slug.clone()),
+            None => self.choice(),
+        };
+        let theme = omarchy_theme::resolve(&choice, self.omarchy_current.as_ref(), self.os_mode, &self.catalog);
+        self.colors = Colors::from_palette(&theme.palette);
+        self.iced_theme = self.colors.iced_theme(&theme.name);
+        self.theme = theme;
+    }
+
+    fn save_choice(&mut self, choice: &ThemeChoice) {
+        self.config.theme.set_choice(choice);
+        if let Err(e) = self.config.save() {
+            tracing::warn!("couldn't save config: {e}");
+        }
+        self.preview = None;
+        self.apply_theme();
+    }
+
+    fn picker_status(&mut self, status: Result<String, String>) {
+        if let Some(p) = &mut self.picker {
+            p.busy = false;
+            p.status = Some(match status {
+                Ok(m) => (false, m),
+                Err(e) => (true, e),
+            });
+        }
+    }
+
+    /// Theme-picker messages. `Continue` hands back a message that isn't the picker's.
+    fn update_picker(&mut self, message: Message) -> ControlFlow<Task<Message>, Message> {
+        let blocking = |f: Box<dyn FnOnce() -> Result<String, String> + Send>| {
+            Task::perform(
+                async move { tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| Err(e.to_string())) },
+                Message::ThemeDone,
+            )
+        };
+        let task = match message {
+            Message::OpenThemes => {
+                let picker = ThemePicker::open(&self.catalog, &self.theme.name);
+                let reveal = picker.reveal();
+                self.picker = Some(picker);
+                Task::batch([operation::focus(theme_picker::FILTER), reveal])
+            }
+            Message::CloseThemes => {
+                self.picker = None;
+                self.preview = None;
+                self.apply_theme();
+                Task::none()
+            }
+            Message::ThemeQuery(q) => {
+                if let Some(p) = &mut self.picker {
+                    p.query = q;
+                    p.selected = 0;
+                    p.refresh(&self.catalog);
+                    self.preview = p.current().map(str::to_string);
+                    self.apply_theme();
+                }
+                Task::none()
+            }
+            Message::ThemeSelect(i) => {
+                if let Some(p) = &mut self.picker {
+                    p.selected = i;
+                    self.preview = p.current().map(str::to_string);
+                    self.apply_theme();
+                }
+                Task::none()
+            }
+            Message::ThemeCommit => {
+                let entry = self.picker.as_ref().and_then(|p| p.current()).and_then(|s| self.catalog.get(s)).cloned();
+                if let Some(entry) = entry {
+                    let choice = theme_picker::commit(&self.choice(), &entry);
+                    self.save_choice(&choice);
+                }
+                self.picker = None;
+                Task::none()
+            }
+            Message::ThemeMode(tab) => {
+                let current = self.choice();
+                let choice = match tab {
+                    ModeTab::Omarchy => ThemeChoice::FollowOmarchy,
+                    ModeTab::Fixed => ThemeChoice::Fixed(self.theme.name.clone()),
+                    ModeTab::Auto => {
+                        let mut auto = self.config.theme.clone();
+                        auto.mode = Some("auto".into());
+                        auto.choice(self.omarchy)
+                    }
+                };
+                if choice != current {
+                    self.save_choice(&choice);
+                }
+                Task::none()
+            }
+            Message::ThemeUrl(url) => {
+                if let Some(p) = &mut self.picker {
+                    p.url = url;
+                    p.confirm_omarchy = false;
+                }
+                Task::none()
+            }
+            Message::InstallTheme => {
+                let Some(p) = &mut self.picker else { return ControlFlow::Break(Task::none()) };
+                let Some(dir) = omarchy_theme::Catalog::app_dir() else { return ControlFlow::Break(Task::none()) };
+                let url = p.url.clone();
+                p.busy = true;
+                p.status = Some((false, "Cloning…".into()));
+                blocking(Box::new(move || {
+                    omarchy_theme::install::install(&url, &dir).map(|e| format!("installed:{}", e.slug))
+                }))
+            }
+            Message::InstallToOmarchy => {
+                let Some(p) = &mut self.picker else { return ControlFlow::Break(Task::none()) };
+                if !p.confirm_omarchy {
+                    p.confirm_omarchy = true;
+                    return ControlFlow::Break(Task::none());
+                }
+                let url = p.url.clone();
+                p.confirm_omarchy = false;
+                p.busy = true;
+                p.status = Some((false, "Installing to Omarchy…".into()));
+                blocking(Box::new(move || {
+                    omarchy_theme::install::install_to_omarchy(&url).map(|_| "Installed in Omarchy and applied to the desktop".into())
+                }))
+            }
+            Message::ThemeUpdate(slug) | Message::ThemeRemove(slug) if self.catalog.get(&slug).is_none() => Task::none(),
+            Message::ThemeUpdate(slug) => {
+                let entry = self.catalog.get(&slug).cloned().expect("checked above");
+                if let Some(p) = &mut self.picker {
+                    p.busy = true;
+                }
+                blocking(Box::new(move || {
+                    omarchy_theme::install::update(&entry).map(|e| format!("Updated {}", e.display_name))
+                }))
+            }
+            Message::ThemeRemove(slug) => {
+                let entry = self.catalog.get(&slug).cloned().expect("checked above");
+                if let Some(p) = &mut self.picker {
+                    p.busy = true;
+                }
+                blocking(Box::new(move || omarchy_theme::install::remove(&entry).map(|_| format!("Removed {}", entry.display_name))))
+            }
+            Message::ThemeDone(result) => {
+                self.catalog = Catalog::load();
+                let installed = result.as_ref().ok().and_then(|m| m.strip_prefix("installed:")).map(str::to_string);
+                let status = match &installed {
+                    Some(slug) => Ok(format!(
+                        "Installed {}. Press Enter to use it.",
+                        self.catalog.get(slug).map_or(slug.as_str(), |e| e.display_name.as_str())
+                    )),
+                    None => result,
+                };
+                if let Some(p) = &mut self.picker {
+                    p.refresh(&self.catalog);
+                    if let Some(slug) = &installed {
+                        p.query.clear();
+                        p.refresh(&self.catalog);
+                        p.select_slug(slug);
+                        p.url.clear();
+                    }
+                    self.preview = p.current().map(str::to_string);
+                }
+                self.picker_status(status);
+                self.apply_theme();
+                self.picker.as_ref().map_or_else(Task::none, ThemePicker::reveal)
+            }
+            Message::Escape if self.picker.is_some() => return self.update_picker(Message::CloseThemes),
+            Message::Key(keyboard::Event::KeyPressed { key: keyboard::Key::Named(named), modifiers, .. }) if self.picker.is_some() => {
+                let step = match named {
+                    keyboard::key::Named::ArrowUp => -1,
+                    keyboard::key::Named::ArrowDown => 1,
+                    keyboard::key::Named::Tab => {
+                        return ControlFlow::Break(operation::focus(if modifiers.shift() { theme_picker::FILTER } else { theme_picker::URL }));
+                    }
+                    _ => return ControlFlow::Break(Task::none()),
+                };
+                let Some(p) = &mut self.picker else { return ControlFlow::Break(Task::none()) };
+                p.step(step);
+                self.preview = p.current().map(str::to_string);
+                let reveal = p.reveal();
+                self.apply_theme();
+                reveal
+            }
+            // Swallow other keys while the picker is up so the chat doesn't react.
+            Message::Key(_) if self.picker.is_some() => Task::none(),
+            other => return ControlFlow::Continue(other),
+        };
+        ControlFlow::Break(task)
     }
 
     pub fn title(&self) -> String {
@@ -154,12 +391,29 @@ impl App {
                 m => tracing::debug!("{m:?}"),
             }
         }
+        let message = match self.update_picker(message) {
+            ControlFlow::Break(task) => return task,
+            ControlFlow::Continue(message) => message,
+        };
         match message {
             Message::ThemeChanged(theme) => {
-                self.colors = Colors::from_palette(&theme.palette);
-                self.iced_theme = self.colors.iced_theme(&theme.name);
-                self.theme = theme;
+                self.omarchy = true;
+                self.omarchy_current = Some(theme);
+                self.apply_theme();
                 Task::none()
+            }
+            Message::OsTheme(mode) => {
+                self.os_mode = match mode {
+                    iced::theme::Mode::Light => omarchy_theme::Mode::Light,
+                    _ => omarchy_theme::Mode::Dark,
+                };
+                self.apply_theme();
+                Task::none()
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: keyboard::Key::Character(k), modifiers, .. })
+                if modifiers.command() && k.as_str() == "t" =>
+            {
+                self.update(if self.picker.is_some() { Message::CloseThemes } else { Message::OpenThemes })
             }
             // `mention:` links are @usernames; a profile popover can hook in here later.
             Message::Link(uri) if uri.starts_with("mention:") => Task::none(),
@@ -225,6 +479,7 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![
             Subscription::run(theme_events).map(Message::ThemeChanged),
+            iced::system::theme_changes().map(Message::OsTheme),
             keyboard::listen().map(Message::Key),
             iced::event::listen_with(|event, _status, _window| match event {
                 iced::Event::Keyboard(keyboard::Event::KeyPressed {
@@ -250,6 +505,14 @@ impl App {
             Screen::Loading => center(text("Connecting…").color(c.muted)).into(),
             Screen::Login(form) => form.view(c),
             Screen::Chat(chat) => chat.view(c, &self.iced_theme),
+        };
+        let body: Element<'_, Message> = match &self.picker {
+            Some(p) => {
+                let choice = self.choice();
+                let picker = p.view(&self.catalog, &choice, &self.theme.name, self.os_mode == omarchy_theme::Mode::Dark, self.omarchy, c);
+                iced::widget::stack![body, picker].into()
+            }
+            None => body,
         };
         container(body).width(Length::Fill).height(Length::Fill).style(c.panel(c.bg)).into()
     }

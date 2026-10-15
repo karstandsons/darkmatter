@@ -113,6 +113,11 @@ impl Catalog {
         Catalog { entries }
     }
 
+    /// Where mm-rust installs themes.
+    pub fn app_dir() -> Option<PathBuf> {
+        app_themes_dir()
+    }
+
     pub fn get(&self, slug: &str) -> Option<&ThemeEntry> {
         self.entries.iter().find(|e| e.slug == slug)
     }

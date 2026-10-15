@@ -30,7 +30,7 @@ pub fn italic() -> Font {
     Font { style: font::Style::Italic, ..font() }
 }
 
-fn c(rgb: Rgb) -> Color {
+pub fn rgb(rgb: Rgb) -> Color {
     Color::from_rgb8(rgb.r, rgb.g, rgb.b)
 }
 
@@ -55,19 +55,19 @@ pub struct Colors {
 impl Colors {
     pub fn from_palette(p: &omarchy_theme::Palette) -> Self {
         Colors {
-            bg: c(p.background),
-            sidebar: c(p.dark_background),
-            rail: c(p.darker_background),
-            surface: c(p.lighter_background),
-            selection: c(p.selection),
-            fg: c(p.foreground),
-            fg_bright: c(p.bright_foreground),
-            muted: c(p.dark_foreground),
-            accent: c(p.accent),
-            red: c(p.red),
-            green: c(p.green),
-            yellow: c(p.yellow),
-            names: [c(p.blue), c(p.magenta), c(p.cyan), c(p.green), c(p.orange), c(p.yellow)],
+            bg: rgb(p.background),
+            sidebar: rgb(p.dark_background),
+            rail: rgb(p.darker_background),
+            surface: rgb(p.lighter_background),
+            selection: rgb(p.selection),
+            fg: rgb(p.foreground),
+            fg_bright: rgb(p.bright_foreground),
+            muted: rgb(p.dark_foreground),
+            accent: rgb(p.accent),
+            red: rgb(p.red),
+            green: rgb(p.green),
+            yellow: rgb(p.yellow),
+            names: [rgb(p.blue), rgb(p.magenta), rgb(p.cyan), rgb(p.green), rgb(p.orange), rgb(p.yellow)],
         }
     }
 
