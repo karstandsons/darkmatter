@@ -23,6 +23,10 @@ const GUTTER: f32 = 46.0;
 /// reply box stays near the message instead of a screen or more below it.
 pub const INLINE_REPLIES: usize = 5;
 
+/// Compact density: widths of the time and name columns.
+const TIME_COLUMN: f32 = 40.0;
+const NAME_COLUMN: f32 = 90.0;
+
 const PANE_FOOTER: iced::Padding = iced::Padding { top: 0.0, right: 20.0, bottom: 16.0, left: 20.0 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -199,7 +203,12 @@ impl Chat {
     /// Buttons at the right of a pane's title bar: Leave, and ✕ when there
     /// are other panes.
     fn pane_controls<'a>(&'a self, pv: &'a PaneView, many: bool, c: Colors) -> Option<Element<'a, Message>> {
-        let mut controls = row![].spacing(4).align_y(iced::Center);
+        let density = if pv.compact { "Cozy" } else { "Compact" };
+        let mut controls = row![
+            button(text(density).size(12).color(c.muted)).padding([2, 8]).on_press(Message::ToggleDensity).style(c.row_button(false))
+        ]
+        .spacing(4)
+        .align_y(iced::Center);
         let channel = self.store.channels.get(&pv.channel);
         // Town Square can't be left; DMs are closed, not left.
         if let Some(channel) = channel.filter(|ch| matches!(ch.kind, ChannelType::Open | ChannelType::Private) && ch.name != "town-square") {
@@ -216,8 +225,7 @@ impl Chat {
                 button(text("✕").size(13).color(c.muted)).padding([2, 8]).on_press(Message::ClosePane).style(c.row_button(false)),
             );
         }
-        (many || channel.is_some_and(|ch| matches!(ch.kind, ChannelType::Open | ChannelType::Private) && ch.name != "town-square"))
-            .then(|| controls.into())
+        Some(controls.into())
     }
 
     fn main<'a>(&'a self, pv: &'a PaneView, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
@@ -552,7 +560,20 @@ impl Chat {
             body = body.push(button(text(label).size(12).color(c.accent)).padding([2, 0]).on_press(msg).style(c.link_button()));
         }
 
-        let content: Element<'_, Message> = if continued {
+        let content: Element<'_, Message> = if pv.compact {
+            // One line: time, name (blank when it continues a run), message.
+            let name: Element<'_, Message> = if continued {
+                space().width(NAME_COLUMN).into()
+            } else {
+                container(text(self.store.display_name(post)).font(bold()).size(13).color(c.name_color(&post.user_id)).wrapping(iced::widget::text::Wrapping::None))
+                    .width(NAME_COLUMN)
+                    .align_right(NAME_COLUMN)
+                    .clip(true)
+                    .into()
+            };
+            let time = text(fmt::time_of_day(post.create_at)).size(11).color(c.muted).width(TIME_COLUMN);
+            container(row![time, name, body].spacing(10)).width(Length::Fill).padding([1, 0]).into()
+        } else if continued {
             // Full width, so the hover actions sit at the right edge, not over the text.
             container(body).padding(iced::Padding { left: GUTTER, ..iced::Padding::ZERO }).width(Length::Fill).into()
         } else {

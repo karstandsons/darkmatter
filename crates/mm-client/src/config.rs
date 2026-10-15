@@ -18,11 +18,19 @@ pub struct LayoutConfig {
     /// "inline" (replies expand under their message) or "pane" (a side pane).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threads: Option<String>,
+    /// "comfortable" (avatars, names above messages) or "compact" (one line
+    /// per message); the default for new panes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub density: Option<String>,
 }
 
 impl LayoutConfig {
     pub fn inline_threads(&self) -> bool {
         self.threads.as_deref() != Some("pane")
+    }
+
+    pub fn compact(&self) -> bool {
+        self.density.as_deref() == Some("compact")
     }
 }
 

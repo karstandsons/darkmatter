@@ -21,6 +21,8 @@ pub enum Saved {
     },
     Pane {
         channel: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compact: bool,
     },
 }
 
@@ -50,7 +52,13 @@ pub fn capture(panes: &pane_grid::State<PaneView>) -> Saved {
                 a: Box::new(walk(a, panes)),
                 b: Box::new(walk(b, panes)),
             },
-            Node::Pane(p) => Saved::Pane { channel: panes.get(*p).map(|v| v.channel.clone()).unwrap_or_default() },
+            Node::Pane(p) => {
+                let view = panes.get(*p);
+                Saved::Pane {
+                    channel: view.map(|v| v.channel.clone()).unwrap_or_default(),
+                    compact: view.is_some_and(|v| v.compact),
+                }
+            }
         }
     }
     walk(panes.layout(), panes)
@@ -69,10 +77,10 @@ pub fn configuration(saved: &Saved, known: &impl Fn(&str) -> bool, next: &mut us
             a: Box::new(configuration(a, known, next)),
             b: Box::new(configuration(b, known, next)),
         },
-        Saved::Pane { channel } => {
+        Saved::Pane { channel, compact } => {
             let channel = if known(channel) { channel.clone() } else { String::new() };
             *next += 1;
-            Configuration::Pane(PaneView::new(*next - 1, channel))
+            Configuration::Pane(PaneView { compact: *compact, ..PaneView::new(*next - 1, channel) })
         }
     }
 }
@@ -109,12 +117,12 @@ mod tests {
         let saved = Saved::Split {
             axis: SavedAxis::Vertical,
             ratio: 0.4,
-            a: Box::new(Saved::Pane { channel: "c1".into() }),
+            a: Box::new(Saved::Pane { channel: "c1".into(), compact: true }),
             b: Box::new(Saved::Split {
                 axis: SavedAxis::Horizontal,
                 ratio: 0.5,
-                a: Box::new(Saved::Pane { channel: "c2".into() }),
-                b: Box::new(Saved::Pane { channel: "gone".into() }),
+                a: Box::new(Saved::Pane { channel: "c2".into(), compact: false }),
+                b: Box::new(Saved::Pane { channel: "gone".into(), compact: false }),
             }),
         };
         let mut file = File::default();
@@ -130,6 +138,6 @@ mod tests {
         assert_eq!(next, 3, "each pane gets its own widget ids");
         let Saved::Split { b, .. } = capture(&panes) else { panic!() };
         let Saved::Split { b: last, .. } = *b else { panic!() };
-        assert_eq!(*last, Saved::Pane { channel: String::new() }, "an unknown channel comes back empty");
+        assert_eq!(*last, Saved::Pane { channel: String::new(), compact: false }, "an unknown channel comes back empty");
     }
 }

@@ -37,6 +37,8 @@ pub struct PaneView {
     /// the bottom, the (content height, offset from bottom) to keep the top still.
     pub viewport: Option<Viewport>,
     pub hold_top: Option<(f32, f32)>,
+    /// One line per message, no avatars.
+    pub compact: bool,
 }
 
 impl PaneView {
@@ -52,6 +54,7 @@ impl PaneView {
             jump_target: None,
             viewport: None,
             hold_top: None,
+            compact: false,
         }
     }
 

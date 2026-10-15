@@ -335,6 +335,16 @@ impl Chat {
         )
     }
 
+    /// Use the configured density for panes the saved layout didn't set
+    /// (only when there's no saved layout: a saved pane knows its own).
+    pub fn set_default_density(&mut self, compact: bool) {
+        if crate::layout::load(&self.session.server).is_none() {
+            for (_, p) in self.panes.iter_mut() {
+                p.compact = compact;
+            }
+        }
+    }
+
     /// Open each pane's channel at startup; panes without one (first run, or a
     /// channel left since) get the default. The focused pane goes last so its
     /// composer ends up with the cursor.
@@ -789,9 +799,14 @@ impl Chat {
                 }
                 Task::none()
             }
+            Message::ToggleDensity => {
+                self.pv_mut().compact ^= true;
+                self.layout_dirty = true;
+                Task::none()
+            }
             Message::SplitPane(axis) => {
                 self.layout_dirty = true;
-                let view = PaneView::new(self.next_pane, self.pv().channel.clone());
+                let view = PaneView { compact: self.pv().compact, ..PaneView::new(self.next_pane, self.pv().channel.clone()) };
                 self.next_pane += 1;
                 let Some((pane, _)) = self.panes.split(axis, self.cur, view) else { return Task::none() };
                 self.focus = pane;
@@ -1393,6 +1408,11 @@ impl Chat {
             {
                 let axis = if modifiers.shift() { pane_grid::Axis::Horizontal } else { pane_grid::Axis::Vertical };
                 self.update(Message::SplitPane(axis))
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
+                if modifiers.command() && modifiers.shift() && k.eq_ignore_ascii_case("l") =>
+            {
+                self.update(Message::ToggleDensity)
             }
             Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
                 if modifiers.command() && !modifiers.shift() && k.as_str() == "w" =>

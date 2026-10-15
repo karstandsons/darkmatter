@@ -122,6 +122,8 @@ pub enum Message {
     SaveLayout,
     /// Put the cursor in the focused pane's message box.
     FocusComposer,
+    /// Switch the pane between comfortable and compact (one line per message).
+    ToggleDensity,
     /// Switch threads between inline and the side pane.
     ToggleThreadLayout,
     CloseThread,
@@ -550,6 +552,7 @@ impl App {
     fn start_chat(&mut self, b: Bootstrap) -> Task<Message> {
         let Some((mut chat, task)) = Chat::start(b) else { return Task::none() };
         chat.inline_threads = self.config.layout.inline_threads();
+        chat.set_default_density(self.config.layout.compact());
         let task = Task::batch([task, chat.open_panes()]);
         self.screen = Screen::Chat(Box::new(chat));
         task
