@@ -40,6 +40,8 @@ struct LoginForm {
     password: String,
     mfa: String,
     need_mfa: bool,
+    /// The field with keyboard focus, tracked so Tab/Enter move predictably.
+    focused: LoginField,
     busy: bool,
     error: Option<String>,
 }
@@ -60,6 +62,10 @@ struct Chat {
 pub enum Message {
     ThemeChanged(omarchy_theme::Theme),
     Login(LoginField, String),
+    /// Enter in a login field: next field, or sign in from the last one.
+    LoginNext(LoginField),
+    /// Tab (+1) or Shift+Tab (-1).
+    LoginTab(isize),
     LoginSubmit,
     LoggedIn(Result<(Session, User), (String, bool)>),
     Bootstrapped(Result<Bootstrap, String>),
@@ -79,8 +85,9 @@ pub enum Message {
     Logout,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LoginField {
+    #[default]
     Server,
     Login,
     Password,
@@ -175,9 +182,13 @@ impl App {
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::Tab), modifiers, .. })
                 if matches!(self.screen, Screen::Login(_)) =>
             {
-                if modifiers.shift() { operation::focus_previous() } else { operation::focus_next() }
+                self.update(Message::LoginTab(if modifiers.shift() { -1 } else { 1 }))
             }
-            Message::Login(..) | Message::LoginSubmit | Message::LoggedIn(_) => {
+            Message::Login(..)
+            | Message::LoginNext(_)
+            | Message::LoginTab(_)
+            | Message::LoginSubmit
+            | Message::LoggedIn(_) => {
                 let Screen::Login(form) = &mut self.screen else { return Task::none() };
                 form.update(message)
             }
@@ -287,6 +298,17 @@ fn bootstrap(session: Session) -> Task<Message> {
     )
 }
 
+impl LoginField {
+    fn id(self) -> &'static str {
+        match self {
+            LoginField::Server => LOGIN_FIRST,
+            LoginField::Login => "login-user",
+            LoginField::Password => "login-password",
+            LoginField::Mfa => "login-mfa",
+        }
+    }
+}
+
 impl LoginForm {
     fn with_server() -> Self {
         LoginForm { server: std::env::var("MM_URL").unwrap_or_default(), ..Default::default() }
@@ -295,6 +317,7 @@ impl LoginForm {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Login(field, value) => {
+                self.focused = field;
                 *match field {
                     LoginField::Server => &mut self.server,
                     LoginField::Login => &mut self.login,
@@ -303,20 +326,37 @@ impl LoginForm {
                 } = value;
                 Task::none()
             }
+            Message::LoginNext(field) => {
+                let fields = self.fields();
+                match fields.iter().position(|f| *f == field) {
+                    Some(i) if i + 1 < fields.len() => self.focus(fields[i + 1]),
+                    _ => self.update(Message::LoginSubmit),
+                }
+            }
+            Message::LoginTab(step) => {
+                let fields = self.fields();
+                let i = fields.iter().position(|f| *f == self.focused).unwrap_or(0) as isize;
+                self.focus(fields[(i + step).rem_euclid(fields.len() as isize) as usize])
+            }
             Message::LoginSubmit if !self.busy => {
                 self.busy = true;
                 self.error = None;
-                let server = self.server.trim().trim_end_matches('/').to_string();
-                let server = if server.contains("://") { server } else { format!("https://{server}") };
+                let server = fmt::server_url(&self.server);
                 let (login, password) = (self.login.clone(), self.password.clone());
                 let mfa = (!self.mfa.is_empty()).then(|| self.mfa.clone());
                 Task::perform(
                     async move {
                         let mut client = Client::new(&server).map_err(|e| (e.to_string(), false))?;
-                        let user = client
-                            .login(&login, &password, mfa.as_deref())
-                            .await
-                            .map_err(|e| (e.to_string(), e.needs_mfa()))?;
+                        let user = client.login(&login, &password, mfa.as_deref()).await.map_err(|e| {
+                            let msg = match &e {
+                                mm_api::Error::Http(h) if h.is_connect() || h.is_timeout() => {
+                                    format!("Couldn't connect to {server}")
+                                }
+                                mm_api::Error::Api(api) if !api.message.is_empty() => api.message.clone(),
+                                _ => e.to_string(),
+                            };
+                            (msg, e.needs_mfa())
+                        })?;
                         let token = client.token().unwrap_or_default().to_string();
                         Ok((Session { server, token }, user))
                     },
@@ -333,17 +373,31 @@ impl LoginForm {
                 self.busy = false;
                 self.need_mfa |= mfa;
                 self.error = Some(if mfa { "Enter your MFA code".into() } else { e });
-                Task::none()
+                self.focus(if mfa { LoginField::Mfa } else { LoginField::Password })
             }
             _ => Task::none(),
         }
     }
 
+    fn fields(&self) -> Vec<LoginField> {
+        let mut f = vec![LoginField::Server, LoginField::Login, LoginField::Password];
+        if self.need_mfa {
+            f.push(LoginField::Mfa);
+        }
+        f
+    }
+
+    fn focus(&mut self, field: LoginField) -> Task<Message> {
+        self.focused = field;
+        operation::focus(field.id())
+    }
+
     fn view(&self, c: Colors) -> Element<'_, Message> {
         let input = |placeholder: &'static str, value: &str, field: LoginField| {
             text_input(placeholder, value)
+                .id(field.id())
                 .on_input(move |v| Message::Login(field, v))
-                .on_submit(Message::LoginSubmit)
+                .on_submit(Message::LoginNext(field))
                 .padding(10)
                 .style(c.input())
         };
@@ -351,7 +405,7 @@ impl LoginForm {
             text("Mattermost").size(28).color(c.fg_bright),
             text("Sign in to your server").color(c.muted),
             space().height(8),
-            input("Server URL, e.g. chat.example.com", &self.server, LoginField::Server).id(LOGIN_FIRST),
+            input("Server URL, e.g. chat.example.com", &self.server, LoginField::Server),
             input("Email or username", &self.login, LoginField::Login),
             input("Password", &self.password, LoginField::Password).secure(true),
         ]

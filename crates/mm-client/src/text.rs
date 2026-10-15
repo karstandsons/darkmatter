@@ -2,6 +2,19 @@
 
 use chrono::{DateTime, Local, TimeZone};
 
+/// Normalize what the user typed as a server address. Without a scheme, local
+/// addresses get `http://` (dev servers) and everything else `https://`, so a
+/// password is never sent to a remote host in plain text by accident.
+pub fn server_url(input: &str) -> String {
+    let s = input.trim().trim_end_matches('/');
+    if s.contains("://") {
+        return s.to_string();
+    }
+    let host = s.split(['/', ':']).next().unwrap_or_default();
+    let local = host == "localhost" || host.starts_with("127.") || s.starts_with("[::1]");
+    format!("{}://{s}", if local { "http" } else { "https" })
+}
+
 /// Turn a Mattermost message into the markdown we render: emoji shortcodes,
 /// bare URLs as links and `@mentions` as `mention:` links. Code is left alone.
 pub fn prepare(message: &str) -> String {
@@ -159,6 +172,16 @@ mod tests {
         assert_eq!(prepare("`@alice :wave:` @bob"), "`@alice :wave:` [@bob](mention:bob)");
         assert_eq!(prepare("```\n@a https://x\n```\n:wave:"), "```\n@a https://x\n```\n👋");
         assert_eq!(prepare("lone @ sign"), "lone @ sign");
+    }
+
+    #[test]
+    fn server_url_picks_scheme() {
+        assert_eq!(server_url("localhost:8065"), "http://localhost:8065");
+        assert_eq!(server_url(" 127.0.0.1:8065/ "), "http://127.0.0.1:8065");
+        assert_eq!(server_url("[::1]:8065"), "http://[::1]:8065");
+        assert_eq!(server_url("chat.example.com"), "https://chat.example.com");
+        assert_eq!(server_url("localhost.evil.com"), "https://localhost.evil.com");
+        assert_eq!(server_url("http://intranet:8065/"), "http://intranet:8065");
     }
 
     #[test]
