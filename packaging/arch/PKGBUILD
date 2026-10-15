@@ -4,7 +4,7 @@
 # checkout: run `makepkg -si` in packaging/arch. Set MM_RUST_GIT to build
 # another clone or a URL.
 pkgname=mm-rust-git
-pkgver=0.1.0
+pkgver=0.1.0.r29.gd40e7e4
 pkgrel=1
 pkgdesc="Omarchy-themed Mattermost client"
 arch=('x86_64' 'aarch64')
@@ -25,7 +25,7 @@ provides=('mm-rust')
 conflicts=('mm-rust')
 source=("mm-rust::git+${MM_RUST_GIT:-file://$(realpath "$startdir/../..")}")
 sha256sums=('SKIP')
-options=('!lto')  # cargo does its own (thin) LTO
+options=('!lto' '!debug')  # cargo does its own (thin) LTO and strips
 
 pkgver() {
   cd mm-rust

@@ -11,6 +11,18 @@ An Omarchy-themed Mattermost client in Rust, with a compatible Rust server to fo
 `reference/` (gitignored) holds shallow clones of `mattermost/mattermost` and
 `mattermost/desktop`. The OpenAPI spec is in `reference/mattermost/api/v4/source/`.
 
+## Install
+
+```sh
+packaging/install.sh               # build and install to ~/.local (binary, launcher entry, icon); no root
+packaging/install.sh --uninstall   # remove them again (settings, layout and login are kept)
+```
+
+On Arch/Omarchy, `packaging/arch/PKGBUILD` builds a `mm-rust-git` package:
+run `makepkg -si` in `packaging/arch`. It then shows up in the app launcher as
+**mm-rust**. Add `--read-only` (or `MM_READONLY=1`) to look around a server
+without changing anything on it.
+
 ## Dev server
 
 ```sh
@@ -23,7 +35,7 @@ The same example works against a real server with `MM_TOKEN` (a personal access 
 ## Run the client
 
 ```sh
-cargo run -p mm-client                                   # login screen; the session is saved to ~/.config/mm-rust/session.toml (0600)
+cargo run -p mm-client                                   # login screen; the login token is kept in the system keyring
 MM_URL=http://localhost:8065 MM_TOKEN=<token> cargo run -p mm-client   # skip the login screen
 ```
 
@@ -39,7 +51,24 @@ MM_URL=http://localhost:8065 MM_TOKEN=<token> cargo run -p mm-client   # skip th
 | PageUp / PageDown | Scroll; older history loads as you reach the top |
 | Ctrl+U | Attach files (drag-and-drop works too) |
 | Ctrl+T | Theme picker |
-| Esc | Close switcher, then thread pane |
+| Ctrl+Shift+T | Threads inline or in a side pane |
+| Esc | Close switcher, then thread pane; then step out of the message box (vim keys) |
+
+**Panes.** Several channels side by side; the layout is saved per server and
+comes back next time.
+
+| Key | Action |
+|---|---|
+| Ctrl+D / Ctrl+Shift+D | Split right / down |
+| Ctrl+W | Close the pane |
+| Ctrl+Alt+arrows | Move between panes (or click one); drag a split to resize, a title bar to move |
+| Ctrl+I | Inbox: unread messages from every channel in one pane |
+| Ctrl+Shift+L | Compact (one line per message) or comfortable, per pane |
+
+**Vim keys**, when no text box has the cursor (Esc leaves the message box):
+`j`/`k` move between messages, `gg`/`G` first/last, `h`/`l` panes, `r` reply,
+`o` show replies (or open an inbox message), `e` edit, `dd` delete, `+` react,
+`u` mark unread, `i` back to typing, `/` search.
 
 The window class is `mm-rust`, for Hyprland rules.
 
@@ -62,6 +91,13 @@ name = "gruvbox"           # used by "fixed"
 light = "catppuccin-latte" # used by "auto"
 dark = "tokyo-night"
 font = "JetBrainsMono Nerd Font"  # optional; defaults to the system monospace font
+
+[layout]
+threads = "inline"         # "inline" | "pane"
+density = "comfortable"    # default for new panes: "comfortable" | "compact"
+
+[keys]
+vim = true                 # vim-style keys when no text box has the cursor
 ```
 
 The bundled themes are copied from Omarchy (MIT, see `crates/omarchy-theme/themes/LICENSE`). Refresh them with `dev/sync-omarchy-themes.sh`.
@@ -70,6 +106,9 @@ The bundled themes are copied from Omarchy (MIT, see `crates/omarchy-theme/theme
 The session token is kept in the system keyring (Secret Service / Keychain).
 
 `dev/drive.sh <pid|title=…> <wtype args>` sends keystrokes for UI testing, and refuses unless that window has focus.
+`dev/click.sh <pid> <x> <y> [move|click|right|scroll N|drag X2 Y2]` moves and clicks the pointer
+inside that window (Hyprland's virtual-pointer protocol, no root), and refuses unless it's focused.
+`dev/seed.sh --threads` / `--bulk N` fill the dev server with busy threads or a long channel.
 
 ## Tests
 

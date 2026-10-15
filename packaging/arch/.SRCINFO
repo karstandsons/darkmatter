@@ -1,6 +1,6 @@
 pkgbase = mm-rust-git
 	pkgdesc = Omarchy-themed Mattermost client
-	pkgver = 0.1.0
+	pkgver = 0.1.0.r29.gd40e7e4
 	pkgrel = 1
 	url = https://github.com/ckarst/mm-rust
 	arch = x86_64
@@ -21,6 +21,7 @@ pkgbase = mm-rust-git
 	provides = mm-rust
 	conflicts = mm-rust
 	options = !lto
+	options = !debug
 	source = mm-rust::git+file:///home/oizo/Projects/mm-rust
 	sha256sums = SKIP
 
