@@ -5,6 +5,8 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-15
+
 - **Theme picker:** clicking a theme now uses it. Before, a click only
   previewed it, and closing the picker undid it. Picking a theme always
   applies it right away (Fixed); Auto light/dark is set with its own
