@@ -5,7 +5,7 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
-## [0.1.0]
+## [0.1.0] - 2026-10-15
 
 The first release: a Mattermost client for Omarchy and other Linux desktops,
 and macOS.
