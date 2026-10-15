@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=mm-rust
+GenericName=Mattermost Client
+Comment=Omarchy-themed Mattermost client
+Exec=mm-rust
+Icon=mm-rust
+Terminal=false
+Categories=Network;Chat;InstantMessaging;
+Keywords=mattermost;chat;messages;
+StartupWMClass=mm-rust

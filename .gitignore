@@ -2,3 +2,6 @@
 /reference
 .env
 /dev/pointer/target
+packaging/arch/*
+!packaging/arch/PKGBUILD
+!packaging/arch/.SRCINFO
