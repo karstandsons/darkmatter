@@ -55,7 +55,7 @@ mod tests {
     fn reports_theme_switch() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("theme")).unwrap();
-        let colors = include_str!("fallback-colors.toml");
+        let colors = crate::tests::TOKYO;
         std::fs::write(dir.path().join("theme/colors.toml"), colors).unwrap();
         std::fs::write(dir.path().join("theme.name"), "tokyo-night").unwrap();
 

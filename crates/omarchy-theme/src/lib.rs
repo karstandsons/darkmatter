@@ -11,7 +11,15 @@ use std::str::FromStr;
 
 use serde::Deserialize;
 
+mod bundled;
+mod catalog;
+mod choice;
+pub mod install;
 mod watch;
+
+pub use bundled::BUNDLED;
+pub use catalog::{Catalog, Roots, Source, ThemeEntry, display_name};
+pub use choice::{ThemeChoice, resolve};
 pub use watch::{ThemeWatcher, watch};
 
 #[derive(Debug, thiserror::Error)]
@@ -167,9 +175,10 @@ impl Palette {
         Ok(toml::from_str::<RawPalette>(colors_toml)?.into())
     }
 
-    /// Tokyo Night, Omarchy's default theme, used when no theme is installed.
+    /// Tokyo Night, Omarchy's default theme, used when nothing else resolves.
     pub fn fallback() -> Self {
-        Palette::parse(include_str!("fallback-colors.toml")).expect("bundled palette is valid")
+        let (_, toml) = BUNDLED.iter().find(|(slug, _)| *slug == "tokyo-night").expect("tokyo-night is bundled");
+        Palette::parse(toml).expect("bundled palette is valid")
     }
 }
 
@@ -205,6 +214,11 @@ impl Theme {
     }
 }
 
+/// True when running under Omarchy (it has rendered a current theme).
+pub fn omarchy_present() -> bool {
+    state_dir().is_ok_and(|d| d.join("theme.name").is_file())
+}
+
 /// `~/.local/state/omarchy/current`
 pub fn state_dir() -> Result<PathBuf, Error> {
     let home = std::env::var_os("HOME").ok_or(Error::NoHome)?;
@@ -224,8 +238,20 @@ fn read(path: &Path) -> Result<String, Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) const TOKYO: &str = include_str!("../themes/tokyo-night/colors.toml");
+
+    #[test]
+    fn every_bundled_theme_parses() {
+        assert_eq!(BUNDLED.len(), 22);
+        for (slug, toml) in BUNDLED {
+            Palette::parse(toml).unwrap_or_else(|e| panic!("{slug}: {e}"));
+        }
+        let light = BUNDLED.iter().filter(|(_, t)| Palette::parse(t).unwrap().mode == Mode::Light).count();
+        assert_eq!(light, 5);
+    }
 
     #[test]
     fn parses_hex() {
@@ -274,7 +300,7 @@ mod tests {
         std::fs::write(dir.path().join("theme.name"), "catppuccin\n").unwrap();
         std::fs::write(
             dir.path().join("theme/colors.toml"),
-            include_str!("fallback-colors.toml"),
+            crate::tests::TOKYO,
         )
         .unwrap();
         let t = Theme::load_from(dir.path()).unwrap();
