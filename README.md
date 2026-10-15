@@ -119,3 +119,18 @@ inside that window (Hyprland's virtual-pointer protocol, no root), and refuses u
 ```sh
 cargo test     # REST against wiremock, WebSocket against a scripted local server, fixtures in fixtures/
 ```
+
+## License
+
+Darkmatter is open source, under either of
+
+- [MIT](LICENSE-MIT)
+- [Apache-2.0](LICENSE-APACHE)
+
+at your option. Copyright Karst & Sons. The names "Darkmatter" and "axiond"
+aren't covered by the license: see [TRADEMARKS.md](TRADEMARKS.md).
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Darkmatter is an independent client for Mattermost servers. It isn't affiliated
+with or endorsed by Mattermost, Inc.
+

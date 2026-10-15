@@ -1,4 +1,4 @@
-# Maintainer: Cody Karst <codykarst@gmail.com>
+# Maintainer: Cody Karst <cody@karstandsons.com>
 #
 # Builds darkmatter from git. Until the repo is published, it builds this
 # checkout: run `makepkg -si` in packaging/arch. Set DARKMATTER_GIT to build
@@ -9,7 +9,7 @@ pkgrel=1
 pkgdesc="Darkmatter: an Omarchy-themed Mattermost client"
 arch=('x86_64' 'aarch64')
 url="https://github.com/karstandsons/darkmatter"
-license=('Apache-2.0')
+license=('MIT OR Apache-2.0')
 # Linked: glibc, gcc-libs. Loaded at runtime: Wayland/X11, xkbcommon, and a GPU
 # driver through Vulkan (it falls back to a CPU renderer without one).
 depends=('gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'hicolor-icon-theme')
@@ -56,4 +56,5 @@ package() {
   install -Dm644 packaging/darkmatter.desktop "$pkgdir/usr/share/applications/darkmatter.desktop"
   install -Dm644 packaging/darkmatter.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/darkmatter.svg"
   install -Dm644 README.md "$pkgdir/usr/share/doc/darkmatter/README.md"
+  install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname/"
 }
