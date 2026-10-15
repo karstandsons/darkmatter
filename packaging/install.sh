@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# Build darkmatter and install it for the current user (no root needed):
-# the binary, a launcher entry and the icon, under ~/.local by default.
+# Install Darkmatter for the current user (no root needed): the binary, a
+# launcher entry and the icon, under ~/.local by default.
+#
+# From a release tarball (the binary is next to this script):
+#   ./install.sh                         install to ~/.local
+# From a source checkout (builds first):
 #   packaging/install.sh                 build and install to ~/.local
-#   PREFIX=/usr/local packaging/install.sh   (then run as root)
 #   packaging/install.sh --no-build      install an existing target/release/darkmatter
-#   packaging/install.sh --uninstall     remove what this installs
+# Either way:
+#   PREFIX=/usr/local ./install.sh       somewhere else (then run as root)
+#   ./install.sh --uninstall             remove what this installs
 set -euo pipefail
-cd "$(dirname "$0")/.."
+here=$(cd "$(dirname "$0")" && pwd)
 PREFIX=${PREFIX:-$HOME/.local}
 bin=$PREFIX/bin/darkmatter
 desktop=$PREFIX/share/applications/darkmatter.desktop
@@ -24,16 +29,23 @@ if [[ ${1:-} == --uninstall ]]; then
   exit 0
 fi
 
-if [[ ${1:-} != --no-build ]]; then
-  cargo=$(command -v cargo || echo "$HOME/.cargo/bin/cargo")
-  "$cargo" build --release --locked -p darkmatter
+if [[ -x $here/darkmatter ]]; then
+  # A release tarball: everything is next to this script.
+  src_bin=$here/darkmatter src_desktop=$here/darkmatter.desktop src_icon=$here/darkmatter.svg
+else
+  root=$(cd "$here/.." && pwd)
+  if [[ ${1:-} != --no-build ]]; then
+    cargo=$(command -v cargo || echo "$HOME/.cargo/bin/cargo")
+    (cd "$root" && "$cargo" build --release --locked -p darkmatter)
+  fi
+  src_bin=$root/target/release/darkmatter src_desktop=$here/darkmatter.desktop src_icon=$here/darkmatter.svg
 fi
 
-install -Dm755 target/release/darkmatter "$bin"
-install -Dm644 packaging/darkmatter.desktop "$desktop"
-install -Dm644 packaging/darkmatter.svg "$icon"
+install -Dm755 "$src_bin" "$bin"
+install -Dm644 "$src_desktop" "$desktop"
+install -Dm644 "$src_icon" "$icon"
 refresh
-echo "Installed $bin"
+echo "Installed $bin ($("$bin" --version))"
 case ":$PATH:" in
   *":$PREFIX/bin:"*) ;;
   *) echo "Note: $PREFIX/bin isn't on your PATH; the launcher entry still works." ;;

@@ -1,0 +1,187 @@
+# Build release artifacts and publish them.
+#
+# - Push a tag like v0.2.0 (made by dev/release.sh) to build, then create the
+#   GitHub release with notes from CHANGELOG.md, then update the AUR package
+#   and the Homebrew tap (each only once its secret is set).
+# - Run it by hand (Actions → Release → Run workflow) for a dry run: the same
+#   builds, uploaded as workflow artifacts, with nothing published.
+#
+# Secrets:
+#   AUR_SSH_KEY        private key of an AUR account that owns darkmatter-bin
+#   HOMEBREW_TAP_TOKEN token that can push to karstandsons/homebrew-tap
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Version from Cargo.toml (and check it matches the tag)
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ $GITHUB_REF == refs/tags/v* && ${GITHUB_REF#refs/tags/v} != "$version" ]]; then
+            echo "::error::tag ${GITHUB_REF#refs/tags/} doesn't match Cargo.toml version $version"
+            exit 1
+          fi
+          packaging/release-notes.sh "$version" > /dev/null
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: version
+    strategy:
+      matrix:
+        # Ubuntu 22.04 builds against an older glibc, so the binary runs on more
+        # distros. GitHub's ARM runners are free only for public repos.
+        include: ${{ fromJSON(github.event.repository.private
+          && '[{"os":"ubuntu-22.04","arch":"x86_64"}]'
+          || '[{"os":"ubuntu-22.04","arch":"x86_64"},{"os":"ubuntu-22.04-arm","arch":"aarch64"}]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev
+      - run: cargo build --release --locked -p darkmatter
+      - run: packaging/linux/tarball.sh target/release/darkmatter ${{ matrix.arch }} dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
+  icons:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y librsvg2-bin
+      - run: packaging/macos/iconset.sh icons
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iconset
+          path: icons
+
+  macos:
+    needs: icons
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          cargo build --release --locked -p darkmatter --target aarch64-apple-darwin
+          cargo build --release --locked -p darkmatter --target x86_64-apple-darwin
+          # One binary for Apple Silicon and Intel.
+          lipo -create -output darkmatter \
+            target/aarch64-apple-darwin/release/darkmatter target/x86_64-apple-darwin/release/darkmatter
+          lipo -info darkmatter
+      - uses: actions/download-artifact@v4
+        with:
+          name: iconset
+          path: icons
+      - run: packaging/macos/bundle.sh darkmatter icons/darkmatter.iconset dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '{linux-*,macos-*}'
+          path: dist
+          merge-multiple: true
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          packaging/release-notes.sh "$VERSION" > notes.md
+          gh release create "v$VERSION" dist/* --title "Darkmatter $VERSION" --notes-file notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/SHA256SUMS
+
+  aur:
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.AUR_SSH_KEY != ''
+      - uses: actions/download-artifact@v4
+        if: env.AUR_SSH_KEY != ''
+        with:
+          name: checksums
+      - name: Publish darkmatter-bin to the AUR
+        if: env.AUR_SSH_KEY != ''
+        run: |
+          pacman -Sy --noconfirm --needed git openssh
+          sum() { awk -v f="$1" '$2 == f { print $1 }' SHA256SUMS; }
+          x86=$(sum "darkmatter-$VERSION-x86_64-linux.tar.gz")
+          arm=$(sum "darkmatter-$VERSION-aarch64-linux.tar.gz")
+          install -d -m700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur && chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur"
+          git clone ssh://aur@aur.archlinux.org/darkmatter-bin.git aur
+          sed -e "s/^pkgver=.*/pkgver=$VERSION/" -e "s/^pkgrel=.*/pkgrel=1/" \
+              -e "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$x86')/" \
+              -e "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${arm:-SKIP}')/" \
+              packaging/arch/darkmatter-bin/PKGBUILD > aur/PKGBUILD
+          # makepkg won't run as root.
+          useradd -m builder && chown -R builder aur
+          su builder -c "cd aur && makepkg --printsrcinfo > .SRCINFO"
+          cd aur
+          git config user.name "Cody Karst" && git config user.email cody@karstandsons.com
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to $VERSION" && git push
+
+  homebrew:
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.HOMEBREW_TAP_TOKEN != ''
+      - uses: actions/download-artifact@v4
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        with:
+          name: checksums
+      - name: Update the cask in karstandsons/homebrew-tap
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        run: |
+          sha=$(awk -v f="darkmatter-$VERSION-macos-universal.zip" '$2 == f { print $1 }' SHA256SUMS)
+          git clone "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/karstandsons/homebrew-tap.git" tap
+          mkdir -p tap/Casks
+          sed -e "s/^  version \".*\"/  version \"$VERSION\"/" -e "s/^  sha256 .*/  sha256 \"$sha\"/" \
+              packaging/homebrew/darkmatter.rb > tap/Casks/darkmatter.rb
+          cd tap
+          git config user.name "Cody Karst" && git config user.email cody@karstandsons.com
+          git add Casks/darkmatter.rb
+          git commit -m "darkmatter $VERSION" && git push

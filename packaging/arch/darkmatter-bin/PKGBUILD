@@ -1,0 +1,34 @@
+# Maintainer: Cody Karst <cody@karstandsons.com>
+#
+# Installs the prebuilt release from GitHub. The release workflow fills in
+# pkgver and the checksums and publishes this to the AUR.
+pkgname=darkmatter-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Darkmatter: an Omarchy-themed Mattermost client"
+arch=('x86_64' 'aarch64')
+url="https://github.com/karstandsons/darkmatter"
+license=('MIT OR Apache-2.0')
+depends=('gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'hicolor-icon-theme')
+optdepends=(
+  'vulkan-icd-loader: GPU rendering'
+  'libx11: running under X11'
+  'gnome-keyring: keep the login in a keyring (or any Secret Service)'
+  'xdg-desktop-portal: file picker for attachments'
+  'libnotify: mention notifications'
+)
+provides=('darkmatter')
+conflicts=('darkmatter' 'darkmatter-git')
+source_x86_64=("$url/releases/download/v$pkgver/darkmatter-$pkgver-x86_64-linux.tar.gz")
+source_aarch64=("$url/releases/download/v$pkgver/darkmatter-$pkgver-aarch64-linux.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  cd "darkmatter-$pkgver-$CARCH-linux"
+  install -Dm755 darkmatter "$pkgdir/usr/bin/darkmatter"
+  install -Dm644 darkmatter.desktop "$pkgdir/usr/share/applications/darkmatter.desktop"
+  install -Dm644 darkmatter.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/darkmatter.svg"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/darkmatter/README.md"
+  install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}
