@@ -1,7 +1,7 @@
 //! vpointer <x> <y> <layout width> <layout height> [move|click|right|scroll <steps>|drag <x2> <y2>]
 //!
 //! Coordinates are logical pixels in the compositor's layout. Don't call this
-//! directly: dev/click.sh checks that mm-rust is focused and the point is in it.
+//! directly: dev/click.sh checks that Darkmatter is focused and the point is in it.
 
 use std::{thread, time::Duration};
 

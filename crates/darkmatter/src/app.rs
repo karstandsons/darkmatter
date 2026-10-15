@@ -434,12 +434,12 @@ impl App {
                 let unread = chat.store.channels.keys().map(|id| chat.store.unread(id).mentions).sum::<i64>();
                 let name = chat.store.channels.get(&chat.focused().channel).map(|c| chat.store.channel_label(c));
                 match (unread, name) {
-                    (0, Some(n)) => format!("{n} — Mattermost"),
-                    (m, Some(n)) => format!("({m}) {n} — Mattermost"),
-                    (_, None) => "Mattermost".into(),
+                    (0, Some(n)) => format!("{n} — Darkmatter"),
+                    (m, Some(n)) => format!("({m}) {n} — Darkmatter"),
+                    (_, None) => "Darkmatter".into(),
                 }
             }
-            _ => "Mattermost".into(),
+            _ => "Darkmatter".into(),
         }
     }
 
@@ -593,7 +593,7 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let started = std::time::Instant::now();
         let element = self.view_inner();
-        tracing::trace!(target: "mm_rust::perf", "view built in {:?}", started.elapsed());
+        tracing::trace!(target: "darkmatter::perf", "view built in {:?}", started.elapsed());
         element
     }
 
@@ -769,8 +769,8 @@ impl LoginForm {
                 .style(c.input())
         };
         let mut form = column![
-            text("Mattermost").size(28).color(c.fg_bright),
-            text("Sign in to your server").color(c.muted),
+            text("Darkmatter").size(28).color(c.fg_bright),
+            text("Sign in to your Mattermost server").color(c.muted),
             space().height(8),
             input("Server URL, e.g. chat.example.com", &self.server, LoginField::Server),
             input("Email or username", &self.login, LoginField::Login),

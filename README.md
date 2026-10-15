@@ -1,11 +1,13 @@
-# mm-rust
+# Darkmatter
 
-An Omarchy-themed Mattermost client in Rust, with a compatible Rust server to follow.
+An Omarchy-themed Mattermost client in Rust, with tiled panes, a unified
+inbox and vim keys. It works with any Mattermost server. A compatible Rust
+server, **axiond**, is to follow.
 
 | Crate | What |
 |---|---|
 | `crates/omarchy-theme` | Loads the active Omarchy palette and font, and watches for `omarchy theme set` |
-| `crates/mm-client` | The iced desktop app (`mm-rust` binary) |
+| `crates/darkmatter` | The iced desktop app (`darkmatter` binary) |
 | `crates/mm-api` | Typed Mattermost API v4 REST client and WebSocket event stream (auto reconnect and resume) |
 
 `reference/` (gitignored) holds shallow clones of `mattermost/mattermost` and
@@ -18,9 +20,9 @@ packaging/install.sh               # build and install to ~/.local (binary, laun
 packaging/install.sh --uninstall   # remove them again (settings, layout and login are kept)
 ```
 
-On Arch/Omarchy, `packaging/arch/PKGBUILD` builds a `mm-rust-git` package:
+On Arch/Omarchy, `packaging/arch/PKGBUILD` builds a `darkmatter-git` package:
 run `makepkg -si` in `packaging/arch`. It then shows up in the app launcher as
-**mm-rust**. Add `--read-only` (or `MM_READONLY=1`) to look around a server
+**Darkmatter**. Add `--read-only` (or `MM_READONLY=1`) to look around a server
 without changing anything on it.
 
 ## Dev server
@@ -35,8 +37,8 @@ The same example works against a real server with `MM_TOKEN` (a personal access 
 ## Run the client
 
 ```sh
-cargo run -p mm-client                                   # login screen; the login token is kept in the system keyring
-MM_URL=http://localhost:8065 MM_TOKEN=<token> cargo run -p mm-client   # skip the login screen
+cargo run -p darkmatter                                   # login screen; the login token is kept in the system keyring
+MM_URL=http://localhost:8065 MM_TOKEN=<token> cargo run -p darkmatter   # skip the login screen
 ```
 
 | Key | Action |
@@ -70,19 +72,19 @@ comes back next time.
 `o` show replies (or open an inbox message), `e` edit, `dd` delete, `+` react,
 `u` mark unread, `i` back to typing, `/` search.
 
-The window class is `mm-rust`, for Hyprland rules.
+The window class is `darkmatter`, for Hyprland rules.
 
 ## Themes
 
-mm-rust uses Omarchy's theme format (`colors.toml`) everywhere:
+Darkmatter uses Omarchy's theme format (`colors.toml`) everywhere:
 
 - **On Omarchy** it follows `omarchy theme set` live by default.
 - **Elsewhere** (other distros, macOS) it follows the OS light/dark setting: Tokyo Night when dark, Catppuccin Latte when light.
 - **Ctrl+T** (or "Themes" in the sidebar) opens the picker. Choose Follow Omarchy, Fixed, or Auto light/dark. Arrow keys preview live, Enter keeps the theme (in Auto it fills the light or dark slot), Esc cancels.
 - **All 22 Omarchy base themes are built in**, so they work without Omarchy. Themes installed in Omarchy (`~/.config/omarchy/themes`) show up too.
-- **Install from git** in the picker, with the same URLs as `omarchy theme install` (see [omarchy.org/themes](https://omarchy.org/themes/)). Themes go to `~/.config/mm-rust/themes`. On Omarchy, "Also install to Omarchy" runs `omarchy theme install`, which also switches your desktop theme. Only `colors.toml` is read from a theme repo; nothing in it is run.
+- **Install from git** in the picker, with the same URLs as `omarchy theme install` (see [omarchy.org/themes](https://omarchy.org/themes/)). Themes go to `~/.config/darkmatter/themes`. On Omarchy, "Also install to Omarchy" runs `omarchy theme install`, which also switches your desktop theme. Only `colors.toml` is read from a theme repo; nothing in it is run.
 
-Settings live in `~/.config/mm-rust/config.toml`:
+Settings live in `~/.config/darkmatter/config.toml`:
 
 ```toml
 [theme]
@@ -101,9 +103,11 @@ vim = true                 # vim-style keys when no text box has the cursor
 ```
 
 The bundled themes are copied from Omarchy (MIT, see `crates/omarchy-theme/themes/LICENSE`). Refresh them with `dev/sync-omarchy-themes.sh`.
-`RUST_LOG=mm_rust=debug` logs UI messages (tokens and login input are never logged).
+`RUST_LOG=darkmatter=debug` logs UI messages (tokens and login input are never logged).
 `--read-only` / `MM_READONLY=1` refuses every write to the server (posting, reacting, marking read…), for safely trying a real server.
 The session token is kept in the system keyring (Secret Service / Keychain).
+Darkmatter used to be called mm-rust: on first start it moves the old settings, layout, cache and
+keyring login to the new name.
 
 `dev/drive.sh <pid|title=…> <wtype args>` sends keystrokes for UI testing, and refuses unless that window has focus.
 `dev/click.sh <pid> <x> <y> [move|click|right|scroll N|drag X2 Y2]` moves and clicks the pointer

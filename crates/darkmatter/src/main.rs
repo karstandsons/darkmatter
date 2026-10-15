@@ -17,11 +17,27 @@ mod viewer;
 
 use app::App;
 
+/// Darkmatter used to be called mm-rust: move its folders (settings, saved
+/// layout, cache) to the new name once. The keyring login moves in `session`.
+fn migrate_old_name() {
+    let bases = [dirs::config_dir(), dirs::state_dir().or_else(dirs::data_local_dir), dirs::cache_dir()];
+    for base in bases.into_iter().flatten() {
+        let (old, new) = (base.join("mm-rust"), base.join("darkmatter"));
+        if old.is_dir() && !new.exists() {
+            match std::fs::rename(&old, &new) {
+                Ok(()) => tracing::info!("moved {} to {}", old.display(), new.display()),
+                Err(e) => tracing::warn!("couldn't move {}: {e}", old.display()),
+            }
+        }
+    }
+}
+
 fn main() -> iced::Result {
-    // RUST_LOG=mm_rust=debug logs every UI message (except the noisy ones).
+    // RUST_LOG=darkmatter=debug logs every UI message (except the noisy ones).
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
         .init();
+    migrate_old_name();
     // Read-only: never change anything on the server (for trying it on a real one).
     let read_only = std::env::args().any(|a| a == "--read-only")
         || std::env::var("MM_READONLY").is_ok_and(|v| !v.is_empty() && v != "0");
@@ -35,7 +51,7 @@ fn main() -> iced::Result {
     // Wayland app id / X11 class, so Hyprland rules and .desktop files can match it.
     #[cfg(target_os = "linux")]
     {
-        window.platform_specific.application_id = "mm-rust".into();
+        window.platform_specific.application_id = "darkmatter".into();
     }
     iced::application(App::new, App::update, App::view)
         .title(App::title)

@@ -1,4 +1,4 @@
-//! The saved login: the server URL in `~/.config/mm-rust/session.toml`, the
+//! The saved login: the server URL in `~/.config/darkmatter/session.toml`, the
 //! session token in the system keyring (or the 0600 file when there is none).
 
 use std::io::Write;
@@ -23,7 +23,7 @@ impl std::fmt::Debug for Session {
 
 
 fn path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("mm-rust/session.toml"))
+    Some(dirs::config_dir()?.join("darkmatter/session.toml"))
 }
 
 /// What's written to `session.toml`. The token only appears here when no
@@ -45,15 +45,33 @@ pub trait SecretStore {
 /// The OS keyring: Secret Service on Linux (gnome-keyring, KWallet), Keychain on macOS.
 pub struct Keyring;
 
+/// Keyring service names: now, and before Darkmatter was renamed from mm-rust.
+const SERVICE: &str = "darkmatter";
+const OLD_SERVICE: &str = "mm-rust";
+
 impl Keyring {
+    fn entry_for(service: &str, server: &str) -> Option<keyring::Entry> {
+        keyring::Entry::new(service, server).map_err(|e| tracing::warn!("keyring unavailable: {e}")).ok()
+    }
+
     fn entry(server: &str) -> Option<keyring::Entry> {
-        keyring::Entry::new("mm-rust", server).map_err(|e| tracing::warn!("keyring unavailable: {e}")).ok()
+        Self::entry_for(SERVICE, server)
     }
 }
 
 impl SecretStore for Keyring {
     fn get(&self, server: &str) -> Option<String> {
-        Self::entry(server)?.get_password().ok()
+        if let Some(token) = Self::entry(server).and_then(|e| e.get_password().ok()) {
+            return Some(token);
+        }
+        // Saved under the old name: move it (the old entry goes only once it's copied).
+        let old = Self::entry_for(OLD_SERVICE, server)?;
+        let token = old.get_password().ok()?;
+        if self.set(server, &token).is_ok() {
+            let _ = old.delete_credential();
+            tracing::info!("moved the saved login to the darkmatter keyring entry");
+        }
+        Some(token)
     }
     fn set(&self, server: &str, token: &str) -> Result<(), String> {
         Self::entry(server).ok_or("no keyring")?.set_password(token).map_err(|e| e.to_string())
@@ -143,6 +161,21 @@ fn write_file(path: &Path, file: &SessionFile) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Uses the real system keyring with a throwaway entry, so it's opt-in:
+    /// `cargo test -p darkmatter -- --ignored keyring_moves`.
+    #[test]
+    #[ignore]
+    fn keyring_moves_a_login_saved_under_the_old_name() {
+        let server = "https://migration-test.invalid";
+        let old = Keyring::entry_for(OLD_SERVICE, server).expect("a keyring");
+        old.set_password("old-token").unwrap();
+        assert_eq!(Keyring.get(server).as_deref(), Some("old-token"));
+        assert!(old.get_password().is_err(), "the old entry is gone once copied");
+        assert_eq!(Keyring::entry(server).unwrap().get_password().unwrap(), "old-token");
+        Keyring.delete(server);
+        assert!(Keyring.get(server).is_none());
+    }
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;

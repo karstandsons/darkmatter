@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Move/click the pointer inside the mm-rust window, ONLY if it's focused.
+# Move/click the pointer inside the Darkmatter window, ONLY if it's focused.
 # On a tiling desktop the window's tile moves, and focus follows the mouse,
 # so the position is read fresh and the point must fall inside the tile.
 #   dev/click.sh <pid> <x> <y> [move|click|right|scroll <steps>|drag <x2> <y2>]

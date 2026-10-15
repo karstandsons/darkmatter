@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Send keystrokes via wtype, but ONLY if the intended window is focused.
 # wtype types into whatever has focus, so never skip this check.
-#   dev/drive.sh <pid> <wtype args...>             target the mm-rust window by pid
+#   dev/drive.sh <pid> <wtype args...>             target the Darkmatter window by pid
 #   dev/drive.sh title=<exact title> <wtype args>  target e.g. a file dialog
 set -euo pipefail
 target=$1; shift

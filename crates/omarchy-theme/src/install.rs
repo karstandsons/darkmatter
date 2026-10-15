@@ -81,7 +81,7 @@ fn git(args: &[&str]) -> Result<(), String> {
 
 fn load(dir: &Path, slug: &str) -> Result<ThemeEntry, String> {
     let toml = std::fs::read_to_string(dir.join("colors.toml"))
-        .map_err(|_| "this repo has no colors.toml, so it isn't an Omarchy theme mm-rust can use".to_string())?;
+        .map_err(|_| "this repo has no colors.toml, so it isn't an Omarchy theme Darkmatter can use".to_string())?;
     let palette = Palette::parse(&toml).map_err(|e| format!("colors.toml: {e}"))?;
     let preview = ["preview.png", "preview.jpg", "preview.jpeg"].iter().map(|f| dir.join(f)).find(|p| p.is_file());
     Ok(ThemeEntry {
@@ -125,7 +125,7 @@ pub fn update(entry: &ThemeEntry) -> Result<ThemeEntry, String> {
     load(dir, &entry.slug)
 }
 
-/// Delete a theme installed through mm-rust. Omarchy's and bundled themes can't be removed here.
+/// Delete a theme installed through Darkmatter. Omarchy's and bundled themes can't be removed here.
 pub fn remove(entry: &ThemeEntry) -> Result<(), String> {
     std::fs::remove_dir_all(app_dir(entry)?).map_err(|e| e.to_string())
 }
@@ -133,7 +133,7 @@ pub fn remove(entry: &ThemeEntry) -> Result<(), String> {
 fn app_dir(entry: &ThemeEntry) -> Result<&PathBuf, String> {
     match (&entry.source, &entry.dir) {
         (Source::App, Some(dir)) if valid_name(&entry.slug) => Ok(dir),
-        _ => Err(format!("{} wasn't installed through mm-rust", entry.display_name)),
+        _ => Err(format!("{} wasn't installed through Darkmatter", entry.display_name)),
     }
 }
 

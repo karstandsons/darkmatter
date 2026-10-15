@@ -1,14 +1,14 @@
 # Maintainer: Cody Karst <codykarst@gmail.com>
 #
-# Builds mm-rust from git. Until the repo is published, it builds this
-# checkout: run `makepkg -si` in packaging/arch. Set MM_RUST_GIT to build
+# Builds darkmatter from git. Until the repo is published, it builds this
+# checkout: run `makepkg -si` in packaging/arch. Set DARKMATTER_GIT to build
 # another clone or a URL.
-pkgname=mm-rust-git
+pkgname=darkmatter-git
 pkgver=0.1.0.r29.gd40e7e4
 pkgrel=1
-pkgdesc="Omarchy-themed Mattermost client"
+pkgdesc="Darkmatter: an Omarchy-themed Mattermost client"
 arch=('x86_64' 'aarch64')
-url="https://github.com/ckarst/mm-rust"
+url="https://github.com/ckarst/darkmatter"
 license=('Apache-2.0')
 # Linked: glibc, gcc-libs. Loaded at runtime: Wayland/X11, xkbcommon, and a GPU
 # driver through Vulkan (it falls back to a CPU renderer without one).
@@ -21,39 +21,39 @@ optdepends=(
   'xdg-desktop-portal: file picker for attachments'
   'libnotify: mention notifications'
 )
-provides=('mm-rust')
-conflicts=('mm-rust')
-source=("mm-rust::git+${MM_RUST_GIT:-file://$(realpath "$startdir/../..")}")
+provides=('darkmatter')
+conflicts=('darkmatter')
+source=("darkmatter::git+${DARKMATTER_GIT:-file://$(realpath "$startdir/../..")}")
 sha256sums=('SKIP')
 options=('!lto' '!debug')  # cargo does its own (thin) LTO and strips
 
 pkgver() {
-  cd mm-rust
+  cd darkmatter
   printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
 }
 
 prepare() {
-  cd mm-rust
+  cd darkmatter
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-  cd mm-rust
+  cd darkmatter
   export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
-  cargo build --frozen --release -p mm-client
+  cargo build --frozen --release -p darkmatter
 }
 
 check() {
-  cd mm-rust
+  cd darkmatter
   export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
   cargo test --frozen --release --workspace
 }
 
 package() {
-  cd mm-rust
-  install -Dm755 target/release/mm-rust "$pkgdir/usr/bin/mm-rust"
-  install -Dm644 packaging/mm-rust.desktop "$pkgdir/usr/share/applications/mm-rust.desktop"
-  install -Dm644 packaging/mm-rust.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/mm-rust.svg"
-  install -Dm644 README.md "$pkgdir/usr/share/doc/mm-rust/README.md"
+  cd darkmatter
+  install -Dm755 target/release/darkmatter "$pkgdir/usr/bin/darkmatter"
+  install -Dm644 packaging/darkmatter.desktop "$pkgdir/usr/share/applications/darkmatter.desktop"
+  install -Dm644 packaging/darkmatter.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/darkmatter.svg"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/darkmatter/README.md"
 }

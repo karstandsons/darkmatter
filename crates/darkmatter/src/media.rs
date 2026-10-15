@@ -130,7 +130,7 @@ pub async fn open_file(client: Client, file_id: String, name: String) -> Result<
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| file_id.clone());
-    let dir = dirs::cache_dir().ok_or("no cache dir")?.join("mm-rust/files").join(&file_id);
+    let dir = dirs::cache_dir().ok_or("no cache dir")?.join("darkmatter/files").join(&file_id);
     let path = dir.join(name);
     if !path.exists() {
         let bytes = client.file(&file_id).await.map_err(|e| e.to_string())?;

@@ -79,7 +79,7 @@ j -X POST $U/teams/$TEAM/members -d "{\"team_id\":\"$TEAM\",\"user_id\":\"$BOB\"
 CH=$(j -X POST $U/channels -d "{\"team_id\":\"$TEAM\",\"name\":\"rust\",\"display_name\":\"Rust\",\"type\":\"O\"}" | jq -r .id)
 j -X POST $U/channels/$CH/members -d "{\"user_id\":\"$BOB\"}" >/dev/null
 TS=$(j "$U/teams/$TEAM/channels/name/town-square" | jq -r .id)
-j -X POST $U/posts -d "{\"channel_id\":\"$TS\",\"message\":\"Welcome to **mm-rust** dev :wave:\"}" >/dev/null
+j -X POST $U/posts -d "{\"channel_id\":\"$TS\",\"message\":\"Welcome to **Darkmatter** dev :wave:\"}" >/dev/null
 echo "seeded: login alice or bob, password $P"
 [[ $BULK -gt 0 ]] && bulk
 [[ $THREADS -gt 0 ]] && threads

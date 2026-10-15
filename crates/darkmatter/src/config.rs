@@ -1,4 +1,4 @@
-//! User settings in `~/.config/mm-rust/config.toml` (separate from the session file).
+//! User settings in `~/.config/darkmatter/config.toml` (separate from the session file).
 
 use std::path::PathBuf;
 
@@ -62,7 +62,7 @@ pub struct ThemeConfig {
 }
 
 fn path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("mm-rust/config.toml"))
+    Some(dirs::config_dir()?.join("darkmatter/config.toml"))
 }
 
 impl ThemeConfig {

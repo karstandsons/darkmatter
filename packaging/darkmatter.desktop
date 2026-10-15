@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=mm-rust
+Name=Darkmatter
 GenericName=Mattermost Client
 Comment=Omarchy-themed Mattermost client
-Exec=mm-rust
-Icon=mm-rust
+Exec=darkmatter
+Icon=darkmatter
 Terminal=false
 Categories=Network;Chat;InstantMessaging;
-Keywords=mattermost;chat;messages;
-StartupWMClass=mm-rust
+Keywords=mattermost;chat;messages;darkmatter;
+StartupWMClass=darkmatter

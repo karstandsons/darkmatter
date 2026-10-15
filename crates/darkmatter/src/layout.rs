@@ -1,5 +1,5 @@
 //! The pane layout, saved per server so it comes back next time.
-//! Lives in `~/.local/state/mm-rust/layout.toml` (channel ids are per server).
+//! Lives in `~/.local/state/darkmatter/layout.toml` (channel ids are per server).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -89,7 +89,7 @@ pub fn configuration(saved: &Saved, known: &impl Fn(&str) -> bool, next: &mut us
 }
 
 fn path() -> Option<PathBuf> {
-    Some(dirs::state_dir().or_else(dirs::data_local_dir)?.join("mm-rust/layout.toml"))
+    Some(dirs::state_dir().or_else(dirs::data_local_dir)?.join("darkmatter/layout.toml"))
 }
 
 fn read() -> File {

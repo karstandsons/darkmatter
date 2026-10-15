@@ -1,4 +1,4 @@
-//! Every theme mm-rust can show: installed through mm-rust, installed in Omarchy,
+//! Every theme Darkmatter can show: installed through Darkmatter, installed in Omarchy,
 //! Omarchy's base themes on disk, and the copies bundled into the binary.
 
 use std::path::{Path, PathBuf};
@@ -9,13 +9,13 @@ use crate::{BUNDLED, Mode, Palette};
 /// earlier source hides later ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
-    /// Installed from git through mm-rust (`~/.config/mm-rust/themes`).
+    /// Installed from git through Darkmatter (`~/.config/darkmatter/themes`).
     App,
     /// Installed into Omarchy (`~/.config/omarchy/themes`).
     OmarchyUser,
     /// Omarchy's base themes on this machine.
     OmarchyBase,
-    /// Compiled into mm-rust, so every platform has Omarchy's base themes.
+    /// Compiled into Darkmatter, so every platform has Omarchy's base themes.
     Bundled,
 }
 
@@ -61,9 +61,9 @@ impl Roots {
     }
 }
 
-/// Where mm-rust installs themes (`~/.config/mm-rust/themes`, or the platform equivalent).
+/// Where Darkmatter installs themes (`~/.config/darkmatter/themes`, or the platform equivalent).
 pub fn app_themes_dir() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("mm-rust/themes"))
+    Some(dirs::config_dir()?.join("darkmatter/themes"))
 }
 
 /// Same title-casing as `omarchy theme current`: `tokyo-night` -> `Tokyo Night`.
@@ -113,7 +113,7 @@ impl Catalog {
         Catalog { entries }
     }
 
-    /// Where mm-rust installs themes.
+    /// Where Darkmatter installs themes.
     pub fn app_dir() -> Option<PathBuf> {
         app_themes_dir()
     }

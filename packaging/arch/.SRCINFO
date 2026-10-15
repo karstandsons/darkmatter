@@ -1,8 +1,8 @@
-pkgbase = mm-rust-git
-	pkgdesc = Omarchy-themed Mattermost client
+pkgbase = darkmatter-git
+	pkgdesc = Darkmatter: an Omarchy-themed Mattermost client
 	pkgver = 0.1.0.r29.gd40e7e4
 	pkgrel = 1
-	url = https://github.com/ckarst/mm-rust
+	url = https://github.com/ckarst/darkmatter
 	arch = x86_64
 	arch = aarch64
 	license = Apache-2.0
@@ -18,11 +18,11 @@ pkgbase = mm-rust-git
 	optdepends = gnome-keyring: keep the login in a keyring (or any Secret Service)
 	optdepends = xdg-desktop-portal: file picker for attachments
 	optdepends = libnotify: mention notifications
-	provides = mm-rust
-	conflicts = mm-rust
+	provides = darkmatter
+	conflicts = darkmatter
 	options = !lto
 	options = !debug
-	source = mm-rust::git+file:///home/oizo/Projects/mm-rust
+	source = darkmatter::git+file:///home/oizo/Projects/mm-rust
 	sha256sums = SKIP
 
-pkgname = mm-rust-git
+pkgname = darkmatter-git

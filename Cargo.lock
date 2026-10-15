@@ -979,6 +979,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "darkmatter"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "emojis",
+ "iced",
+ "image",
+ "keyring",
+ "mm-api",
+ "notify-rust",
+ "omarchy-theme",
+ "open",
+ "rfd",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2781,31 +2806,6 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "url",
- "wiremock",
-]
-
-[[package]]
-name = "mm-client"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dirs",
- "emojis",
- "iced",
- "image",
- "keyring",
- "mm-api",
- "notify-rust",
- "omarchy-theme",
- "open",
- "rfd",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
  "wiremock",
 ]
 
