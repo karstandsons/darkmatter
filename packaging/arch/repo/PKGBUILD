@@ -1,0 +1,33 @@
+# Maintainer: Cody Karst <cody@karstandsons.com>
+#
+# The `darkmatter` package in the Karst & Sons pacman repository
+# (karstandsons.github.io/archlinux). The release workflow builds it from the
+# release tarball next to this file (setting pkgver), signs it and publishes it.
+pkgname=darkmatter
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Darkmatter: an Omarchy-themed Mattermost client"
+arch=('x86_64' 'aarch64')
+url="https://github.com/karstandsons/darkmatter"
+license=('MIT OR Apache-2.0')
+depends=('gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'hicolor-icon-theme')
+optdepends=(
+  'vulkan-icd-loader: GPU rendering'
+  'libx11: running under X11'
+  'gnome-keyring: keep the login in a keyring (or any Secret Service)'
+  'xdg-desktop-portal: file picker for attachments'
+  'libnotify: mention notifications'
+)
+conflicts=('darkmatter-bin' 'darkmatter-git')
+source=("darkmatter-$pkgver-$CARCH-linux.tar.gz")
+sha256sums=('SKIP')  # built from the tarball CI just made and checked
+options=('!debug')
+
+package() {
+  cd "darkmatter-$pkgver-$CARCH-linux"
+  install -Dm755 darkmatter "$pkgdir/usr/bin/darkmatter"
+  install -Dm644 darkmatter.desktop "$pkgdir/usr/share/applications/darkmatter.desktop"
+  install -Dm644 darkmatter.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/darkmatter.svg"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/darkmatter/README.md"
+  install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}

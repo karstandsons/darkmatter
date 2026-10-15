@@ -95,7 +95,7 @@ pub fn install_method(exe: &Path) -> Install {
 /// The one-line "how to update" under the notice.
 pub fn hint(install: Install) -> &'static str {
     match install {
-        Install::Pacman => "Update with yay -Syu (or paru)",
+        Install::Pacman => "Update with sudo pacman -Syu",
         Install::MacApp => "Update with brew upgrade --cask darkmatter",
         Install::Local => "Download it and run install.sh again",
         Install::Dev => "git pull and rebuild",
