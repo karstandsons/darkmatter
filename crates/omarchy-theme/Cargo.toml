@@ -1,0 +1,15 @@
+[package]
+name = "omarchy-theme"
+description = "Load the active Omarchy theme (colors + font) and watch for theme switches"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+toml = "1"
+notify = "8"
+
+[dev-dependencies]
+tempfile = "3"
