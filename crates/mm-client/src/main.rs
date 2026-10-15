@@ -4,6 +4,7 @@ mod chat_view;
 mod session;
 mod store;
 mod style;
+mod switcher;
 mod text;
 mod viewer;
 

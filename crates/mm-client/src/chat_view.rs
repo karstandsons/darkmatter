@@ -1,7 +1,8 @@
 //! Chat screen views.
 
 use iced::widget::{
-    Column, button, center, column, container, hover, markdown, row, rule, scrollable, space, text, text_input,
+    Column, button, center, column, container, hover, markdown, row, rule, scrollable, space, stack, text,
+    text_input,
 };
 use iced::{Element, Length, Theme};
 use mm_api::models::{Channel, ChannelType, Post};
@@ -30,7 +31,10 @@ impl Chat {
         if let Some(root) = &self.thread {
             layout = layout.push(rule::vertical(1)).push(self.thread_pane(root, c, theme));
         }
-        layout.into()
+        match &self.switcher {
+            Some(sw) => stack![layout, sw.view(&self.store, c)].into(),
+            None => layout.into(),
+        }
     }
 
     fn team_rail(&self, c: Colors) -> Element<'_, Message> {

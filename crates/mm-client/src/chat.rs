@@ -12,6 +12,7 @@ use mm_api::{Client, PostsQuery, ws};
 use crate::app::{Message, bootstrap, err};
 use crate::session::Session;
 use crate::store::Store;
+use crate::switcher::{self, Switcher};
 
 pub const COMPOSER: &str = "composer";
 pub const TIMELINE: &str = "timeline";
@@ -32,6 +33,7 @@ pub struct Chat {
     /// Root post id of the thread shown in the right pane.
     pub thread: Option<String>,
     pub thread_draft: String,
+    pub switcher: Option<Switcher>,
     pub error: Option<String>,
 }
 
@@ -55,6 +57,7 @@ impl Chat {
             typing: HashMap::new(),
             thread: None,
             thread_draft: String::new(),
+            switcher: None,
             error: None,
         };
         Some((chat, Task::none()))
@@ -204,6 +207,47 @@ impl Chat {
                 let client = self.client.clone();
                 Task::perform(async move { client.create_post(&post).await.map_err(err) }, Message::Sent)
             }
+            Message::OpenSwitcher => {
+                let mut sw = Switcher::default();
+                sw.refresh(&self.store);
+                self.switcher = Some(sw);
+                operation::focus(switcher::INPUT)
+            }
+            Message::CloseSwitcher => {
+                self.switcher = None;
+                operation::focus(COMPOSER)
+            }
+            Message::SwitcherQuery(q) => {
+                if let Some(sw) = &mut self.switcher {
+                    sw.query = q;
+                    sw.selected = 0;
+                    sw.refresh(&self.store);
+                }
+                Task::none()
+            }
+            Message::SwitcherPick(id) => {
+                let Some(sw) = self.switcher.take() else { return Task::none() };
+                let Some(id) = id.or_else(|| sw.current().cloned()) else { return Task::none() };
+                if let Some(team) = self.store.channels.get(&id).map(|c| c.team_id.clone())
+                    && !team.is_empty()
+                {
+                    self.team = team;
+                }
+                self.select_channel(id)
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
+                if modifiers.command() && k.as_str() == "k" =>
+            {
+                self.update(if self.switcher.is_some() { Message::CloseSwitcher } else { Message::OpenSwitcher })
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Named(named), .. }) if self.switcher.is_some() => {
+                match named {
+                    Named::ArrowUp => self.switcher.as_mut().map(|s| s.step(-1)),
+                    Named::ArrowDown => self.switcher.as_mut().map(|s| s.step(1)),
+                    _ => None,
+                };
+                Task::none()
+            }
             // Mattermost's shortcut: reply to the latest message in the channel.
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::ArrowUp), modifiers, .. })
                 if modifiers.shift() && !modifiers.alt() =>
@@ -219,9 +263,8 @@ impl Chat {
                     None => Task::none(),
                 }
             }
-            Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::Escape), .. }) if self.thread.is_some() => {
-                self.update(Message::CloseThread)
-            }
+            Message::Escape if self.switcher.is_some() => self.update(Message::CloseSwitcher),
+            Message::Escape if self.thread.is_some() => self.update(Message::CloseThread),
             Message::React(post_id, emoji, add) => {
                 let client = self.client.clone();
                 let me = self.store.me.id.clone();

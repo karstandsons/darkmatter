@@ -65,10 +65,17 @@ pub enum Message {
     Thread(String, Result<PostList, String>),
     ThreadDraft(String),
     SendReply,
+    OpenSwitcher,
+    CloseSwitcher,
+    SwitcherQuery(String),
+    /// Enter (None = the highlighted row) or a click on a row.
+    SwitcherPick(Option<String>),
     React(String, String, bool),
     Ws(ws::Message),
     Link(markdown::Uri),
     Key(keyboard::Event),
+    /// Esc, even when a text field captured it (they use it to drop focus).
+    Escape,
     Tick,
     Logout,
 }
@@ -198,6 +205,13 @@ impl App {
         let mut subs = vec![
             Subscription::run(theme_events).map(Message::ThemeChanged),
             keyboard::listen().map(Message::Key),
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::Escape),
+                _ => None,
+            }),
         ];
         if let Screen::Chat(chat) = &self.screen {
             subs.push(Subscription::run_with(chat.session.clone(), ws_events).map(Message::Ws));
