@@ -39,6 +39,8 @@ pub struct PaneView {
     pub hold_top: Option<(f32, f32)>,
     /// One line per message, no avatars.
     pub compact: bool,
+    /// The unified inbox (unread messages from every channel) instead of a channel.
+    pub inbox: bool,
 }
 
 impl PaneView {
@@ -55,6 +57,7 @@ impl PaneView {
             viewport: None,
             hold_top: None,
             compact: false,
+            inbox: false,
         }
     }
 

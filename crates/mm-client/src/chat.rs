@@ -53,6 +53,8 @@ pub struct Chat {
     pub focus: pane_grid::Pane,
     cur: pane_grid::Pane,
     next_pane: usize,
+    /// The channel pane focused most recently: where the inbox opens messages.
+    last_channel_pane: Option<pane_grid::Pane>,
     /// The layout changed since it was last saved (saved a second later, so
     /// dragging a split doesn't write on every step).
     pub layout_dirty: bool,
@@ -289,6 +291,7 @@ impl Chat {
             cur: first,
             next_pane,
             layout_dirty: false,
+            last_channel_pane: None,
             drafts: HashMap::new(),
             sending: None,
             online: false,
@@ -335,6 +338,22 @@ impl Chat {
         )
     }
 
+    /// Split the current pane and focus the new one.
+    fn split(&mut self, axis: pane_grid::Axis, view: PaneView) -> Option<pane_grid::Pane> {
+        let view = PaneView { n: self.next_pane, ..view };
+        self.next_pane += 1;
+        let (pane, _) = self.panes.split(axis, self.cur, view)?;
+        self.layout_dirty = true;
+        self.focus = pane;
+        self.cur = pane;
+        Some(pane)
+    }
+
+    /// Fetch the unread channels the inbox can't show yet.
+    fn load_inbox(&self) -> Task<Message> {
+        Task::batch(self.store.unread_unloaded(&self.team).into_iter().map(|c| self.load_history(c)).collect::<Vec<_>>())
+    }
+
     /// Use the configured density for panes the saved layout didn't set
     /// (only when there's no saved layout: a saved pane knows its own).
     pub fn set_default_density(&mut self, compact: bool) {
@@ -355,6 +374,10 @@ impl Chat {
         let mut tasks = Vec::new();
         for pane in order {
             self.cur = pane;
+            if self.pv().inbox {
+                tasks.push(self.load_inbox());
+                continue;
+            }
             let channel = std::mem::take(&mut self.pv_mut().channel);
             if let Some(channel) = Some(channel).filter(|c| !c.is_empty()).or_else(|| default.clone()) {
                 tasks.push(self.select_channel(channel));
@@ -387,6 +410,7 @@ impl Chat {
 
     fn select_channel(&mut self, id: String) -> Task<Message> {
         self.layout_dirty = true;
+        self.pv_mut().inbox = false;
         if self.pv().thread.as_ref().is_some_and(|r| self.is_inline(r)) {
             self.pv_mut().thread = None;
         }
@@ -574,6 +598,9 @@ impl Chat {
             }
             message => self.handle(message),
         };
+        if self.panes.get(self.focus).is_some_and(|p| !p.inbox) {
+            self.last_channel_pane = Some(self.focus);
+        }
         // Results that belong to a pane find their way back to it.
         let task = task.map(move |m| m.for_pane(pane));
         Task::batch([task, self.fetch_media()])
@@ -805,13 +832,49 @@ impl Chat {
                 Task::none()
             }
             Message::SplitPane(axis) => {
-                self.layout_dirty = true;
                 let view = PaneView { compact: self.pv().compact, ..PaneView::new(self.next_pane, self.pv().channel.clone()) };
-                self.next_pane += 1;
-                let Some((pane, _)) = self.panes.split(axis, self.cur, view) else { return Task::none() };
-                self.focus = pane;
-                self.cur = pane;
+                let inbox = self.pv().inbox;
+                if self.split(axis, PaneView { inbox, ..view }).is_none() {
+                    return Task::none();
+                }
                 Task::batch([to_latest(self.pv().timeline()), operation::focus(self.pv().composer())])
+            }
+            Message::OpenInbox => {
+                let existing = self.panes.iter().find(|(_, p)| p.inbox).map(|(pane, _)| *pane);
+                match existing {
+                    Some(pane) => {
+                        self.focus = pane;
+                        self.cur = pane;
+                    }
+                    None => {
+                        let view = PaneView { inbox: true, ..PaneView::new(self.next_pane, String::new()) };
+                        if self.split(pane_grid::Axis::Vertical, view).is_none() {
+                            return Task::none();
+                        }
+                    }
+                }
+                self.load_inbox()
+            }
+            Message::InboxOpen(channel, root, post) => {
+                // In the channel pane used last, or a new one beside the inbox.
+                let target = self.last_channel_pane.filter(|p| self.panes.get(*p).is_some_and(|v| !v.inbox));
+                match target {
+                    Some(pane) => {
+                        self.focus = pane;
+                        self.cur = pane;
+                    }
+                    None => {
+                        let view = PaneView { compact: self.pv().compact, ..PaneView::new(self.next_pane, String::new()) };
+                        if self.split(pane_grid::Axis::Vertical, view).is_none() {
+                            return Task::none();
+                        }
+                    }
+                }
+                if post.is_empty() {
+                    self.select_channel(channel)
+                } else {
+                    self.update(Message::JumpTo(channel, root, post))
+                }
             }
             Message::ClosePane if self.panes.len() > 1 => {
                 self.layout_dirty = true;
@@ -1410,6 +1473,11 @@ impl Chat {
                 self.update(Message::SplitPane(axis))
             }
             Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
+                if modifiers.command() && !modifiers.shift() && k.as_str() == "i" =>
+            {
+                self.update(Message::OpenInbox)
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
                 if modifiers.command() && modifiers.shift() && k.eq_ignore_ascii_case("l") =>
             {
                 self.update(Message::ToggleDensity)
@@ -1474,6 +1542,15 @@ impl Chat {
             }
             M::Event(Event::Posted { post, mentions, .. }) => {
                 let viewing = self.showing(&post.channel_id);
+                if viewing && let Some(m) = self.store.members.get_mut(&post.channel_id) {
+                    // Seen as it arrives, so it doesn't land in the inbox.
+                    m.last_viewed_at = m.last_viewed_at.max(post.create_at);
+                }
+                // The inbox shows channels' loaded posts: load this one's if needed.
+                let feed_inbox = !viewing
+                    && self.panes.iter().any(|(_, p)| p.inbox)
+                    && !self.store.timelines.get(&post.channel_id).is_some_and(|t| t.loaded);
+                let feed = if feed_inbox { self.load_history(post.channel_id.clone()) } else { Task::none() };
                 // Arriving while you're looking isn't "new": keep the marker off
                 // unless one is already showing for messages from before.
                 if viewing && post.user_id != self.store.me.id {
@@ -1492,7 +1569,7 @@ impl Chat {
                 }
                 // Bottom-anchored lists stay on the newest post by themselves, and
                 // someone reading further up isn't yanked down.
-                self.load_missing_users()
+                Task::batch([self.load_missing_users(), feed])
             }
             M::Event(Event::PostEdited(post)) => {
                 self.store.edited(*post);

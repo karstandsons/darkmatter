@@ -124,6 +124,11 @@ pub enum Message {
     FocusComposer,
     /// Switch the pane between comfortable and compact (one line per message).
     ToggleDensity,
+    /// Show the unified inbox pane (opening one beside the focused pane if needed).
+    OpenInbox,
+    /// From the inbox: (channel, thread root, post) to open in a channel pane;
+    /// an empty post opens just the channel.
+    InboxOpen(String, String, String),
     /// Switch threads between inline and the side pane.
     ToggleThreadLayout,
     CloseThread,

@@ -32,6 +32,8 @@ const PANE_FOOTER: iced::Padding = iced::Padding { top: 0.0, right: 20.0, bottom
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Channel,
+    /// In the unified inbox: from any channel.
+    Inbox,
     Thread,
 }
 
@@ -50,7 +52,8 @@ impl Chat {
             }
             // With several panes, the focused one is outlined in the accent color.
             let border = if many && pane == self.focus { c.accent } else { iced::Color::TRANSPARENT };
-            pane_grid::Content::new(self.main(pv, c, theme).map(wrap)).title_bar(title).style(move |_: &Theme| container::Style {
+            let body = if pv.inbox { self.inbox(pv, c, theme) } else { self.main(pv, c, theme) };
+            pane_grid::Content::new(body.map(wrap)).title_bar(title).style(move |_: &Theme| container::Style {
                 border: iced::Border { color: border, width: 1.0, radius: 4.0.into() },
                 ..Default::default()
             })
@@ -137,7 +140,7 @@ impl Chat {
         };
         let section = |label: &'static str| text(label).size(11).font(bold()).color(c.muted);
 
-        let mut list = column![self.threads_entry(c), space().height(10), section("CHANNELS")].spacing(2);
+        let mut list = column![self.inbox_entry(c), self.threads_entry(c), space().height(10), section("CHANNELS")].spacing(2);
         for ch in regular {
             list = list.push(item(ch));
         }
@@ -182,6 +185,14 @@ impl Chat {
     /// A pane's title bar: the channel name and topic, and Leave. It's also
     /// where a pane is grabbed to drag it elsewhere.
     fn pane_header<'a>(&'a self, pv: &'a PaneView, c: Colors) -> Element<'a, Message> {
+        if pv.inbox {
+            let n = self.store.inbox(&self.team).len();
+            let count = if n == 0 { "all caught up".to_string() } else { format!("{n} unread") };
+            return row![text("Inbox").size(17).font(bold()).color(c.fg_bright), text(count).size(13).color(c.muted)]
+                .spacing(12)
+                .align_y(iced::Center)
+                .into();
+        }
         let Some(channel) = self.store.channels.get(&pv.channel) else {
             return text("No channel").size(17).color(c.muted).into();
         };
@@ -226,6 +237,40 @@ impl Chat {
             );
         }
         Some(controls.into())
+    }
+
+    /// The unified inbox: unread messages from every channel, oldest first,
+    /// under a heading for each run from the same channel.
+    fn inbox<'a>(&'a self, pv: &'a PaneView, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
+        let entries = self.store.inbox(&self.team);
+        if entries.is_empty() {
+            return center(text("You're all caught up").color(c.muted)).into();
+        }
+        let md = c.markdown(theme);
+        let mut col = Column::new().spacing(2).padding([12, 20]);
+        let mut prev: Option<&Post> = None;
+        for entry in entries {
+            let post = &entry.post;
+            if prev.is_none_or(|p| p.channel_id != post.channel_id) {
+                let label = self.store.channels.get(&post.channel_id).map(|ch| self.store.channel_label(ch)).unwrap_or_default();
+                let sigil = match self.store.channels.get(&post.channel_id).map(|ch| ch.kind) {
+                    Some(ChannelType::Direct) => "@",
+                    Some(ChannelType::Group) => "👥",
+                    _ => "#",
+                };
+                let heading = button(text(format!("{sigil} {label}")).size(13).font(bold()).color(c.accent))
+                    .padding([2, 0])
+                    .on_press(Message::InboxOpen(post.channel_id.clone(), String::new(), String::new()))
+                    .style(c.link_button());
+                col = col.push(container(heading).padding(iced::Padding { top: if prev.is_some() { 12.0 } else { 0.0 }, ..iced::Padding::ZERO }));
+                prev = None;
+            }
+            let continued = prev.is_some_and(|p| p.user_id == post.user_id && post.create_at - p.create_at < 5 * 60 * 1000);
+            col = col.push(self.post_view(pv, entry, continued, Kind::Inbox, c, md));
+            prev = Some(post);
+        }
+        let scroll = scrollable(col).id(pv.timeline()).anchor_bottom().height(Length::Shrink);
+        column![rule::horizontal(1), container(scroll).height(Length::Fill).align_bottom(Length::Fill)].into()
     }
 
     fn main<'a>(&'a self, pv: &'a PaneView, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
@@ -445,7 +490,7 @@ impl Chat {
             }
         }
         let id = match kind {
-            Kind::Channel => pv.timeline(),
+            Kind::Channel | Kind::Inbox => pv.timeline(),
             Kind::Thread => iced::widget::Id::from(THREAD),
         };
         // Shrink to the messages and sit at the bottom, so a short channel's
@@ -453,7 +498,7 @@ impl Chat {
         let scroll = scrollable(col).id(id).anchor_bottom().height(Length::Shrink);
         let scroll = match kind {
             Kind::Channel => scroll.on_scroll(Message::TimelineScrolled),
-            Kind::Thread => scroll,
+            Kind::Thread | Kind::Inbox => scroll,
         };
         container(scroll).height(Length::Fill).align_bottom(Length::Fill).into()
     }
@@ -549,7 +594,7 @@ impl Chat {
             body = body.push(reactions);
         }
         let thread_root = if post.is_reply() { &post.root_id } else { &post.id };
-        if kind == Kind::Channel && !post.is_reply() && post.reply_count > 0 {
+        if kind != Kind::Thread && !post.is_reply() && post.reply_count > 0 {
             let open = pv.expanded.contains(&post.id) && self.is_inline_in(pv, &post.id);
             let label = match (open, post.reply_count) {
                 (true, _) => "▾ Hide replies".to_string(),
@@ -593,7 +638,10 @@ impl Chat {
         // Actions appear in the top-right corner on hover.
         let chip = |label: &'static str, msg: Message| button(text(label).size(12)).padding([2, 8]).on_press(msg).style(c.chip(false));
         let mut actions = row![chip("☺+", Message::OpenEmoji(post.id.clone()))].spacing(4);
-        if kind == Kind::Channel {
+        if kind == Kind::Inbox {
+            actions = actions.push(chip("Open", Message::InboxOpen(post.channel_id.clone(), thread_root.clone(), post.id.clone())));
+        }
+        if kind != Kind::Thread {
             actions = actions.push(chip("↩ Reply", Message::OpenThread(thread_root.clone())));
         }
         if post.user_id == self.store.me.id {
@@ -605,7 +653,7 @@ impl Chat {
                     .on_press(Message::DeletePost(post.id.clone()))
                     .style(c.chip(confirming)),
             );
-        } else if kind == Kind::Channel {
+        } else if kind != Kind::Thread {
             actions = actions.push(chip("Unread", Message::MarkUnread(post.id.clone())));
         }
         let post_el = hover(content, container(actions).width(Length::Fill).align_x(iced::alignment::Horizontal::Right));

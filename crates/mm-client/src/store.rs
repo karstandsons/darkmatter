@@ -375,6 +375,38 @@ impl Store {
         }
     }
 
+    /// The unified inbox: root posts newer than when their channel was last
+    /// viewed, across the team's channels and DMs, not ours, not in muted
+    /// channels. Oldest first.
+    pub fn inbox(&self, team_id: &str) -> Vec<&Entry> {
+        let (regular, direct) = self.sidebar(team_id);
+        let mut out: Vec<&Entry> = regular
+            .into_iter()
+            .chain(direct)
+            .filter_map(|c| {
+                let m = self.members.get(&c.id).filter(|m| !m.is_muted())?;
+                let t = self.timelines.get(&c.id)?;
+                Some(t.entries.iter().filter(move |e| {
+                    e.post.create_at > m.last_viewed_at && e.post.user_id != self.me.id && !e.post.is_system()
+                }))
+            })
+            .flatten()
+            .collect();
+        out.sort_by_key(|e| e.post.create_at);
+        out
+    }
+
+    /// Unread channels whose posts aren't loaded, for the inbox to fetch.
+    pub fn unread_unloaded(&self, team_id: &str) -> Vec<String> {
+        let (regular, direct) = self.sidebar(team_id);
+        regular
+            .into_iter()
+            .chain(direct)
+            .filter(|c| self.unread(&c.id).has_unread && !self.timelines.get(&c.id).is_some_and(|t| t.loaded))
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
     pub fn mark_viewed(&mut self, channel_id: &str) {
         if let (Some(c), Some(m)) = (self.channels.get(channel_id), self.members.get_mut(channel_id)) {
             m.msg_count = c.total_msg_count;
@@ -585,5 +617,25 @@ mod tests {
         s.posted(post("next", "c1", "bob", 101), &[], true);
         let ids: Vec<&str> = s.timelines["c1"].entries.iter().map(|e| e.post.id.as_str()).collect();
         assert_eq!(ids, ["a", "b", "c", "d", "live", "next"]);
+    }
+
+    #[test]
+    fn inbox_is_unseen_posts_from_others_oldest_first() {
+        let mut s = store();
+        if let Some(m) = s.members.get_mut("c1") {
+            m.last_viewed_at = 10;
+        }
+        let list = |posts: Vec<Post>| PostList {
+            order: posts.iter().map(|p| p.id.clone()).collect(),
+            posts: posts.into_iter().map(|p| (p.id.clone(), p)).collect(),
+            ..Default::default()
+        };
+        s.set_history("c1", list(vec![post("seen", "c1", "bob", 5), post("new2", "c1", "bob", 30), post("mine", "c1", "me", 40)]));
+        s.set_history("d1", list(vec![post("new1", "d1", "bob", 20)]));
+        let ids: Vec<&str> = s.inbox("t").iter().map(|e| e.post.id.as_str()).collect();
+        assert_eq!(ids, ["new1", "new2"], "unseen, not ours, merged by time");
+        // Viewing a channel clears its posts out.
+        s.members.get_mut("c1").unwrap().last_viewed_at = 100;
+        assert_eq!(s.inbox("t").len(), 1);
     }
 }

@@ -109,6 +109,18 @@ impl Chat {
         scrollable(Column::with_children(rows).spacing(4).padding([8, 8])).height(Length::Fill).into()
     }
 
+    /// "Inbox" entry at the top of the sidebar, with the unread count.
+    pub(crate) fn inbox_entry(&self, c: Colors) -> Element<'_, Message> {
+        let n = self.store.inbox(&self.team).len();
+        let mut label = text("Inbox").size(14);
+        label = if n > 0 { label.font(bold()).color(c.fg_bright) } else { label.color(c.fg) };
+        let mut line = row![text("📥").size(13).width(18), label].spacing(6).align_y(iced::Center);
+        if n > 0 {
+            line = line.push(space::horizontal()).push(container(text(n.to_string()).size(11).font(bold())).padding([1, 7]).style(c.badge()));
+        }
+        button(line).width(Length::Fill).padding([5, 10]).on_press(Message::OpenInbox).style(c.row_button(self.focused().inbox)).into()
+    }
+
     /// "Threads" entry at the top of the sidebar.
     pub(crate) fn threads_entry(&self, c: Colors) -> Element<'_, Message> {
         let (unread, mentions) = self.store.thread_unreads();
