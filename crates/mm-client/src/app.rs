@@ -102,6 +102,18 @@ pub enum Message {
     Attach(Vec<std::path::PathBuf>),
     Uploaded(u64, Result<String, String>),
     RemoveAttachment(u64),
+    OpenEmoji(String),
+    CloseEmoji,
+    EmojiQuery(String),
+    /// A clicked emoji, or None for the highlighted one.
+    EmojiPick(Option<String>),
+    EditPost(String),
+    Edited(Result<Post, String>),
+    /// First press asks to confirm, the second deletes.
+    DeletePost(String),
+    Deleted(String, Result<(), String>),
+    MarkUnread(String),
+    MarkedUnread(Result<mm_api::models::ChannelUnreadAt, String>),
     OpenSwitcher,
     CloseSwitcher,
     SwitcherQuery(String),

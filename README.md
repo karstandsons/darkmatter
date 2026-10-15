@@ -31,7 +31,10 @@ MM_URL=http://localhost:8065 MM_TOKEN=<token> cargo run -p mm-client   # skip th
 |---|---|
 | Ctrl+K | Quick switcher (fuzzy, all teams) |
 | Alt+Up / Alt+Down | Previous / next channel |
+| Up (empty composer) | Edit your last message (Esc cancels) |
 | Shift+Up | Open the thread of the latest message |
+| Ctrl+Shift+\\ | React to the latest message |
+| PageUp / PageDown | Scroll; older history loads as you reach the top |
 | Ctrl+U | Attach files (drag-and-drop works too) |
 | Ctrl+T | Theme picker |
 | Esc | Close switcher, then thread pane |
@@ -61,6 +64,8 @@ font = "JetBrainsMono Nerd Font"  # optional; defaults to the system monospace f
 
 The bundled themes are copied from Omarchy (MIT, see `crates/omarchy-theme/themes/LICENSE`). Refresh them with `dev/sync-omarchy-themes.sh`.
 `RUST_LOG=mm_rust=debug` logs UI messages (tokens and login input are never logged).
+`--read-only` / `MM_READONLY=1` refuses every write to the server (posting, reacting, marking read…), for safely trying a real server.
+The session token is kept in the system keyring (Secret Service / Keychain).
 
 `dev/drive.sh <pid|title=…> <wtype args>` sends keystrokes for UI testing, and refuses unless that window has focus.
 

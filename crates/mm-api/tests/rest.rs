@@ -165,3 +165,29 @@ async fn decode_errors_name_the_field() {
     let Error::Decode { endpoint, path, .. } = err else { panic!("{err:?}") };
     assert_eq!((endpoint.as_str(), path.as_str()), ("users/me", "props.a"));
 }
+
+#[tokio::test]
+async fn edit_delete_and_mark_unread() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/posts/p1/patch"))
+        .and(body_json(json!({ "message": "fixed" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "p1", "message": "fixed", "edit_at": 5 })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE")).and(path("/api/v4/posts/p1")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/users/u1/posts/p1/set_unread"))
+        .and(body_json(json!({ "collapsed_threads_supported": true })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "channel_id": "c1", "msg_count": 4, "msg_count_root": 3, "mention_count": 0, "last_viewed_at": 99
+        })))
+        .mount(&server)
+        .await;
+
+    let client = Client::new(&server.uri()).unwrap().with_token("t");
+    assert_eq!(client.edit_post("p1", "fixed").await.unwrap().edit_at, 5);
+    client.delete_post("p1").await.unwrap();
+    let unread = client.set_unread("u1", "p1").await.unwrap();
+    assert_eq!((unread.msg_count_root, unread.last_viewed_at), (3, 99));
+}

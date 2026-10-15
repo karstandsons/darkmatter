@@ -278,6 +278,18 @@ pub struct FileInfo {
     pub mini_preview: Option<String>,
 }
 
+/// Read state of a channel after "mark as unread": counts of messages already read.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ChannelUnreadAt {
+    pub channel_id: Id,
+    pub msg_count: i64,
+    pub msg_count_root: i64,
+    pub mention_count: i64,
+    pub mention_count_root: i64,
+    pub last_viewed_at: Millis,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Status {

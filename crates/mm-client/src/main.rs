@@ -2,6 +2,7 @@ mod app;
 mod chat;
 mod chat_view;
 mod config;
+mod emoji_picker;
 mod media;
 mod session;
 mod store;

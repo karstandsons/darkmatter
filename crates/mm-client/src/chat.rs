@@ -11,6 +11,7 @@ use mm_api::{Client, PostsQuery, ws};
 
 use crate::app::{Message, bootstrap, err};
 use crate::session::Session;
+use crate::emoji_picker::{self, EmojiPicker};
 use crate::media;
 use crate::store::Store;
 use crate::switcher::{self, Switcher};
@@ -47,8 +48,24 @@ pub struct Chat {
     keep_position: Option<(f32, f32, bool)>,
     /// `last_viewed_at` of each channel when it was opened, for the "New messages" line.
     pub viewed_before: HashMap<String, i64>,
+    pub emoji_picker: Option<EmojiPicker>,
+    recent_emoji: Vec<String>,
+    /// The post being edited in a composer, and the draft it replaced.
+    pub editing: Option<Editing>,
+    pub confirm_delete: Option<String>,
+    /// Channels marked unread: leaving them must not mark them read again.
+    marked_unread: std::collections::HashSet<String>,
+    /// Which composer was used last, for Up-to-edit.
+    last_in_thread: bool,
     next_local_id: u64,
     pub error: Option<String>,
+}
+
+pub struct Editing {
+    pub post_id: String,
+    /// Draft key of the composer doing the editing.
+    pub key: String,
+    saved_draft: Option<String>,
 }
 
 fn thread_key(root: &str) -> String {
@@ -89,6 +106,12 @@ impl Chat {
             viewport: None,
             keep_position: None,
             viewed_before: HashMap::new(),
+            emoji_picker: None,
+            recent_emoji: Vec::new(),
+            editing: None,
+            confirm_delete: None,
+            marked_unread: Default::default(),
+            last_in_thread: false,
             next_local_id: 0,
             error: None,
         };
@@ -112,6 +135,7 @@ impl Chat {
 
     fn select_channel(&mut self, id: String) -> Task<Message> {
         let prev = std::mem::replace(&mut self.channel, id.clone());
+        self.marked_unread.remove(&id);
         self.viewport = None;
         self.keep_position = None;
         if let Some(m) = self.store.members.get_mut(&id) {
@@ -126,7 +150,9 @@ impl Chat {
             Task::none()
         } else {
             let id = id.clone();
-            Task::future(async move { client.view_channel(&id, Some(&prev)).await }).discard()
+            // A channel just marked unread must stay unread when we leave it.
+            let prev = if self.marked_unread.remove(&prev) { None } else { Some(prev) };
+            Task::future(async move { client.view_channel(&id, prev.as_deref()).await }).discard()
         };
         let history = if self.store.timelines.get(&id).is_some_and(|t| t.loaded) {
             Task::none()
@@ -168,6 +194,45 @@ impl Chat {
             },
             |(id, r)| Message::History(id, r),
         )
+    }
+
+    /// Put a post's text into its composer for editing.
+    fn start_edit(&mut self, post_id: &str) -> Task<Message> {
+        let Some(post) = self.store.post(post_id).cloned() else { return Task::none() };
+        if post.user_id != self.store.me.id {
+            return Task::none();
+        }
+        self.cancel_edit();
+        let (key, composer) = if post.is_reply() {
+            self.thread = Some(post.root_id.clone());
+            (thread_key(&post.root_id), THREAD_COMPOSER)
+        } else {
+            (post.channel_id.clone(), COMPOSER)
+        };
+        let saved_draft = self.drafts.insert(key.clone(), post.message.clone());
+        self.editing = Some(Editing { post_id: post.id, key, saved_draft });
+        operation::focus(composer)
+    }
+
+    fn cancel_edit(&mut self) {
+        if let Some(e) = self.editing.take() {
+            match e.saved_draft {
+                Some(d) => self.drafts.insert(e.key, d),
+                None => self.drafts.remove(&e.key),
+            };
+        }
+    }
+
+    fn save_edit(&mut self) -> Task<Message> {
+        let Some(e) = &self.editing else { return Task::none() };
+        let (id, text) = (e.post_id.clone(), self.drafts.get(&e.key).cloned().unwrap_or_default());
+        self.cancel_edit();
+        if text.trim().is_empty() {
+            // Mattermost asks to delete instead; keep it simple and just cancel.
+            return Task::none();
+        }
+        let client = self.client.clone();
+        Task::perform(async move { client.edit_post(&id, text.trim()).await.map_err(err) }, Message::Edited)
     }
 
     fn load_statuses(&mut self) -> Task<Message> {
@@ -292,7 +357,12 @@ impl Chat {
                 self.drafts.insert(self.channel.clone(), d);
                 Task::none()
             }
+            Message::Send if self.editing.as_ref().is_some_and(|e| e.key == self.channel) => self.save_edit(),
+            Message::SendReply if self.editing.as_ref().is_some_and(|e| Some(&e.key) == self.thread.as_ref().map(|r| thread_key(r)).as_ref()) => {
+                self.save_edit()
+            }
             Message::Send => {
+                self.last_in_thread = false;
                 let message = self.draft().trim().to_string();
                 let here = |a: &&media::Pending| a.channel_id == self.channel;
                 if self.attachments.iter().filter(here).any(|a| matches!(a.state, media::Upload::Uploading)) {
@@ -367,6 +437,7 @@ impl Chat {
                 Task::none()
             }
             Message::SendReply => {
+                self.last_in_thread = true;
                 let message = self.thread_draft().trim().to_string();
                 let Some(root) = self.thread.clone() else { return Task::none() };
                 let Some(channel_id) = self.store.post(&root).map(|p| p.channel_id.clone()) else {
@@ -442,6 +513,104 @@ impl Chat {
                 self.attachments.retain(|a| a.local_id != local_id);
                 Task::none()
             }
+            Message::OpenEmoji(post_id) => {
+                self.emoji_picker = Some(EmojiPicker::open(post_id, &self.recent_emoji));
+                operation::focus(emoji_picker::INPUT)
+            }
+            Message::CloseEmoji => {
+                self.emoji_picker = None;
+                Task::none()
+            }
+            Message::EmojiQuery(q) => {
+                if let Some(p) = &mut self.emoji_picker {
+                    p.set_query(q, &self.recent_emoji);
+                }
+                Task::none()
+            }
+            Message::EmojiPick(name) => {
+                let Some(picker) = self.emoji_picker.take() else { return Task::none() };
+                let Some(name) = name.or_else(|| picker.current().map(str::to_string)) else { return Task::none() };
+                self.recent_emoji.retain(|n| *n != name);
+                self.recent_emoji.insert(0, name.clone());
+                self.recent_emoji.truncate(16);
+                let mine = self.store.post(&picker.post_id).is_some_and(|p| {
+                    p.metadata.reactions.iter().any(|r| r.user_id == self.store.me.id && r.emoji_name == name)
+                });
+                self.update(Message::React(picker.post_id, name, !mine))
+            }
+            Message::EditPost(post_id) => self.start_edit(&post_id),
+            Message::Edited(Ok(post)) => {
+                self.store.edited(post);
+                Task::none()
+            }
+            Message::Edited(Err(e)) => {
+                self.error = Some(format!("Couldn't save the edit: {e}"));
+                Task::none()
+            }
+            Message::DeletePost(id) if self.confirm_delete.as_deref() != Some(id.as_str()) => {
+                self.confirm_delete = Some(id);
+                Task::none()
+            }
+            Message::DeletePost(id) => {
+                self.confirm_delete = None;
+                let client = self.client.clone();
+                Task::perform(
+                    async move {
+                        let r = client.delete_post(&id).await.map_err(err);
+                        (id, r)
+                    },
+                    |(id, r)| Message::Deleted(id, r),
+                )
+            }
+            Message::Deleted(id, Ok(())) => {
+                if let Some(post) = self.store.post(&id).cloned() {
+                    self.store.deleted(&post);
+                }
+                Task::none()
+            }
+            Message::Deleted(_, Err(e)) => {
+                self.error = Some(format!("Couldn't delete: {e}"));
+                Task::none()
+            }
+            Message::MarkUnread(post_id) => {
+                let client = self.client.clone();
+                let me = self.store.me.id.clone();
+                Task::perform(async move { client.set_unread(&me, &post_id).await.map_err(err) }, Message::MarkedUnread)
+            }
+            Message::MarkedUnread(Ok(u)) => {
+                if let Some(m) = self.store.members.get_mut(&u.channel_id) {
+                    m.msg_count = u.msg_count;
+                    m.msg_count_root = u.msg_count_root;
+                    m.mention_count = u.mention_count;
+                    m.mention_count_root = u.mention_count_root;
+                    m.last_viewed_at = u.last_viewed_at;
+                }
+                self.viewed_before.insert(u.channel_id.clone(), u.last_viewed_at);
+                self.marked_unread.insert(u.channel_id);
+                Task::none()
+            }
+            Message::MarkedUnread(Err(e)) => {
+                self.error = Some(format!("Couldn't mark unread: {e}"));
+                Task::none()
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Named(named), .. }) if self.emoji_picker.is_some() => {
+                let step = match named {
+                    Named::ArrowLeft => -1,
+                    Named::ArrowRight => 1,
+                    Named::ArrowUp => -EmojiPicker::row_len(),
+                    Named::ArrowDown => EmojiPicker::row_len(),
+                    _ => 0,
+                };
+                if let Some(p) = &mut self.emoji_picker {
+                    p.step(step);
+                }
+                Task::none()
+            }
+            Message::Escape if self.emoji_picker.is_some() => self.update(Message::CloseEmoji),
+            Message::Escape if self.editing.is_some() => {
+                self.cancel_edit();
+                Task::none()
+            }
             Message::OpenSwitcher => {
                 let mut sw = Switcher::default();
                 sw.refresh(&self.store);
@@ -492,6 +661,38 @@ impl Chat {
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(named @ (Named::PageUp | Named::PageDown)), .. }) => {
                 let dy = if named == Named::PageUp { -500.0 } else { 500.0 };
                 operation::scroll_by(TIMELINE, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: dy })
+            }
+            // Mattermost's Ctrl+Shift+\\: react to the latest message.
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
+                if modifiers.command() && modifiers.shift() && matches!(k.as_str(), "\\" | "|") =>
+            {
+                let last = self.store.timelines.get(&self.channel).and_then(|t| {
+                    t.entries.iter().rev().map(|e| &e.post).find(|p| !p.is_system()).map(|p| p.id.clone())
+                });
+                match last {
+                    Some(id) => self.update(Message::OpenEmoji(id)),
+                    None => Task::none(),
+                }
+            }
+            // Up in an empty composer edits your last message, as in Mattermost.
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::ArrowUp), modifiers, .. })
+                if modifiers.is_empty() && self.switcher.is_none() && self.editing.is_none() =>
+            {
+                let in_thread = self.last_in_thread && self.thread.is_some();
+                let (draft, timeline) = if in_thread {
+                    (self.thread_draft(), self.thread.as_ref().and_then(|r| self.store.threads.get(r)))
+                } else {
+                    (self.draft(), self.store.timelines.get(&self.channel))
+                };
+                if !draft.is_empty() {
+                    return Task::none();
+                }
+                let me = &self.store.me.id;
+                let last = timeline.and_then(|t| t.entries.iter().rev().map(|e| &e.post).find(|p| p.user_id == *me && !p.is_system()));
+                match last.map(|p| p.id.clone()) {
+                    Some(id) => self.start_edit(&id),
+                    None => Task::none(),
+                }
             }
             // Mattermost's shortcut: reply to the latest message in the channel.
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::ArrowUp), modifiers, .. })
@@ -548,6 +749,11 @@ impl Chat {
         match msg {
             M::Connected { .. } => {
                 self.online = true;
+                // Our own status may have been fetched before the socket was up.
+                let mine = self.store.statuses.entry(self.store.me.id.clone()).or_insert_with(|| "online".into());
+                if mine == "offline" {
+                    *mine = "online".into();
+                }
                 Task::none()
             }
             M::Disconnected => {
@@ -699,6 +905,84 @@ mod tests {
         let _ = chat.handle(Message::Draft("newer".into()));
         let _ = chat.handle(Message::Sent(Err("offline".into())));
         assert_eq!(chat.draft(), "newer", "a new draft isn't overwritten");
+    }
+
+    fn with_post(chat: &mut Chat, id: &str, user: &str, at: i64) {
+        let mut list = mm_api::models::PostList::default();
+        let post = mm_api::models::Post {
+            id: id.into(),
+            channel_id: "c1".into(),
+            user_id: user.into(),
+            message: format!("text of {id}"),
+            create_at: at,
+            ..Default::default()
+        };
+        list.order.push(id.into());
+        list.posts.insert(id.into(), post);
+        chat.store.set_history("c1", list);
+    }
+
+    #[test]
+    fn up_edits_last_own_post_and_esc_restores_draft() {
+        let mut chat = chat();
+        with_post(&mut chat, "mine", "me", 1);
+        with_post(&mut chat, "theirs", "bob", 2);
+        let up = || Message::Key(keyboard::Event::KeyPressed {
+            key: Key::Named(Named::ArrowUp),
+            modified_key: Key::Named(Named::ArrowUp),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowUp),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        // Not with a draft in progress.
+        chat.drafts.insert("c1".into(), "typing".into());
+        let _ = chat.handle(up());
+        assert!(chat.editing.is_none());
+
+        chat.drafts.clear();
+        let _ = chat.handle(up());
+        assert_eq!(chat.editing.as_ref().unwrap().post_id, "mine");
+        assert_eq!(chat.draft(), "text of mine");
+        let _ = chat.handle(Message::Escape);
+        assert!(chat.editing.is_none());
+        assert_eq!(chat.draft(), "");
+
+        // Can't edit someone else's post.
+        let _ = chat.handle(Message::EditPost("theirs".into()));
+        assert!(chat.editing.is_none());
+
+        // Saving leaves edit mode and gives back the previous draft.
+        chat.drafts.insert("c1".into(), "half-written".into());
+        let _ = chat.handle(Message::EditPost("mine".into()));
+        chat.drafts.insert("c1".into(), "edited".into());
+        let _ = chat.handle(Message::Send);
+        assert!(chat.editing.is_none());
+        assert_eq!(chat.draft(), "half-written");
+    }
+
+    #[test]
+    fn delete_needs_two_presses() {
+        let mut chat = chat();
+        with_post(&mut chat, "mine", "me", 1);
+        let _ = chat.handle(Message::DeletePost("mine".into()));
+        assert_eq!(chat.confirm_delete.as_deref(), Some("mine"));
+        let _ = chat.handle(Message::DeletePost("mine".into()));
+        assert!(chat.confirm_delete.is_none());
+        let _ = chat.handle(Message::Deleted("mine".into(), Ok(())));
+        assert!(chat.store.post("mine").is_none());
+    }
+
+    #[test]
+    fn picking_an_emoji_remembers_it() {
+        let mut chat = chat();
+        with_post(&mut chat, "p", "bob", 1);
+        let _ = chat.handle(Message::OpenEmoji("p".into()));
+        let _ = chat.handle(Message::EmojiQuery("rocket".into()));
+        let _ = chat.handle(Message::EmojiPick(None));
+        assert!(chat.emoji_picker.is_none());
+        assert_eq!(chat.recent_emoji.first().map(String::as_str), Some("rocket"));
     }
 
     #[test]

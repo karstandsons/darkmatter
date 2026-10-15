@@ -36,9 +36,10 @@ impl Chat {
         if let Some(root) = &self.thread {
             layout = layout.push(rule::vertical(1)).push(self.thread_pane(root, c, theme));
         }
-        match &self.switcher {
-            Some(sw) => stack![layout, sw.view(&self.store, c)].into(),
-            None => layout.into(),
+        match (&self.switcher, &self.emoji_picker) {
+            (Some(sw), _) => stack![layout, sw.view(&self.store, c)].into(),
+            (None, Some(picker)) => stack![layout, picker.view(c)].into(),
+            (None, None) => layout.into(),
         }
     }
 
@@ -182,7 +183,7 @@ impl Chat {
             .on_press(Message::PickFiles)
             .style(c.chip(false));
         let composer = row![attach, composer].spacing(8).align_y(iced::Center);
-        let typing = self.typing_line(&self.channel, "", c);
+        let typing = self.editing_note(&self.channel, c).unwrap_or_else(|| self.typing_line(&self.channel, "", c));
         let mut footer = column![typing].spacing(6);
         if let Some(chips) = self.attachment_chips(c) {
             footer = footer.push(chips);
@@ -220,7 +221,8 @@ impl Chat {
             .padding(12)
             .style(c.input());
         let channel_id = self.store.post(root_id).map_or("", |p| p.channel_id.as_str());
-        let typing = self.typing_line(channel_id, root_id, c);
+        let thread_key = format!("thread:{root_id}");
+        let typing = self.editing_note(&thread_key, c).unwrap_or_else(|| self.typing_line(channel_id, root_id, c));
 
         container(
             column![
@@ -262,6 +264,13 @@ impl Chat {
             })
             .collect();
         (!chips.is_empty()).then(|| iced::widget::Row::with_children(chips).spacing(8).wrap().into())
+    }
+
+    fn editing_note(&self, key: &str, c: Colors) -> Option<Element<'_, Message>> {
+        self.editing
+            .as_ref()
+            .filter(|e| e.key == key)
+            .map(|_| text("Editing message · Enter to save · Esc to cancel").size(12).color(c.yellow).into())
     }
 
     fn typing_line(&self, channel_id: &str, parent_id: &str, c: Colors) -> Element<'_, Message> {
@@ -404,12 +413,25 @@ impl Chat {
                 .into()
         };
 
-        if pane == Pane::Thread {
-            return content;
+        // Actions appear in the top-right corner on hover.
+        let chip = |label: &'static str, msg: Message| button(text(label).size(12)).padding([2, 8]).on_press(msg).style(c.chip(false));
+        let mut actions = row![chip("☺+", Message::OpenEmoji(post.id.clone()))].spacing(4);
+        if pane == Pane::Channel {
+            actions = actions.push(chip("↩ Reply", Message::OpenThread(thread_root.clone())));
         }
-        // Reply action appears in the top-right corner on hover.
-        let reply = button(text("↩ Reply").size(12)).padding([2, 8]).on_press(Message::OpenThread(thread_root.clone())).style(c.chip(false));
-        hover(content, container(reply).width(Length::Fill).align_x(iced::alignment::Horizontal::Right))
+        if post.user_id == self.store.me.id {
+            actions = actions.push(chip("Edit", Message::EditPost(post.id.clone())));
+            let confirming = self.confirm_delete.as_deref() == Some(post.id.as_str());
+            actions = actions.push(
+                button(text(if confirming { "Delete?" } else { "Delete" }).size(12).color(if confirming { c.red } else { c.fg }))
+                    .padding([2, 8])
+                    .on_press(Message::DeletePost(post.id.clone()))
+                    .style(c.chip(confirming)),
+            );
+        } else if pane == Pane::Channel {
+            actions = actions.push(chip("Unread", Message::MarkUnread(post.id.clone())));
+        }
+        hover(content, container(actions).width(Length::Fill).align_x(iced::alignment::Horizontal::Right))
     }
 
     fn presence_color(&self, user_id: &str, c: Colors) -> Option<iced::Color> {

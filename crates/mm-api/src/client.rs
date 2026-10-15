@@ -156,6 +156,12 @@ impl Client {
         self.send_unit(Method::POST, "channels/members/me/view", Some(&body)).await
     }
 
+    /// Mark the channel unread from this post on (inclusive).
+    pub async fn set_unread(&self, user_id: &str, post_id: &str) -> Result<ChannelUnreadAt, Error> {
+        let body = json!({ "collapsed_threads_supported": true });
+        self.send(Method::POST, &format!("users/{user_id}/posts/{post_id}/set_unread"), Some(&body)).await
+    }
+
     pub async fn add_reaction(&self, user_id: &str, post_id: &str, emoji: &str) -> Result<Reaction, Error> {
         let body = json!({ "user_id": user_id, "post_id": post_id, "emoji_name": emoji });
         self.send(Method::POST, "reactions", Some(&body)).await
