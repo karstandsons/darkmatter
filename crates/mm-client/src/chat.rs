@@ -53,6 +53,9 @@ pub struct Chat {
     pub focus: pane_grid::Pane,
     cur: pane_grid::Pane,
     next_pane: usize,
+    /// The layout changed since it was last saved (saved a second later, so
+    /// dragging a split doesn't write on every step).
+    pub layout_dirty: bool,
     /// Unsent text per composer: channel id, or `thread:<root id>`.
     pub drafts: HashMap<String, String>,
     /// The last message handed to the server, restored to its composer if sending fails.
@@ -264,7 +267,18 @@ impl Chat {
         store.add_channels(b.channels, b.members);
         store.add_users(b.users);
         let team = store.teams.first().map(|t| t.id.clone()).unwrap_or_default();
-        let (panes, first) = pane_grid::State::new(PaneView::new(0, String::new()));
+        // The layout from last time on this server, if any.
+        let mut next_pane = 1;
+        let (panes, first) = match crate::layout::load(&b.session.server) {
+            Some(saved) => {
+                next_pane = 0;
+                let known = |c: &str| store.members.contains_key(c);
+                let panes = pane_grid::State::with_configuration(crate::layout::configuration(&saved, &known, &mut next_pane));
+                let first = *panes.iter().next().expect("a layout has a pane").0;
+                (panes, first)
+            }
+            None => pane_grid::State::new(PaneView::new(0, String::new())),
+        };
         let chat = Chat {
             session: b.session,
             client,
@@ -273,7 +287,8 @@ impl Chat {
             panes,
             focus: first,
             cur: first,
-            next_pane: 1,
+            next_pane,
+            layout_dirty: false,
             drafts: HashMap::new(),
             sending: None,
             online: false,
@@ -320,6 +335,33 @@ impl Chat {
         )
     }
 
+    /// Open each pane's channel at startup; panes without one (first run, or a
+    /// channel left since) get the default. The focused pane goes last so its
+    /// composer ends up with the cursor.
+    pub fn open_panes(&mut self) -> Task<Message> {
+        let default = self.default_channel();
+        let focus = self.focus;
+        let order: Vec<pane_grid::Pane> = self.panes.iter().map(|(p, _)| *p).filter(|p| *p != focus).chain([focus]).collect();
+        let mut tasks = Vec::new();
+        for pane in order {
+            self.cur = pane;
+            let channel = std::mem::take(&mut self.pv_mut().channel);
+            if let Some(channel) = Some(channel).filter(|c| !c.is_empty()).or_else(|| default.clone()) {
+                tasks.push(self.select_channel(channel));
+            }
+        }
+        self.cur = self.focus;
+        // As a message of its own: this runs as the chat screen replaces the
+        // "Connecting…" one, and a focus sent now would land on the old screen.
+        tasks.push(Task::done(Message::FocusComposer));
+        Task::batch(tasks)
+    }
+
+    fn default_channel(&self) -> Option<String> {
+        let (regular, _) = self.store.sidebar(&self.team);
+        regular.iter().find(|c| c.name == "town-square").or(regular.first()).map(|c| c.id.clone())
+    }
+
     pub fn open_default_channel(&mut self) -> Task<Message> {
         let (regular, _) = self.store.sidebar(&self.team);
         let target = regular
@@ -334,6 +376,7 @@ impl Chat {
     }
 
     fn select_channel(&mut self, id: String) -> Task<Message> {
+        self.layout_dirty = true;
         if self.pv().thread.as_ref().is_some_and(|r| self.is_inline(r)) {
             self.pv_mut().thread = None;
         }
@@ -738,7 +781,16 @@ impl Chat {
                 }
                 Task::none()
             }
+            Message::FocusComposer => operation::focus(self.pv().composer()),
+            Message::SaveLayout => {
+                self.layout_dirty = false;
+                if let Err(e) = crate::layout::save(&self.session.server, &crate::layout::capture(&self.panes)) {
+                    tracing::warn!("couldn't save the layout: {e}");
+                }
+                Task::none()
+            }
             Message::SplitPane(axis) => {
+                self.layout_dirty = true;
                 let view = PaneView::new(self.next_pane, self.pv().channel.clone());
                 self.next_pane += 1;
                 let Some((pane, _)) = self.panes.split(axis, self.cur, view) else { return Task::none() };
@@ -747,6 +799,7 @@ impl Chat {
                 Task::batch([to_latest(self.pv().timeline()), operation::focus(self.pv().composer())])
             }
             Message::ClosePane if self.panes.len() > 1 => {
+                self.layout_dirty = true;
                 let Some((_, sibling)) = self.panes.close(self.cur) else { return Task::none() };
                 // The handler's pane is gone: carry on as the one taking its place.
                 self.focus = sibling;
@@ -764,10 +817,12 @@ impl Chat {
             },
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
                 self.panes.resize(split, ratio);
+                self.layout_dirty = true;
                 Task::none()
             }
             Message::PaneDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
                 self.panes.drop(pane, target);
+                self.layout_dirty = true;
                 Task::none()
             }
             Message::PaneDragged(_) => Task::none(),

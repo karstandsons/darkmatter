@@ -118,6 +118,10 @@ pub enum Message {
     FocusAdjacent(iced::widget::pane_grid::Direction),
     PaneResized(iced::widget::pane_grid::ResizeEvent),
     PaneDragged(iced::widget::pane_grid::DragEvent),
+    /// Write the pane layout to disk (a second after it changes).
+    SaveLayout,
+    /// Put the cursor in the focused pane's message box.
+    FocusComposer,
     /// Switch threads between inline and the side pane.
     ToggleThreadLayout,
     CloseThread,
@@ -546,7 +550,7 @@ impl App {
     fn start_chat(&mut self, b: Bootstrap) -> Task<Message> {
         let Some((mut chat, task)) = Chat::start(b) else { return Task::none() };
         chat.inline_threads = self.config.layout.inline_threads();
-        let task = Task::batch([task, chat.open_default_channel()]);
+        let task = Task::batch([task, chat.open_panes()]);
         self.screen = Screen::Chat(Box::new(chat));
         task
     }
@@ -567,6 +571,9 @@ impl App {
         ];
         if let Screen::Chat(chat) = &self.screen {
             subs.push(Subscription::run_with(chat.session.clone(), ws_events).map(Message::Ws));
+            if chat.layout_dirty {
+                subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::SaveLayout));
+            }
             if !chat.typing.is_empty() || chat.panes.iter().any(|(_, p)| p.highlight.is_some()) {
                 subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
             }
@@ -588,14 +595,13 @@ impl App {
             Screen::Login(form) => form.view(c),
             Screen::Chat(chat) => chat.view(c, &self.iced_theme),
         };
-        let body: Element<'_, Message> = match &self.picker {
-            Some(p) => {
-                let choice = self.choice();
-                let picker = p.view(&self.catalog, &choice, &self.theme.name, self.os_mode == omarchy_theme::Mode::Dark, self.omarchy, c);
-                iced::widget::stack![body, picker].into()
-            }
-            None => body,
-        };
+        // Always a stack, so opening or closing the picker keeps the state
+        // (and focus) of the widgets under it.
+        let mut body = iced::widget::stack![body];
+        if let Some(p) = &self.picker {
+            let choice = self.choice();
+            body = body.push(p.view(&self.catalog, &choice, &self.theme.name, self.os_mode == omarchy_theme::Mode::Dark, self.omarchy, c));
+        }
         container(body).width(Length::Fill).height(Length::Fill).style(c.panel(c.bg)).into()
     }
 }

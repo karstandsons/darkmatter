@@ -3,6 +3,7 @@ mod chat;
 mod chat_view;
 mod config;
 mod emoji_picker;
+mod layout;
 mod media;
 mod pane;
 mod panels;
