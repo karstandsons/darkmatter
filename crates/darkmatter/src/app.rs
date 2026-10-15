@@ -105,6 +105,9 @@ pub enum Message {
     Newer(String, Result<PostList, String>),
     /// Leave an older stretch for the newest messages.
     JumpToLatest,
+    /// Time to look for a newer Darkmatter release.
+    CheckUpdate,
+    UpdateChecked(Result<Option<crate::update::Available>, String>),
     /// The server's custom emoji.
     CustomEmoji(Result<Vec<mm_api::models::CustomEmoji>, String>),
     /// A message from a pane's widgets, or a result for that pane.
@@ -558,8 +561,9 @@ impl App {
         let Some((mut chat, task)) = Chat::start(b) else { return Task::none() };
         chat.inline_threads = self.config.layout.inline_threads();
         chat.vim_keys = self.config.keys.vim != Some(false);
+        chat.check_updates = self.config.updates.check != Some(false);
         chat.set_default_density(self.config.layout.compact());
-        let task = Task::batch([task, chat.open_panes()]);
+        let task = Task::batch([task, chat.open_panes(), chat.update(Message::CheckUpdate)]);
         self.screen = Screen::Chat(Box::new(chat));
         task
     }
@@ -580,6 +584,9 @@ impl App {
         ];
         if let Screen::Chat(chat) = &self.screen {
             subs.push(Subscription::run_with(chat.session.clone(), ws_events).map(Message::Ws));
+            if chat.check_updates {
+                subs.push(iced::time::every(Duration::from_secs(24 * 60 * 60)).map(|_| Message::CheckUpdate));
+            }
             if chat.layout_dirty {
                 subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::SaveLayout));
             }

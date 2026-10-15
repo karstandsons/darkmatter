@@ -175,6 +175,15 @@ impl Chat {
         if self.client.is_read_only() {
             col = col.push(text("● read-only: nothing is sent to the server").size(11).color(c.yellow));
         }
+        if let Some(release) = &self.new_release {
+            let install = std::env::current_exe().map_or(crate::update::Install::Local, |exe| crate::update::install_method(&exe));
+            let notice = column![
+                text(format!("⬆ Darkmatter {} is out", release.version)).size(12).font(bold()).color(c.accent),
+                text(crate::update::hint(install)).size(11).color(c.muted),
+            ]
+            .spacing(2);
+            col = col.push(button(notice).width(Length::Fill).padding([6, 8]).on_press(Message::Link(release.url.clone())).style(c.chip(false)));
+        }
         container(col.push(footer))
         .width(250)
         .height(Length::Fill)

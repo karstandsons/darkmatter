@@ -25,6 +25,8 @@ dirs = "7"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 open = "5"
 keyring = "4"
+# The update check (GitHub's latest release); mm-api already pulls it in.
+reqwest = { version = "0.13", features = ["json"] }
 notify-rust = "4"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }

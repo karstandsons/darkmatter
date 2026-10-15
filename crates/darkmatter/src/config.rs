@@ -11,6 +11,15 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub layout: LayoutConfig,
     pub keys: KeysConfig,
+    pub updates: UpdatesConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    /// Look for a newer release on GitHub at startup and once a day. On unless false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

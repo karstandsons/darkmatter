@@ -100,6 +100,9 @@ density = "comfortable"    # default for new panes: "comfortable" | "compact"
 
 [keys]
 vim = true                 # vim-style keys when no text box has the cursor
+
+[updates]
+check = true               # look for a newer release on GitHub at startup and daily
 ```
 
 The bundled themes are copied from Omarchy (MIT, see `crates/omarchy-theme/themes/LICENSE`). Refresh them with `dev/sync-omarchy-themes.sh`.

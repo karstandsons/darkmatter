@@ -25,6 +25,9 @@ and macOS.
 - **Omarchy themes everywhere:** follows `omarchy theme set` live, all 22
   base themes built in, themes installable from git, and follows the OS
   light/dark setting off Omarchy.
+- **Update notice:** when a newer release is out, a note in the sidebar says
+  how to update (pacman, Homebrew or install.sh). Turn it off with
+  `[updates] check = false`.
 - **Login and safety:** email or username plus password (with MFA); the
   login token is kept in the system keyring; a `--read-only` mode for
   looking around a server safely.

@@ -53,6 +53,9 @@ pub struct Chat {
     pub focus: pane_grid::Pane,
     cur: pane_grid::Pane,
     next_pane: usize,
+    /// Look for newer releases; and the one found, if any.
+    pub check_updates: bool,
+    pub new_release: Option<crate::update::Available>,
     /// Vim-style keys when no text box has the cursor.
     pub vim_keys: bool,
     /// A `g` was pressed: another makes `gg`.
@@ -297,6 +300,8 @@ impl Chat {
             layout_dirty: false,
             last_channel_pane: None,
             vim_keys: true,
+            check_updates: true,
+            new_release: None,
             pending_g: false,
             drafts: HashMap::new(),
             sending: None,
@@ -920,6 +925,24 @@ impl Chat {
                     self.focus = p;
                     self.cur = p;
                 }
+                Task::none()
+            }
+            Message::CheckUpdate => {
+                let source = std::env::current_exe().ok().and_then(|exe| crate::update::source(&exe));
+                match source.filter(|_| self.check_updates) {
+                    Some(url) => Task::perform(crate::update::check(url, env!("CARGO_PKG_VERSION")), Message::UpdateChecked),
+                    None => Task::none(),
+                }
+            }
+            Message::UpdateChecked(Ok(found)) => {
+                if let Some(release) = &found {
+                    tracing::info!("Darkmatter {} is available", release.version);
+                }
+                self.new_release = found;
+                Task::none()
+            }
+            Message::UpdateChecked(Err(e)) => {
+                tracing::debug!("update check failed: {e}");
                 Task::none()
             }
             Message::FocusComposer => operation::focus(self.pv().composer()),

@@ -13,6 +13,7 @@ mod style;
 mod switcher;
 mod text;
 mod theme_picker;
+mod update;
 mod viewer;
 
 use app::App;

@@ -992,6 +992,7 @@ dependencies = [
  "notify-rust",
  "omarchy-theme",
  "open",
+ "reqwest",
  "rfd",
  "serde",
  "serde_json",
