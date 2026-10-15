@@ -86,6 +86,7 @@ pub enum Message {
     History(String, Result<PostList, String>),
     TimelineScrolled(iced::widget::scrollable::Viewport),
     Users(Result<Vec<User>, String>),
+    Statuses(Result<Vec<mm_api::models::Status>, String>),
     Draft(String),
     Send,
     Sent(Result<Post, String>),

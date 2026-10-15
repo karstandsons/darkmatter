@@ -45,6 +45,8 @@ pub struct Chat {
     viewport: Option<iced::widget::scrollable::Viewport>,
     /// (height, offset, older page applied yet)
     keep_position: Option<(f32, f32, bool)>,
+    /// `last_viewed_at` of each channel when it was opened, for the "New messages" line.
+    pub viewed_before: HashMap<String, i64>,
     next_local_id: u64,
     pub error: Option<String>,
 }
@@ -86,10 +88,13 @@ impl Chat {
             attachments: Vec::new(),
             viewport: None,
             keep_position: None,
+            viewed_before: HashMap::new(),
             next_local_id: 0,
             error: None,
         };
-        Some((chat, Task::none()))
+        let mut chat = chat;
+        let statuses = chat.load_statuses();
+        Some((chat, statuses))
     }
 
     pub fn open_default_channel(&mut self) -> Task<Message> {
@@ -109,6 +114,11 @@ impl Chat {
         let prev = std::mem::replace(&mut self.channel, id.clone());
         self.viewport = None;
         self.keep_position = None;
+        if let Some(m) = self.store.members.get_mut(&id) {
+            // Unread posts are the ones after this; remember it before marking read.
+            self.viewed_before.insert(id.clone(), m.last_viewed_at);
+            m.last_viewed_at = chrono::Utc::now().timestamp_millis();
+        }
         self.store.mark_viewed(&id);
         let client = self.client.clone();
         // Marking a channel read is a write; read-only mode skips it quietly.
@@ -158,6 +168,19 @@ impl Chat {
             },
             |(id, r)| Message::History(id, r),
         )
+    }
+
+    fn load_statuses(&mut self) -> Task<Message> {
+        let ids = self.store.missing_statuses();
+        if ids.is_empty() {
+            return Task::none();
+        }
+        // Mark as pending so overlapping loads don't refetch them.
+        for id in &ids {
+            self.store.statuses.insert(id.clone(), "offline".into());
+        }
+        let client = self.client.clone();
+        Task::perform(async move { client.statuses_by_ids(&ids).await.map_err(err) }, Message::Statuses)
     }
 
     fn load_missing_users(&self) -> Task<Message> {
@@ -216,7 +239,16 @@ impl Chat {
                 // Measured from the top even with anchor_bottom() (checked against PageUp).
                 let from_top = viewport.absolute_offset().y;
                 let height = viewport.content_bounds().height;
+                // Stick to the bottom: if we were at the end and content grew
+                // (an image loaded, a post arrived), stay at the end.
+                let was_at_bottom = self.viewport.is_some_and(|v| {
+                    v.absolute_offset().y + v.bounds().height >= v.content_bounds().height - 4.0
+                });
+                let grew = self.viewport.is_some_and(|v| height > v.content_bounds().height + 1.0);
                 self.viewport = Some(viewport);
+                if was_at_bottom && grew && self.keep_position.is_none() {
+                    return operation::snap_to_end(TIMELINE);
+                }
                 tracing::trace!("timeline scrolled: {from_top}px from top, content {height}px");
                 // Older posts were just prepended: shift by the added height so the
                 // same messages stay on screen (otherwise every page triggers the next).
@@ -232,6 +264,16 @@ impl Chat {
             }
             Message::Users(Ok(users)) => {
                 self.store.add_users(users);
+                self.load_statuses()
+            }
+            Message::Statuses(Ok(statuses)) => {
+                for st in statuses {
+                    self.store.statuses.insert(st.user_id, st.status);
+                }
+                Task::none()
+            }
+            Message::Statuses(Err(e)) => {
+                tracing::warn!("couldn't load statuses: {e}");
                 Task::none()
             }
             Message::Sent(Err(e)) => {
@@ -521,6 +563,17 @@ impl Chat {
             }
             M::Event(Event::Posted { post, mentions, .. }) => {
                 let viewing = post.channel_id == self.channel;
+                // Arriving while you're looking isn't "new": keep the marker off
+                // unless one is already showing for messages from before.
+                if viewing && post.user_id != self.store.me.id {
+                    let since = self.viewed_before.get(&self.channel).copied().unwrap_or(i64::MAX);
+                    let marker_showing = self.store.timelines.get(&self.channel).is_some_and(|t| {
+                        t.entries.iter().any(|e| e.post.create_at > since && e.post.user_id != self.store.me.id)
+                    });
+                    if !marker_showing {
+                        self.viewed_before.insert(self.channel.clone(), post.create_at);
+                    }
+                }
                 self.typing.retain(|(ch, user, _), _| !(*ch == post.channel_id && *user == post.user_id));
                 let in_open_thread = post.is_reply() && self.thread.as_deref() == Some(post.root_id.as_str());
                 let notify = self.store.posted(*post.clone(), &mentions, viewing);
@@ -559,6 +612,10 @@ impl Chat {
             }
             M::Event(Event::ChannelViewed { channel_id }) => {
                 self.store.mark_viewed(&channel_id);
+                Task::none()
+            }
+            M::Event(Event::StatusChange { user_id, status }) => {
+                self.store.statuses.insert(user_id, status);
                 Task::none()
             }
             M::Event(_) => Task::none(),

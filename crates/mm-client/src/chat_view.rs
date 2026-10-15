@@ -70,17 +70,22 @@ impl Chat {
             let unread = self.store.unread(&ch.id);
             let sigil = match ch.kind {
                 ChannelType::Private => "🔒",
-                ChannelType::Direct => "@",
+                ChannelType::Direct => "●",
                 ChannelType::Group => "👥",
                 _ => "#",
             };
+            // DMs show the other person's presence in place of a sigil.
+            let sigil_color = ch
+                .dm_partner(&self.store.me.id)
+                .and_then(|u| self.presence_color(u, c))
+                .unwrap_or(c.muted);
             let mut name = text(self.store.channel_label(ch)).size(14);
             name = if unread.has_unread || unread.mentions > 0 {
                 name.font(bold()).color(c.fg_bright)
             } else {
                 name.color(c.fg)
             };
-            let mut line = row![text(sigil).size(13).color(c.muted).width(18), name].spacing(6);
+            let mut line = row![text(sigil).size(13).color(sigil_color).width(18), name].spacing(6);
             if unread.mentions > 0 {
                 line = line.push(space::horizontal()).push(
                     container(text(unread.mentions.to_string()).size(11).font(bold())).padding([1, 7]).style(c.badge()),
@@ -292,18 +297,39 @@ impl Chat {
             col = col.push(container(text(top).size(12).color(c.muted)).center_x(Length::Fill).height(32).center_y(32));
         }
         let mut prev: Option<&Post> = None;
+        // "New messages" goes above the first post from someone else since the last visit.
+        let new_since = (pane == Pane::Channel).then(|| self.viewed_before.get(&self.channel)).flatten();
+        let first_new = new_since.and_then(|since| {
+            entries
+                .iter()
+                .map(|e| &e.post)
+                .find(|p| p.create_at > *since && p.user_id != self.store.me.id && !p.is_system())
+                .map(|p| p.id.as_str())
+        });
+        let mut prev_day: Option<i64> = None;
         for entry in entries {
             let post = &entry.post;
-            if prev.is_none_or(|p| !fmt::same_day(p.create_at, post.create_at)) {
+            let mut break_group = false;
+            if first_new == Some(post.id.as_str()) {
+                col = col.push(
+                    row![rule::horizontal(1), text("New messages").size(12).color(c.red), rule::horizontal(1)]
+                        .spacing(10)
+                        .align_y(iced::Center)
+                        .padding([6, 0]),
+                );
+                break_group = true;
+            }
+            if prev_day.is_none_or(|d| !fmt::same_day(d, post.create_at)) {
                 col = col.push(
                     row![rule::horizontal(1), text(fmt::day_label(post.create_at, now)).size(12).color(c.muted), rule::horizontal(1)]
                         .spacing(10)
                         .align_y(iced::Center)
                         .padding([8, 0]),
                 );
-                prev = None;
+                break_group = true;
             }
-            let continued = prev.is_some_and(|p| {
+            prev_day = Some(post.create_at);
+            let continued = !break_group && prev.is_some_and(|p| {
                 p.user_id == post.user_id
                     && post.create_at - p.create_at < 5 * 60 * 1000
                     && !p.is_system()
@@ -386,7 +412,34 @@ impl Chat {
         hover(content, container(reply).width(Length::Fill).align_x(iced::alignment::Horizontal::Right))
     }
 
+    fn presence_color(&self, user_id: &str, c: Colors) -> Option<iced::Color> {
+        Some(match self.store.statuses.get(user_id)?.as_str() {
+            "online" => c.green,
+            "away" => c.yellow,
+            "dnd" => c.red,
+            _ => c.muted,
+        })
+    }
+
     fn avatar(&self, post: &Post, c: Colors) -> Element<'_, Message> {
+        let picture = self.avatar_picture(post, c);
+        let Some(color) = self.presence_color(&post.user_id, c).filter(|_| post.override_username().is_none()) else {
+            return picture;
+        };
+        let ring = c.bg;
+        let dot = container(space().width(10).height(10)).style(move |_: &Theme| container::Style {
+            background: Some(iced::Background::Color(color)),
+            border: iced::Border { radius: 6.0.into(), width: 2.0, color: ring },
+            ..Default::default()
+        });
+        stack![
+            picture,
+            container(dot).width(AVATAR).height(AVATAR).align_right(AVATAR).align_bottom(AVATAR),
+        ]
+        .into()
+    }
+
+    fn avatar_picture(&self, post: &Post, c: Colors) -> Element<'_, Message> {
         let user = self.store.users.get(&post.user_id);
         let handle = user.and_then(|u| self.media.get(&media::Key::Avatar(u.id.clone(), u.last_picture_update)));
         // Bots posting under another name keep the placeholder.

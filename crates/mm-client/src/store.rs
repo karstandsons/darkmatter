@@ -59,6 +59,8 @@ pub struct Store {
     /// Replies already counted into their root's `reply_count`, so the REST
     /// reply to our own send and its WebSocket echo don't both count.
     counted_replies: HashSet<Id>,
+    /// Presence by user id: `online`, `away`, `dnd` or `offline`.
+    pub statuses: HashMap<Id, String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +82,7 @@ impl Store {
             timelines: HashMap::new(),
             threads: HashMap::new(),
             counted_replies: HashSet::new(),
+            statuses: HashMap::new(),
         }
     }
 
@@ -90,6 +93,13 @@ impl Store {
         for m in members {
             self.members.insert(m.channel_id.clone(), m);
         }
+    }
+
+    /// Known users whose presence we haven't fetched yet.
+    pub fn missing_statuses(&self) -> Vec<Id> {
+        let mut ids: Vec<Id> = self.users.keys().filter(|id| !self.statuses.contains_key(*id)).cloned().collect();
+        ids.sort();
+        ids
     }
 
     pub fn add_users(&mut self, users: Vec<User>) {
