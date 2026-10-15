@@ -3,6 +3,17 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Mattermost sends `null` for many "empty" fields (e.g. `width` on a text
+/// file). `#[serde(default)]` only covers missing keys, so nullable fields use
+/// this to turn `null` into the default too.
+fn nullable<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 /// Mattermost ids are 26-char strings; timestamps are Unix milliseconds.
 pub type Id = String;
 pub type Millis = i64;
@@ -15,16 +26,24 @@ pub struct User {
     pub update_at: Millis,
     pub delete_at: Millis,
     pub username: String,
+    #[serde(deserialize_with = "nullable")]
     pub first_name: String,
+    #[serde(deserialize_with = "nullable")]
     pub last_name: String,
+    #[serde(deserialize_with = "nullable")]
     pub nickname: String,
     pub email: String,
+    #[serde(deserialize_with = "nullable")]
     pub roles: String,
+    #[serde(deserialize_with = "nullable")]
     pub locale: String,
     pub last_picture_update: Millis,
     pub is_bot: bool,
+    #[serde(deserialize_with = "nullable")]
     pub props: HashMap<String, String>,
+    #[serde(deserialize_with = "nullable")]
     pub notify_props: HashMap<String, String>,
+    #[serde(deserialize_with = "nullable")]
     pub timezone: HashMap<String, String>,
 }
 
@@ -80,13 +99,17 @@ pub struct Channel {
     pub create_at: Millis,
     pub update_at: Millis,
     pub delete_at: Millis,
+    #[serde(deserialize_with = "nullable")]
     pub team_id: Id,
     #[serde(rename = "type")]
     pub kind: ChannelType,
+    #[serde(deserialize_with = "nullable")]
     pub display_name: String,
     /// For DMs this is `<user_id_a>__<user_id_b>`.
     pub name: String,
+    #[serde(deserialize_with = "nullable")]
     pub header: String,
+    #[serde(deserialize_with = "nullable")]
     pub purpose: String,
     pub last_post_at: Millis,
     pub last_root_post_at: Millis,
@@ -111,6 +134,7 @@ impl Channel {
 pub struct ChannelMember {
     pub channel_id: Id,
     pub user_id: Id,
+    #[serde(deserialize_with = "nullable")]
     pub roles: String,
     pub last_viewed_at: Millis,
     pub msg_count: i64,
@@ -118,6 +142,7 @@ pub struct ChannelMember {
     pub mention_count_root: i64,
     pub msg_count_root: i64,
     pub urgent_mention_count: i64,
+    #[serde(deserialize_with = "nullable")]
     pub notify_props: HashMap<String, String>,
     pub last_update_at: Millis,
 }
@@ -145,17 +170,24 @@ pub struct Post {
     pub user_id: Id,
     pub channel_id: Id,
     /// Id of the thread root, empty for root posts.
+    #[serde(deserialize_with = "nullable")]
     pub root_id: Id,
+    #[serde(deserialize_with = "nullable")]
     pub original_id: Id,
     pub message: String,
     /// Empty for normal posts; `system_*` for join/leave/header changes etc.
     #[serde(rename = "type")]
     pub kind: String,
     pub props: Value,
+    #[serde(deserialize_with = "nullable")]
     pub hashtags: String,
+    #[serde(deserialize_with = "nullable")]
     pub file_ids: Vec<Id>,
+    #[serde(deserialize_with = "nullable")]
     pub pending_post_id: String,
+    #[serde(deserialize_with = "nullable")]
     pub reply_count: i64,
+    #[serde(deserialize_with = "nullable")]
     pub metadata: PostMetadata,
 }
 
@@ -177,10 +209,15 @@ impl Post {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct PostMetadata {
+    #[serde(deserialize_with = "nullable")]
     pub embeds: Vec<Value>,
+    #[serde(deserialize_with = "nullable")]
     pub emojis: Vec<Value>,
+    #[serde(deserialize_with = "nullable")]
     pub files: Vec<FileInfo>,
+    #[serde(deserialize_with = "nullable")]
     pub images: HashMap<String, Value>,
+    #[serde(deserialize_with = "nullable")]
     pub reactions: Vec<Reaction>,
 }
 
@@ -188,9 +225,13 @@ pub struct PostMetadata {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct PostList {
+    #[serde(deserialize_with = "nullable")]
     pub order: Vec<Id>,
+    #[serde(deserialize_with = "nullable")]
     pub posts: HashMap<Id, Post>,
+    #[serde(deserialize_with = "nullable")]
     pub next_post_id: Id,
+    #[serde(deserialize_with = "nullable")]
     pub prev_post_id: Id,
     pub has_next: bool,
 }
@@ -216,15 +257,23 @@ pub struct Reaction {
 pub struct FileInfo {
     pub id: Id,
     pub user_id: Id,
+    #[serde(deserialize_with = "nullable")]
     pub post_id: Id,
+    #[serde(deserialize_with = "nullable")]
     pub channel_id: Id,
     pub create_at: Millis,
     pub name: String,
+    #[serde(deserialize_with = "nullable")]
     pub extension: String,
+    #[serde(deserialize_with = "nullable")]
     pub size: i64,
+    #[serde(deserialize_with = "nullable")]
     pub mime_type: String,
+    #[serde(deserialize_with = "nullable")]
     pub width: i64,
+    #[serde(deserialize_with = "nullable")]
     pub height: i64,
+    #[serde(deserialize_with = "nullable")]
     pub has_preview_image: bool,
     pub mini_preview: Option<String>,
 }

@@ -11,6 +11,7 @@ use mm_api::{Client, PostsQuery, ws};
 
 use crate::app::{Message, bootstrap, err};
 use crate::session::Session;
+use crate::media;
 use crate::store::Store;
 use crate::switcher::{self, Switcher};
 
@@ -34,6 +35,7 @@ pub struct Chat {
     pub thread: Option<String>,
     pub thread_draft: String,
     pub switcher: Option<Switcher>,
+    pub media: media::Cache,
     pub error: Option<String>,
 }
 
@@ -58,6 +60,7 @@ impl Chat {
             thread: None,
             thread_draft: String::new(),
             switcher: None,
+            media: media::Cache::default(),
             error: None,
         };
         Some((chat, Task::none()))
@@ -113,6 +116,32 @@ impl Chat {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        Task::batch([task, self.fetch_media()])
+    }
+
+    /// Avatars and image previews needed by what's on screen and not fetched yet.
+    fn fetch_media(&mut self) -> Task<Message> {
+        let visible = [Some(&self.channel), self.thread.as_ref()];
+        let mut keys = Vec::new();
+        for (i, id) in visible.into_iter().enumerate() {
+            let Some(id) = id else { continue };
+            let timeline = if i == 0 { self.store.timelines.get(id) } else { self.store.threads.get(id) };
+            for post in timeline.into_iter().flat_map(|t| &t.entries).map(|e| &e.post) {
+                if let Some(u) = self.store.users.get(&post.user_id) {
+                    keys.push(media::Key::Avatar(u.id.clone(), u.last_picture_update));
+                }
+                for f in &post.metadata.files {
+                    if f.mime_type.starts_with("image/") && f.has_preview_image {
+                        keys.push(media::Key::Preview(f.id.clone()));
+                    }
+                }
+            }
+        }
+        self.media.fetch(&self.client, keys)
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SelectTeam(id) => {
                 self.team = id;
@@ -206,6 +235,17 @@ impl Chat {
                 };
                 let client = self.client.clone();
                 Task::perform(async move { client.create_post(&post).await.map_err(err) }, Message::Sent)
+            }
+            Message::Media(key, result) => {
+                self.media.loaded(key, result);
+                Task::none()
+            }
+            Message::OpenFile(id, name) => {
+                Task::perform(media::open_file(self.client.clone(), id, name), Message::Opened)
+            }
+            Message::Opened(Err(e)) => {
+                self.error = Some(format!("Couldn't open file: {e}"));
+                Task::none()
             }
             Message::OpenSwitcher => {
                 let mut sw = Switcher::default();

@@ -167,6 +167,11 @@ impl Client {
         self.bytes(&format!("files/{file_id}")).await
     }
 
+    /// Medium-size rendering of an image attachment (what chat views show inline).
+    pub async fn file_preview(&self, file_id: &str) -> Result<Vec<u8>, Error> {
+        self.bytes(&format!("files/{file_id}/preview")).await
+    }
+
     pub async fn file_thumbnail(&self, file_id: &str) -> Result<Vec<u8>, Error> {
         self.bytes(&format!("files/{file_id}/thumbnail")).await
     }

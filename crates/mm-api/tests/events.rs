@@ -45,3 +45,23 @@ fn unknown_events_are_kept_raw() {
     assert_eq!(raw.event, "some_future_event");
     assert_eq!(raw.seq, 7);
 }
+
+#[test]
+fn nulls_from_the_server_become_defaults() {
+    // Real shape of a post with a text attachment: image-only fields are null.
+    let json = r#"{
+        "id": "p1", "message": "notes", "file_ids": null, "props": null, "reply_count": null,
+        "metadata": { "files": [ {
+            "id": "f1", "name": "notes.txt", "mime_type": "text/plain; charset=utf-8",
+            "has_preview_image": null, "width": null, "height": null, "mini_preview": null
+        } ], "reactions": null, "embeds": null }
+    }"#;
+    let post: mm_api::models::Post = serde_json::from_str(json).unwrap();
+    let f = &post.metadata.files[0];
+    assert!(!f.has_preview_image);
+    assert_eq!((f.width, f.height), (0, 0));
+    assert!(post.file_ids.is_empty() && post.metadata.reactions.is_empty());
+
+    let post: mm_api::models::Post = serde_json::from_str(r#"{"id":"p2","metadata":null}"#).unwrap();
+    assert!(post.metadata.files.is_empty());
+}

@@ -2614,6 +2614,7 @@ dependencies = [
  "dirs",
  "emojis",
  "iced",
+ "image",
  "mm-api",
  "omarchy-theme",
  "serde",

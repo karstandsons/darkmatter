@@ -1,6 +1,7 @@
 mod app;
 mod chat;
 mod chat_view;
+mod media;
 mod session;
 mod store;
 mod style;

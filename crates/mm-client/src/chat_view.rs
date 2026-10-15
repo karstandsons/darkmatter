@@ -1,17 +1,22 @@
 //! Chat screen views.
 
 use iced::widget::{
-    Column, button, center, column, container, hover, markdown, row, rule, scrollable, space, stack, text,
+    Column, button, center, column, container, hover, image, markdown, row, rule, scrollable, space, stack, text,
     text_input,
 };
 use iced::{Element, Length, Theme};
-use mm_api::models::{Channel, ChannelType, Post};
+use mm_api::models::{Channel, ChannelType, FileInfo, Post};
 
 use crate::app::Message;
 use crate::chat::{COMPOSER, Chat, THREAD, THREAD_COMPOSER, TIMELINE};
+use crate::media;
 use crate::store::Entry;
 use crate::style::{Colors, bold, italic};
 use crate::text as fmt;
+
+/// Avatar size and the left gutter that aligns grouped messages with the first one.
+const AVATAR: f32 = 34.0;
+const GUTTER: f32 = 46.0;
 
 const PANE_FOOTER: iced::Padding = iced::Padding { top: 0.0, right: 20.0, bottom: 16.0, left: 20.0 };
 
@@ -267,13 +272,16 @@ impl Chat {
         let post = &entry.post;
         if post.is_system() {
             return container(text(&post.message).size(13).color(c.muted).font(italic()))
-                .padding([4, 0])
+                .padding(iced::Padding { top: 4.0, bottom: 4.0, left: GUTTER, right: 0.0 })
                 .into();
         }
         let viewer = crate::viewer::PostViewer { colors: c };
         let mut body = column![markdown::view_with(&entry.markdown, md, &viewer)].spacing(4);
         if post.edit_at > 0 {
             body = body.push(text("(edited)").size(11).color(c.muted));
+        }
+        for f in &post.metadata.files {
+            body = body.push(self.attachment(f, c));
         }
         if let Some(reactions) = self.reactions(post, c) {
             body = body.push(reactions);
@@ -293,7 +301,7 @@ impl Chat {
         }
 
         let content: Element<'_, Message> = if continued {
-            body.into()
+            container(body).padding(iced::Padding { left: GUTTER, ..iced::Padding::ZERO }).into()
         } else {
             let name = row![
                 text(self.store.display_name(post)).font(bold()).size(14).color(c.name_color(&post.user_id)),
@@ -301,7 +309,10 @@ impl Chat {
             ]
             .spacing(8)
             .align_y(iced::Center);
-            container(column![name, body].spacing(2)).padding(iced::Padding { top: 8.0, ..iced::Padding::ZERO }).into()
+            let avatar = self.avatar(post, c);
+            container(row![avatar, column![name, body].spacing(2)].spacing(GUTTER - AVATAR))
+                .padding(iced::Padding { top: 8.0, ..iced::Padding::ZERO })
+                .into()
         };
 
         if pane == Pane::Thread {
@@ -310,6 +321,57 @@ impl Chat {
         // Reply action appears in the top-right corner on hover.
         let reply = button(text("↩ Reply").size(12)).padding([2, 8]).on_press(Message::OpenThread(thread_root.clone())).style(c.chip(false));
         hover(content, container(reply).width(Length::Fill).align_x(iced::alignment::Horizontal::Right))
+    }
+
+    fn avatar(&self, post: &Post, c: Colors) -> Element<'_, Message> {
+        let user = self.store.users.get(&post.user_id);
+        let handle = user.and_then(|u| self.media.get(&media::Key::Avatar(u.id.clone(), u.last_picture_update)));
+        // Bots posting under another name keep the placeholder.
+        match handle.filter(|_| post.override_username().is_none()) {
+            Some(h) => image(h.clone()).width(AVATAR).height(AVATAR).border_radius(AVATAR / 2.0).into(),
+            None => {
+                let initial: String = self.store.display_name(post).chars().take(1).collect::<String>().to_uppercase();
+                let color = c.name_color(&post.user_id);
+                container(text(initial).size(15).font(bold()).color(c.rail))
+                    .center(AVATAR)
+                    .style(move |_: &Theme| container::Style {
+                        background: Some(iced::Background::Color(color)),
+                        border: iced::border::rounded(AVATAR / 2.0),
+                        ..Default::default()
+                    })
+                    .into()
+            }
+        }
+    }
+
+    fn attachment<'a>(&'a self, f: &'a FileInfo, c: Colors) -> Element<'a, Message> {
+        let open = Message::OpenFile(f.id.clone(), f.name.clone());
+        if f.mime_type.starts_with("image/") && f.has_preview_image {
+            let (w, h) = media::preview_size(f.width, f.height);
+            let key = media::Key::Preview(f.id.clone());
+            let inner: Element<'_, Message> = match self.media.get(&key) {
+                Some(handle) => image(handle.clone()).width(w).height(h).border_radius(6).into(),
+                None => container(
+                    text(if self.media.failed(&key) { "Preview unavailable" } else { "Loading…" }).size(12).color(c.muted),
+                )
+                .center_x(w)
+                .center_y(h)
+                .style(c.code_block())
+                .into(),
+            };
+            return button(inner).padding(0).on_press(open).style(c.link_button()).into();
+        }
+        let label = row![
+            text("📄").size(16),
+            column![
+                text(&f.name).size(13).color(c.fg_bright),
+                text(format!("{} · {}", f.extension.to_uppercase(), media::human_size(f.size))).size(11).color(c.muted),
+            ]
+            .spacing(2),
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+        button(label).padding([8, 12]).on_press(open).style(c.chip(false)).into()
     }
 
     fn reactions(&self, post: &Post, c: Colors) -> Option<Element<'_, Message>> {
