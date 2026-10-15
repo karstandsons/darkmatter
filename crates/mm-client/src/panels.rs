@@ -62,10 +62,10 @@ impl Chat {
                         text(self.store.display_name(post)).size(13).font(bold()).color(c.name_color(&post.user_id)),
                         markdown::view_with(&entry.markdown, md, &viewer),
                         row![
-                            button(text("Open thread").size(11)).padding([2, 8]).on_press(Message::OpenThread(root)).style(c.chip(false)),
-                            button(text("Go to channel").size(11))
+                            button(text("Open thread").size(11)).padding([2, 8]).on_press(Message::OpenThread(root.clone())).style(c.chip(false)),
+                            button(text("Jump").size(11))
                                 .padding([2, 8])
-                                .on_press(Message::SelectChannel(post.channel_id.clone()))
+                                .on_press(Message::JumpTo(post.channel_id.clone(), root.clone(), post.id.clone()))
                                 .style(c.chip(false)),
                         ]
                         .spacing(6),

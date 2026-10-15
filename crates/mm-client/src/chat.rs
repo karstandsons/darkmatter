@@ -21,6 +21,8 @@ pub const TIMELINE: &str = "timeline";
 pub const THREAD: &str = "thread";
 pub const THREAD_COMPOSER: &str = "thread-composer";
 pub const SEARCH_INPUT: &str = "search-input";
+/// The post being jumped to gets this container id so it can be found.
+pub const JUMP_TARGET: &str = "jump-target";
 
 /// What the right side shows when no thread is open on top of it.
 pub enum Panel {
@@ -37,6 +39,19 @@ pub struct SearchPane {
     pub results: Option<Result<Vec<crate::store::Entry>, String>>,
 }
 const TYPING_TTL: Duration = Duration::from_secs(6);
+/// How long a jumped-to message stays highlighted.
+const HIGHLIGHT_FOR: Duration = Duration::from_secs(4);
+/// Posts loaded on each side of a jump target that isn't already loaded.
+const AROUND: u32 = 30;
+
+/// A message being jumped to. If its thread root isn't loaded, the channel
+/// shows the stretch around it instead (paging newer as you scroll down).
+pub struct Jump {
+    channel: String,
+    root: String,
+    post: String,
+    window_requested: bool,
+}
 
 pub struct Chat {
     pub session: Session,
@@ -60,6 +75,12 @@ pub struct Chat {
     pub expanded: HashSet<String>,
     /// Inline threads showing every reply rather than the latest few.
     pub all_replies: HashSet<String>,
+    pub jump: Option<Jump>,
+    /// The post scrolled to, and until when it's highlighted.
+    pub highlight: Option<(String, Instant)>,
+    /// The post whose position the jump scrolls to (the reply itself inline,
+    /// or its root when threads open in the pane).
+    pub jump_target: Option<String>,
     /// Latest timeline viewport, and while a thread expands or collapses above
     /// the bottom, the (content height, offset from bottom) to keep the top still.
     viewport: Option<iced::widget::scrollable::Viewport>,
@@ -122,6 +143,90 @@ impl Chat {
         }
     }
 
+    /// Take the next step of a pending jump: load older history until the
+    /// thread root is in the channel, then highlight the post and scroll to it.
+    fn continue_jump(&mut self) -> Task<Message> {
+        let Some(j) = &mut self.jump else { return Task::none() };
+        if self.channel != j.channel {
+            self.jump = None; // went somewhere else meanwhile
+            return Task::none();
+        }
+        let found = self.store.timelines.get(&j.channel).is_some_and(|t| t.loaded && t.entries.iter().any(|e| e.post.id == j.root));
+        if !found {
+            if j.window_requested {
+                self.jump = None;
+                self.error = Some("That message isn't in the channel any more".into());
+                return Task::none();
+            }
+            j.window_requested = true;
+            let (client, channel, root) = (self.client.clone(), j.channel.clone(), j.root.clone());
+            return Task::perform(
+                async move {
+                    let before = client.posts(&channel, PostsQuery::Before { post_id: root.clone(), per_page: AROUND }, true);
+                    let after = client.posts(&channel, PostsQuery::After { post_id: root.clone(), per_page: AROUND }, true);
+                    let thread = client.thread(&root);
+                    let r = tokio::try_join!(before, after, thread).map_err(err);
+                    (channel, root, r)
+                },
+                |(channel, root, r)| Message::JumpWindow(channel, root, r),
+            );
+        }
+        let Some(Jump { root, post, .. }) = self.jump.take() else { return Task::none() };
+        self.hold_top = None;
+        self.highlight = Some((post.clone(), Instant::now() + HIGHLIGHT_FOR));
+        if root == post {
+            self.jump_target = Some(post);
+            return locate();
+        }
+        if self.inline_threads {
+            // Show the whole thread so the reply is there to scroll to.
+            self.jump_target = Some(post);
+            self.expanded.insert(root.clone());
+            self.all_replies.insert(root.clone());
+            return if self.store.threads.get(&root).is_some_and(|t| t.loaded) { locate() } else { self.load_thread(root) };
+        }
+        self.jump_target = Some(root.clone());
+        Task::batch([self.update(Message::OpenThread(root)), locate()])
+    }
+
+    /// Fetch the page after the newest loaded post, while viewing an older stretch.
+    fn load_newer(&mut self) -> Task<Message> {
+        let id = self.channel.clone();
+        let Some(newest) = self.store.newest(&id).map(|p| p.id.clone()) else { return Task::none() };
+        let Some(t) = self.store.timelines.get_mut(&id) else { return Task::none() };
+        if !t.has_newer || t.loading_newer {
+            return Task::none();
+        }
+        t.loading_newer = true;
+        let client = self.client.clone();
+        Task::perform(
+            async move {
+                let r = client.posts(&id, PostsQuery::After { post_id: newest, per_page: 60 }, true).await.map_err(err);
+                (id, r)
+            },
+            |(id, r)| Message::Newer(id, r),
+        )
+    }
+
+    /// Drop an older stretch and show the channel's newest messages.
+    fn reload_latest(&mut self) -> Task<Message> {
+        self.store.timelines.remove(&self.channel);
+        self.hold_top = None;
+        let id = self.channel.clone();
+        Task::batch([self.load_history(id), to_latest(TIMELINE)])
+    }
+
+    fn load_thread(&self, root: String) -> Task<Message> {
+        let client = self.client.clone();
+        Task::perform(
+            async move {
+                let r = client.thread(&root).await.map_err(err);
+                (root, r)
+            },
+            |(root, r)| Message::Thread(root, r),
+        )
+    }
+
     /// Keep the messages on screen still while `root`'s thread expands or
     /// collapses, so its replies grow downward from it (the bottom anchor would
     /// otherwise push it up and out of view). The newest message is the
@@ -160,6 +265,9 @@ impl Chat {
             inline_threads: true,
             expanded: HashSet::new(),
             all_replies: HashSet::new(),
+            jump: None,
+            highlight: None,
+            jump_target: None,
             viewport: None,
             hold_top: None,
             switcher: None,
@@ -219,11 +327,14 @@ impl Chat {
             let prev = if self.marked_unread.remove(&prev) { None } else { Some(prev) };
             Task::future(async move { client.view_channel(&id, prev.as_deref()).await }).discard()
         };
-        let history = if self.store.timelines.get(&id).is_some_and(|t| t.loaded) {
-            Task::none()
-        } else {
-            self.load_history(id)
-        };
+        let jumping = self.jump.as_ref().is_some_and(|j| j.channel == id);
+        // Coming back to a channel left on an older stretch shows the latest again.
+        if !jumping && self.store.timelines.get(&id).is_some_and(|t| t.has_newer) {
+            self.store.timelines.remove(&id);
+        }
+        let loaded = self.store.timelines.get(&id).is_some_and(|t| t.loaded);
+        // A jump loads its own stretch if the message isn't already here.
+        let history = if loaded || jumping { Task::none() } else { self.load_history(id) };
         Task::batch([view, history, to_latest(TIMELINE), operation::focus(COMPOSER)])
     }
 
@@ -425,7 +536,14 @@ impl Chat {
                         return Task::none();
                     }
                 }
-                if from_top < 400.0 { self.load_older() } else { Task::none() }
+                let has_newer = self.store.timelines.get(&self.channel).is_some_and(|t| t.has_newer);
+                if has_newer && from_bottom < 400.0 {
+                    self.load_newer()
+                } else if from_top < 400.0 {
+                    self.load_older()
+                } else {
+                    Task::none()
+                }
             }
             Message::Users(Ok(users)) => {
                 self.store.add_users(users);
@@ -500,8 +618,53 @@ impl Chat {
                 self.sending = None;
                 let in_thread = post.is_reply();
                 self.store.sent(post);
+                if !in_thread && self.store.timelines.get(&self.channel).is_some_and(|t| t.has_newer) {
+                    return self.reload_latest();
+                }
                 to_latest(if in_thread { THREAD } else { TIMELINE })
             }
+            Message::JumpTo(channel, root, post) => {
+                // Set first: select_channel skips loading the newest page for it.
+                self.jump = Some(Jump { channel: channel.clone(), root, post, window_requested: false });
+                let select = if self.channel != channel { self.select_channel(channel) } else { Task::none() };
+                Task::batch([select, self.continue_jump()])
+            }
+            Message::JumpWindow(channel, root, Ok((before, after, thread))) => {
+                let has_more = !before.prev_post_id.is_empty();
+                let has_newer = !after.next_post_id.is_empty();
+                let mut list = before;
+                list.posts.extend(after.posts);
+                if let Some(p) = thread.posts.get(&root) {
+                    list.posts.insert(root.clone(), p.clone());
+                }
+                self.hold_top = None;
+                self.store.set_window(&channel, list, has_more, has_newer);
+                self.store.set_thread(&root, thread);
+                Task::batch([self.load_missing_users(), self.continue_jump()])
+            }
+            Message::JumpWindow(channel, _, Err(e)) => {
+                self.jump = None;
+                self.error = Some(format!("Couldn't load that message: {e}"));
+                if self.store.timelines.get(&channel).is_some_and(|t| t.loaded) { Task::none() } else { self.load_history(channel) }
+            }
+            Message::Newer(id, Ok(list)) => {
+                // Posts appended below would push the view up: hold it still.
+                self.hold_top = self.viewport.map(|v| (v.content_bounds().height, v.absolute_offset().y));
+                self.store.add_newer(&id, list);
+                self.load_missing_users()
+            }
+            Message::Newer(id, Err(e)) => {
+                if let Some(t) = self.store.timelines.get_mut(&id) {
+                    t.loading_newer = false;
+                }
+                self.error = Some(e);
+                Task::none()
+            }
+            Message::JumpToLatest => self.reload_latest(),
+            Message::JumpLocated(Some(from_bottom)) => {
+                operation::scroll_to(TIMELINE, iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(from_bottom) })
+            }
+            Message::JumpLocated(None) => Task::none(),
             Message::ShowAllReplies(root) => {
                 self.hold_view(&root);
                 self.all_replies.insert(root);
@@ -539,14 +702,7 @@ impl Chat {
                 let load = if self.store.threads.get(&root).is_some_and(|t| t.loaded) {
                     Task::none()
                 } else {
-                    let client = self.client.clone();
-                    Task::perform(
-                        async move {
-                            let r = client.thread(&root).await.map_err(err);
-                            (root, r)
-                        },
-                        |(root, r)| Message::Thread(root, r),
-                    )
+                    self.load_thread(root)
                 };
                 Task::batch([load, mark_read, to_latest(THREAD), operation::focus(THREAD_COMPOSER)])
             }
@@ -560,7 +716,11 @@ impl Chat {
             }
             Message::Thread(root, Ok(list)) => {
                 self.store.set_thread(&root, list);
-                Task::batch([self.load_missing_users(), to_latest(THREAD)])
+                let locate = match &self.jump_target {
+                    Some(t) if self.expanded.contains(&root) && self.store.threads.get(&root).is_some_and(|th| th.entries.iter().any(|e| e.post.id == *t)) => locate(),
+                    _ => Task::none(),
+                };
+                Task::batch([self.load_missing_users(), to_latest(THREAD), locate])
             }
             Message::Thread(_, Err(e)) => {
                 self.error = Some(e);
@@ -1034,6 +1194,10 @@ impl Chat {
             Message::Ws(msg) => self.on_ws(msg),
             Message::Tick => {
                 self.typing.retain(|_, at| at.elapsed() < TYPING_TTL);
+                if self.highlight.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
+                    self.highlight = None;
+                    self.jump_target = None;
+                }
                 Task::none()
             }
             Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) if modifiers.alt() => {
@@ -1159,6 +1323,44 @@ fn notify_mention(store: &Store, post: &Post) {
             tracing::warn!("notification failed: {e}");
         }
     });
+}
+
+/// Find the jump target in the timeline, as the offset from the bottom that
+/// puts it a little below the top of the view.
+fn locate() -> Task<Message> {
+    use iced::advanced::widget::{Id, Operation, operation::Outcome, operation::Scrollable};
+    use iced::{Rectangle, Vector};
+
+    #[derive(Default)]
+    struct Find {
+        timeline: Option<(Rectangle, Rectangle)>,
+        target: Option<Rectangle>,
+    }
+    impl Operation<Option<f32>> for Find {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Option<f32>>)) {
+            operate(self);
+        }
+        fn scrollable(&mut self, id: Option<&Id>, bounds: Rectangle, content: Rectangle, _: Vector, _: &mut dyn Scrollable) {
+            if id == Some(&Id::from(TIMELINE)) {
+                self.timeline = Some((bounds, content));
+            }
+        }
+        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+            // The channel comes before the side pane, so its copy wins.
+            if id == Some(&Id::from(JUMP_TARGET)) && self.target.is_none() {
+                self.target = Some(bounds);
+            }
+        }
+        fn finish(&self) -> Outcome<Option<f32>> {
+            // Layout bounds ignore scrolling, so the target's distance from the
+            // content's top is fixed; convert it to the bottom-anchored offset.
+            Outcome::Some(self.timeline.zip(self.target).map(|((view, content), target)| {
+                let top = target.y - content.y;
+                (content.height - view.height - (top - 48.0)).clamp(0.0, (content.height - view.height).max(0.0))
+            }))
+        }
+    }
+    iced::advanced::widget::operate(Find::default()).map(Message::JumpLocated)
 }
 
 /// Scroll a bottom-anchored list to its newest post. Offsets count from the

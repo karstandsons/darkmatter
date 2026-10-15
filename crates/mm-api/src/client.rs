@@ -32,6 +32,8 @@ pub enum PostsQuery {
     Since(Millis),
     /// Older history before a given post.
     Before { post_id: Id, per_page: u32 },
+    /// Newer history after a given post (when viewing an older stretch).
+    After { post_id: Id, per_page: u32 },
 }
 
 impl Client {
@@ -128,6 +130,7 @@ impl Client {
             PostsQuery::Before { post_id, per_page } => {
                 req.query(&[("before", post_id), ("per_page", per_page.to_string())])
             }
+            PostsQuery::After { post_id, per_page } => req.query(&[("after", post_id), ("per_page", per_page.to_string())]),
         };
         decode(&path, check(req.send().await?).await?).await
     }

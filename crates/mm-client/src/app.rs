@@ -95,6 +95,16 @@ pub enum Message {
     ToggleThread(String),
     /// Show all of an inline thread's replies, not just the latest few.
     ShowAllReplies(String),
+    /// Go to a message in its channel: (channel id, thread root id, post id).
+    JumpTo(String, String, String),
+    /// Where the jump target sits, as a timeline offset from the bottom.
+    JumpLocated(Option<f32>),
+    /// Posts around a jump target: (channel, root, (before, after, thread)).
+    JumpWindow(String, String, Result<(PostList, PostList, PostList), String>),
+    /// A page of newer posts while viewing an older stretch.
+    Newer(String, Result<PostList, String>),
+    /// Leave an older stretch for the newest messages.
+    JumpToLatest,
     /// Switch threads between inline and the side pane.
     ToggleThreadLayout,
     CloseThread,
@@ -418,7 +428,7 @@ impl App {
             match &message {
                 // Login input carries the password; never log it.
                 Message::Login(..) => {}
-                Message::Ws(_) | Message::Tick | Message::Media(..) | Message::History(..) | Message::Thread(..) => {}
+                Message::Ws(_) | Message::Tick | Message::Media(..) | Message::History(..) | Message::Thread(..) | Message::JumpWindow(..) | Message::Newer(..) => {}
                 Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                     tracing::debug!("key {key:?} {modifiers:?}")
                 }
@@ -544,7 +554,7 @@ impl App {
         ];
         if let Screen::Chat(chat) = &self.screen {
             subs.push(Subscription::run_with(chat.session.clone(), ws_events).map(Message::Ws));
-            if !chat.typing.is_empty() {
+            if !chat.typing.is_empty() || chat.highlight.is_some() {
                 subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
             }
         }

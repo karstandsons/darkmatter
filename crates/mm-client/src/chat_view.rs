@@ -191,6 +191,19 @@ impl Chat {
             .style(c.input());
 
         let mut col = column![container(header).padding([12, 20]), rule::horizontal(1), timeline];
+        if self.store.timelines.get(&self.channel).is_some_and(|t| t.has_newer) {
+            col = col.push(
+                container(
+                    row![
+                        text("Viewing older messages").size(12).color(c.muted),
+                        space::horizontal(),
+                        button(text("Jump to latest ↓").size(12)).padding([3, 10]).on_press(Message::JumpToLatest).style(c.chip(false)),
+                    ]
+                    .align_y(iced::Center),
+                )
+                .padding([4, 20]),
+            );
+        }
         if let Some(e) = &self.error {
             col = col.push(container(text(e).size(12).color(c.red)).padding([4, 20]));
         }
@@ -373,11 +386,14 @@ impl Chat {
             Pane::Channel => TIMELINE,
             Pane::Thread => THREAD,
         };
-        let scroll = scrollable(col).id(id).anchor_bottom().height(Length::Fill);
-        match pane {
-            Pane::Channel => scroll.on_scroll(Message::TimelineScrolled).into(),
-            Pane::Thread => scroll.into(),
-        }
+        // Shrink to the messages and sit at the bottom, so a short channel's
+        // few messages are next to the composer rather than at the top.
+        let scroll = scrollable(col).id(id).anchor_bottom().height(Length::Shrink);
+        let scroll = match pane {
+            Pane::Channel => scroll.on_scroll(Message::TimelineScrolled),
+            Pane::Thread => scroll,
+        };
+        container(scroll).height(Length::Fill).align_bottom(Length::Fill).into()
     }
 
     /// Replies shown under their root, indented behind an accent bar, with the
@@ -479,7 +495,8 @@ impl Chat {
         }
 
         let content: Element<'_, Message> = if continued {
-            container(body).padding(iced::Padding { left: GUTTER, ..iced::Padding::ZERO }).into()
+            // Full width, so the hover actions sit at the right edge, not over the text.
+            container(body).padding(iced::Padding { left: GUTTER, ..iced::Padding::ZERO }).width(Length::Fill).into()
         } else {
             let name = row![
                 text(self.store.display_name(post)).font(bold()).size(14).color(c.name_color(&post.user_id)),
@@ -490,6 +507,7 @@ impl Chat {
             let avatar = self.avatar(post, c);
             container(row![avatar, column![name, body].spacing(2)].spacing(GUTTER - AVATAR))
                 .padding(iced::Padding { top: 8.0, ..iced::Padding::ZERO })
+                .width(Length::Fill)
                 .into()
         };
 
@@ -511,7 +529,24 @@ impl Chat {
         } else if pane == Pane::Channel {
             actions = actions.push(chip("Unread", Message::MarkUnread(post.id.clone())));
         }
-        hover(content, container(actions).width(Length::Fill).align_x(iced::alignment::Horizontal::Right))
+        let post_el = hover(content, container(actions).width(Length::Fill).align_x(iced::alignment::Horizontal::Right));
+        let highlighted = self.highlight.as_ref().is_some_and(|(id, _)| *id == post.id);
+        if !highlighted && self.jump_target.as_deref() != Some(post.id.as_str()) {
+            return post_el;
+        }
+        let mut wrapped = container(post_el).width(Length::Fill);
+        if self.jump_target.as_deref() == Some(post.id.as_str()) {
+            wrapped = wrapped.id(crate::chat::JUMP_TARGET);
+        }
+        if highlighted {
+            let tint = iced::Color { a: 0.18, ..c.accent };
+            wrapped = wrapped.style(move |_: &Theme| container::Style {
+                background: Some(iced::Background::Color(tint)),
+                border: iced::Border { radius: 6.0.into(), ..Default::default() },
+                ..Default::default()
+            });
+        }
+        wrapped.into()
     }
 
     fn presence_color(&self, user_id: &str, c: Colors) -> Option<iced::Color> {

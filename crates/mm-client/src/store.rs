@@ -28,6 +28,10 @@ pub struct Timeline {
     /// The server has older posts than the oldest loaded one.
     pub has_more: bool,
     pub loading_older: bool,
+    /// Showing an older stretch (after a jump): the server has newer posts
+    /// than the newest loaded one, and live posts wait until they're paged in.
+    pub has_newer: bool,
+    pub loading_newer: bool,
 }
 
 impl Timeline {
@@ -240,7 +244,11 @@ impl Store {
                 t.upsert(post.clone());
             }
             if let Some(t) = self.timelines.get_mut(&post.channel_id) {
-                t.upsert(post);
+                // Past the end of an older stretch: it's paged in later.
+                let beyond = t.has_newer && t.entries.last().is_none_or(|e| post.create_at > e.post.create_at);
+                if !beyond {
+                    t.upsert(post);
+                }
             }
             return;
         }
@@ -254,6 +262,30 @@ impl Store {
         if let Some(t) = self.threads.get_mut(&post.root_id) {
             t.upsert(post);
         }
+    }
+
+    /// Replace a channel's posts with a stretch around a jump target.
+    pub fn set_window(&mut self, channel_id: &str, list: PostList, has_more: bool, has_newer: bool) {
+        let t = self.timelines.entry(channel_id.to_string()).or_default();
+        *t = Timeline { loaded: true, has_more, has_newer, ..Timeline::default() };
+        for p in list.posts.into_values() {
+            t.upsert(p);
+        }
+    }
+
+    /// Merge a page of newer posts into a stretch being viewed.
+    pub fn add_newer(&mut self, channel_id: &str, list: PostList) {
+        let Some(t) = self.timelines.get_mut(channel_id) else { return };
+        t.has_newer = !list.next_post_id.is_empty();
+        t.loading_newer = false;
+        for p in list.posts.into_values() {
+            t.upsert(p);
+        }
+    }
+
+    /// The newest loaded post, for fetching the page after it.
+    pub fn newest(&self, channel_id: &str) -> Option<&Post> {
+        self.timelines.get(channel_id)?.entries.last().map(|e| &e.post)
     }
 
     /// Merge a page of history (the newest page or an older one) into a channel.
@@ -524,5 +556,31 @@ mod tests {
         s.members.get_mut("c2").unwrap().notify_props.insert("mark_unread".into(), "mention".into());
         s.posted(post("p", "c2", "bob", 1), &[], false);
         assert!(!s.unread("c2").has_unread);
+    }
+
+    #[test]
+    fn older_stretch_holds_live_posts_until_paged_in() {
+        let mut s = store();
+        let list = |posts: Vec<Post>, next: &str| PostList {
+            order: posts.iter().map(|p| p.id.clone()).collect(),
+            posts: posts.into_iter().map(|p| (p.id.clone(), p)).collect(),
+            next_post_id: next.into(),
+            ..Default::default()
+        };
+        s.set_window("c1", list(vec![post("a", "c1", "bob", 1), post("b", "c1", "bob", 2)], ""), true, true);
+        // A live post is past the end of the stretch: it waits.
+        s.posted(post("live", "c1", "bob", 100), &[], true);
+        assert!(s.post("live").is_none());
+        // An edit to a post that's shown still applies.
+        s.edited(Post { message: "edited".into(), ..post("a", "c1", "bob", 1) });
+        assert_eq!(s.post("a").unwrap().message, "edited");
+        // Paging newer joins on; the last page clears has_newer, then live posts show.
+        s.add_newer("c1", list(vec![post("c", "c1", "bob", 3)], "d"));
+        assert!(s.timelines["c1"].has_newer);
+        s.add_newer("c1", list(vec![post("d", "c1", "bob", 4), post("live", "c1", "bob", 100)], ""));
+        assert!(!s.timelines["c1"].has_newer);
+        s.posted(post("next", "c1", "bob", 101), &[], true);
+        let ids: Vec<&str> = s.timelines["c1"].entries.iter().map(|e| e.post.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c", "d", "live", "next"]);
     }
 }
