@@ -4,6 +4,7 @@
 //!   MM_URL=... MM_LOGIN=alice MM_PASSWORD=... [MM_MFA=123456] cargo run -p mm-api --example smoke
 //!
 //! Prints the user, teams and channels, then streams events until Ctrl+C.
+//! With MM_UPLOAD=<path>, also posts that file to ~town-square of the first team.
 
 use mm_api::models::ChannelType;
 use mm_api::ws::{self, Message};
@@ -36,6 +37,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => format!("~{}", ch.name),
             };
             println!("  {name:<40} {:>4} unread", unread);
+        }
+        if let (Some(path), Some(ch)) = (env("MM_UPLOAD"), channels.iter().find(|c| c.name == "town-square")) {
+            let name = std::path::Path::new(&path).file_name().unwrap().to_string_lossy().into_owned();
+            let up = client.upload_file(&ch.id, &name, std::fs::read(&path)?).await?;
+            let file_ids: Vec<_> = up.file_infos.iter().map(|f| f.id.clone()).collect();
+            let post = mm_api::models::NewPost {
+                channel_id: ch.id.clone(),
+                message: format!("uploaded {name}"),
+                file_ids,
+                ..Default::default()
+            };
+            let p = client.create_post(&post).await?;
+            println!("  uploaded {name} -> post {} with {} file(s)", p.id, p.file_ids.len());
         }
         if let Some(ch) = channels.iter().find(|c| c.name == "town-square") {
             let posts = client.posts(&ch.id, PostsQuery::Page { page: 0, per_page: 5 }, true).await?;

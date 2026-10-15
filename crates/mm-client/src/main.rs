@@ -12,6 +12,10 @@ mod viewer;
 use app::App;
 
 fn main() -> iced::Result {
+    // RUST_LOG=mm_rust=debug logs every UI message (except the noisy ones).
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+        .init();
     style::set_font(omarchy_theme::monospace_font());
     let mut window = iced::window::Settings { size: iced::Size::new(1200.0, 800.0), ..Default::default() };
     // Wayland app id / X11 class, so Hyprland rules and .desktop files can match it.

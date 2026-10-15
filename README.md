@@ -27,10 +27,18 @@ cargo run -p mm-client                                   # login screen; the ses
 MM_URL=http://localhost:8065 MM_TOKEN=<token> cargo run -p mm-client   # skip the login screen
 ```
 
-Alt+Up / Alt+Down switch channels. Colors and font follow `omarchy theme set` live.
-The window class is `mm-rust`, for Hyprland rules.
+| Key | Action |
+|---|---|
+| Ctrl+K | Quick switcher (fuzzy, all teams) |
+| Alt+Up / Alt+Down | Previous / next channel |
+| Shift+Up | Open the thread of the latest message |
+| Ctrl+U | Attach files (drag-and-drop works too) |
+| Esc | Close switcher, then thread pane |
 
-`dev/drive.sh <pid> <wtype args>` sends keystrokes for UI testing, and refuses unless the app window has focus.
+Colors and font follow `omarchy theme set` live. The window class is `mm-rust`, for Hyprland rules.
+`RUST_LOG=mm_rust=debug` logs UI messages (tokens and login input are never logged).
+
+`dev/drive.sh <pid|title=…> <wtype args>` sends keystrokes for UI testing, and refuses unless that window has focus.
 
 ## Tests
 

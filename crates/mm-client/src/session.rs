@@ -6,11 +6,19 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub struct Session {
     pub server: String,
     pub token: String,
 }
+
+/// Never print the token: messages carrying a session get logged.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session").field("server", &self.server).field("token", &"<redacted>").finish()
+    }
+}
+
 
 fn path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("mm-rust/session.toml"))
@@ -41,5 +49,14 @@ impl Session {
 
     pub fn client(&self) -> Result<mm_api::Client, mm_api::Error> {
         Ok(mm_api::Client::new(&self.server)?.with_token(&self.token))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn debug_hides_token() {
+        let s = super::Session { server: "https://x".into(), token: "secret-token".into() };
+        assert!(!format!("{s:?}").contains("secret-token"));
     }
 }

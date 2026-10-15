@@ -160,8 +160,17 @@ impl Chat {
         if let Some(e) = &self.error {
             col = col.push(container(text(e).size(12).color(c.red)).padding([4, 20]));
         }
+        let attach = button(text("📎").size(16))
+            .padding([10, 12])
+            .on_press(Message::PickFiles)
+            .style(c.chip(false));
+        let composer = row![attach, composer].spacing(8).align_y(iced::Center);
         let typing = self.typing_line(&self.channel, "", c);
-        col.push(container(column![typing, composer].spacing(4)).padding(PANE_FOOTER))
+        let mut footer = column![typing].spacing(6);
+        if let Some(chips) = self.attachment_chips(c) {
+            footer = footer.push(chips);
+        }
+        col.push(container(footer.push(composer)).padding(PANE_FOOTER))
             .width(Length::Fill)
             .into()
     }
@@ -209,6 +218,33 @@ impl Chat {
         .height(Length::Fill)
         .style(c.panel(c.sidebar))
         .into()
+    }
+
+    fn attachment_chips(&self, c: Colors) -> Option<Element<'_, Message>> {
+        let chips: Vec<Element<'_, Message>> = self
+            .attachments
+            .iter()
+            .filter(|a| a.channel_id == self.channel)
+            .map(|a| {
+                let (status, color) = match &a.state {
+                    media::Upload::Uploading => ("uploading…".to_string(), c.muted),
+                    media::Upload::Done(_) => (String::new(), c.muted),
+                    media::Upload::Failed(e) => (format!("failed: {e}"), c.red),
+                };
+                let mut line = row![text("📎").size(13), text(&a.name).size(13).color(c.fg)].spacing(6).align_y(iced::Center);
+                if !status.is_empty() {
+                    line = line.push(text(status).size(11).color(color));
+                }
+                line = line.push(
+                    button(text("✕").size(11).color(c.muted))
+                        .padding([0, 4])
+                        .on_press(Message::RemoveAttachment(a.local_id))
+                        .style(c.link_button()),
+                );
+                container(line).padding([4, 10]).style(c.code_block()).into()
+            })
+            .collect();
+        (!chips.is_empty()).then(|| iced::widget::Row::with_children(chips).spacing(8).wrap().into())
     }
 
     fn typing_line(&self, channel_id: &str, parent_id: &str, c: Colors) -> Element<'_, Message> {

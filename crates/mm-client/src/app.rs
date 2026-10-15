@@ -68,6 +68,10 @@ pub enum Message {
     Media(crate::media::Key, Result<Vec<u8>, String>),
     OpenFile(String, String),
     Opened(Result<(), String>),
+    PickFiles,
+    Attach(Vec<std::path::PathBuf>),
+    Uploaded(u64, Result<String, String>),
+    RemoveAttachment(u64),
     OpenSwitcher,
     CloseSwitcher,
     SwitcherQuery(String),
@@ -138,6 +142,18 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            match &message {
+                // Login input carries the password; never log it.
+                Message::Login(..) => {}
+                Message::Ws(_) | Message::Tick | Message::Media(..) | Message::History(..) | Message::Thread(..) => {}
+                Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                    tracing::debug!("key {key:?} {modifiers:?}")
+                }
+                Message::Key(_) => {}
+                m => tracing::debug!("{m:?}"),
+            }
+        }
         match message {
             Message::ThemeChanged(theme) => {
                 self.colors = Colors::from_palette(&theme.palette);
@@ -213,6 +229,7 @@ impl App {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
                     ..
                 }) => Some(Message::Escape),
+                iced::Event::Window(iced::window::Event::FileDropped(path)) => Some(Message::Attach(vec![path])),
                 _ => None,
             }),
         ];

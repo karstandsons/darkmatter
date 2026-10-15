@@ -97,6 +97,28 @@ pub fn human_size(bytes: i64) -> String {
     }
 }
 
+/// A file attached to the composer, uploaded as soon as it's added.
+pub struct Pending {
+    pub local_id: u64,
+    pub channel_id: String,
+    pub name: String,
+    pub state: Upload,
+}
+
+pub enum Upload {
+    Uploading,
+    Done(String),
+    Failed(String),
+}
+
+/// Read a local file and upload it to a channel; returns the server file id.
+pub async fn upload(client: Client, channel_id: String, path: std::path::PathBuf) -> Result<String, String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+    let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
+    let result = client.upload_file(&channel_id, &name, bytes).await.map_err(|e| e.to_string())?;
+    result.file_infos.into_iter().next().map(|f| f.id).ok_or_else(|| "server returned no file".into())
+}
+
 /// Download an attachment into the cache dir and open it with the desktop's default app.
 pub async fn open_file(client: Client, file_id: String, name: String) -> Result<(), String> {
     // Only the final path component, so a crafted name can't escape the directory.
@@ -126,6 +148,35 @@ mod tests {
         assert_eq!(preview_size(1200, 300), (400.0, 100.0));
         assert_eq!(preview_size(100, 50), (100.0, 50.0));
         assert_eq!(preview_size(0, 0), (400.0, 180.0));
+    }
+
+    #[tokio::test]
+    async fn upload_posts_multipart_and_returns_file_id() {
+        use wiremock::matchers::{body_string_contains, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/files"))
+            .and(header("Authorization", "Bearer t"))
+            .and(body_string_contains("name=\"channel_id\""))
+            .and(body_string_contains("c1"))
+            .and(body_string_contains("filename=\"pic.png\""))
+            .and(body_string_contains("PNGDATA"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "file_infos": [{ "id": "f9", "name": "pic.png" }] })),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pic.png");
+        std::fs::write(&file, "PNGDATA").unwrap();
+        let client = Client::new(&server.uri()).unwrap().with_token("t");
+        assert_eq!(upload(client, "c1".into(), file).await.unwrap(), "f9");
+
+        let missing = upload(Client::new(&server.uri()).unwrap(), "c1".into(), dir.path().join("nope")).await;
+        assert!(missing.is_err());
     }
 
     #[test]

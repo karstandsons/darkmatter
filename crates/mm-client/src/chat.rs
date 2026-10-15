@@ -36,6 +36,9 @@ pub struct Chat {
     pub thread_draft: String,
     pub switcher: Option<Switcher>,
     pub media: media::Cache,
+    /// Files attached to the main composer, per channel, until sent.
+    pub attachments: Vec<media::Pending>,
+    next_local_id: u64,
     pub error: Option<String>,
 }
 
@@ -61,6 +64,8 @@ impl Chat {
             thread_draft: String::new(),
             switcher: None,
             media: media::Cache::default(),
+            attachments: Vec::new(),
+            next_local_id: 0,
             error: None,
         };
         Some((chat, Task::none()))
@@ -166,13 +171,31 @@ impl Chat {
             }
             Message::Send => {
                 let message = self.draft.trim().to_string();
-                if message.is_empty() || self.channel.is_empty() {
+                let here = |a: &&media::Pending| a.channel_id == self.channel;
+                if self.attachments.iter().filter(here).any(|a| matches!(a.state, media::Upload::Uploading)) {
+                    self.error = Some("Wait for uploads to finish".into());
+                    return Task::none();
+                }
+                let file_ids: Vec<String> = self
+                    .attachments
+                    .iter()
+                    .filter(here)
+                    .filter_map(|a| match &a.state {
+                        media::Upload::Done(id) => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if (message.is_empty() && file_ids.is_empty()) || self.channel.is_empty() {
                     return Task::none();
                 }
                 self.draft.clear();
+                self.error = None;
+                let channel = self.channel.clone();
+                self.attachments.retain(|a| a.channel_id != channel);
                 let post = NewPost {
                     channel_id: self.channel.clone(),
                     message,
+                    file_ids,
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
                     ..Default::default()
                 };
@@ -247,6 +270,49 @@ impl Chat {
                 self.error = Some(format!("Couldn't open file: {e}"));
                 Task::none()
             }
+            Message::PickFiles => Task::perform(
+                async {
+                    let files = rfd::AsyncFileDialog::new().set_title("Attach files").pick_files().await;
+                    files.unwrap_or_default().into_iter().map(|f| f.path().to_path_buf()).collect()
+                },
+                Message::Attach,
+            ),
+            Message::Attach(paths) => {
+                if self.channel.is_empty() {
+                    return Task::none();
+                }
+                let tasks: Vec<_> = paths
+                    .into_iter()
+                    .filter(|p| p.is_file())
+                    .map(|path| {
+                        self.next_local_id += 1;
+                        let local_id = self.next_local_id;
+                        self.attachments.push(media::Pending {
+                            local_id,
+                            channel_id: self.channel.clone(),
+                            name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                            state: media::Upload::Uploading,
+                        });
+                        Task::perform(media::upload(self.client.clone(), self.channel.clone(), path), move |r| {
+                            Message::Uploaded(local_id, r)
+                        })
+                    })
+                    .collect();
+                Task::batch(tasks)
+            }
+            Message::Uploaded(local_id, result) => {
+                if let Some(a) = self.attachments.iter_mut().find(|a| a.local_id == local_id) {
+                    a.state = match result {
+                        Ok(id) => media::Upload::Done(id),
+                        Err(e) => media::Upload::Failed(e),
+                    };
+                }
+                Task::none()
+            }
+            Message::RemoveAttachment(local_id) => {
+                self.attachments.retain(|a| a.local_id != local_id);
+                Task::none()
+            }
             Message::OpenSwitcher => {
                 let mut sw = Switcher::default();
                 sw.refresh(&self.store);
@@ -274,6 +340,12 @@ impl Chat {
                     self.team = team;
                 }
                 self.select_channel(id)
+            }
+            // Mattermost's upload shortcut.
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
+                if modifiers.command() && k.as_str() == "u" =>
+            {
+                self.update(Message::PickFiles)
             }
             Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
                 if modifiers.command() && k.as_str() == "k" =>
@@ -407,4 +479,70 @@ fn notify_mention(store: &Store, post: &Post) {
     let channel = store.channels.get(&post.channel_id).map(|c| store.channel_label(c)).unwrap_or_default();
     let title = format!("{} in {channel}", store.display_name(post));
     let _ = std::process::Command::new("notify-send").args(["-a", "Mattermost", &title, &post.message]).spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::Bootstrap;
+    use mm_api::models::{Channel, ChannelMember, User};
+
+    fn chat() -> Chat {
+        let b = Bootstrap {
+            session: Session { server: "http://localhost:1".into(), token: "t".into() },
+            me: User { id: "me".into(), ..Default::default() },
+            teams: vec![],
+            channels: vec![Channel { id: "c1".into(), ..Default::default() }],
+            members: vec![ChannelMember { channel_id: "c1".into(), ..Default::default() }],
+            users: vec![],
+        };
+        let (mut chat, _) = Chat::start(b).unwrap();
+        chat.channel = "c1".into();
+        chat
+    }
+
+    #[test]
+    fn attachments_gate_send_and_clear_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let mut chat = chat();
+
+        let _ = chat.handle(Message::Attach(vec![file, dir.path().join("missing")]));
+        assert_eq!(chat.attachments.len(), 1, "missing paths are skipped");
+        let id = chat.attachments[0].local_id;
+
+        // Can't send while the upload is in flight.
+        let _ = chat.handle(Message::Send);
+        assert_eq!(chat.attachments.len(), 1);
+        assert!(chat.error.is_some());
+
+        let _ = chat.handle(Message::Uploaded(id, Ok("f1".into())));
+        assert!(matches!(chat.attachments[0].state, media::Upload::Done(_)));
+
+        // A message with only a file is allowed, and sending clears the chips.
+        let _ = chat.handle(Message::Send);
+        assert!(chat.attachments.is_empty());
+        assert!(chat.error.is_none());
+    }
+
+    #[test]
+    fn attachments_stay_with_their_channel_and_can_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let mut chat = chat();
+        let _ = chat.handle(Message::Attach(vec![file.clone(), file]));
+        let first = chat.attachments[0].local_id;
+        let _ = chat.handle(Message::Uploaded(first, Err("too big".into())));
+        assert!(matches!(chat.attachments[0].state, media::Upload::Failed(_)));
+        let _ = chat.handle(Message::RemoveAttachment(first));
+        assert_eq!(chat.attachments.len(), 1);
+
+        // Sending in another channel leaves c1's attachment alone.
+        chat.channel = "c2".into();
+        chat.draft = "hi".into();
+        let _ = chat.handle(Message::Send);
+        assert_eq!(chat.attachments.len(), 1);
+    }
 }
