@@ -13,9 +13,8 @@ An Omarchy-themed Mattermost client in Rust, with a compatible Rust server to fo
 ## Dev server
 
 ```sh
-docker run -d --name mm-dev -p 8065:8065 mattermost/mattermost-preview
-# open http://localhost:8065, create the first (admin) user, then:
-MM_URL=http://localhost:8065 MM_LOGIN=<user> MM_PASSWORD=<pw> cargo run -p mm-api --example smoke
+dev/seed.sh   # starts mattermost-preview on :8065 with users alice/bob (password Devpass-123!)
+MM_URL=http://localhost:8065 MM_LOGIN=alice MM_PASSWORD='Devpass-123!' cargo run -p mm-api --example smoke
 ```
 
 The same example works against a real server with `MM_TOKEN` (a personal access token).
