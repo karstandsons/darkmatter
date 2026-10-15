@@ -658,12 +658,24 @@ impl Chat {
         }
         let post_el = hover(content, container(actions).width(Length::Fill).align_x(iced::alignment::Horizontal::Right));
         let highlighted = pv.highlight.as_ref().is_some_and(|(id, _)| *id == post.id);
-        if !highlighted && pv.jump_target.as_deref() != Some(post.id.as_str()) {
+        let selected = pv.selected.as_deref() == Some(post.id.as_str());
+        let target = pv.jump_target.as_deref() == Some(post.id.as_str());
+        if !highlighted && !selected && !target {
             return post_el;
         }
         let mut wrapped = container(post_el).width(Length::Fill);
-        if pv.jump_target.as_deref() == Some(post.id.as_str()) {
+        if target {
             wrapped = wrapped.id(pv.jump_target_id());
+        }
+        if selected {
+            // The vim-keys selection: outlined, so it's visible next to a highlight.
+            let accent = c.accent;
+            let wrapped = wrapped.id(pv.selected_id()).padding([2, 4]).style(move |_: &Theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color { a: 0.08, ..accent })),
+                border: iced::Border { color: accent, width: 1.0, radius: 6.0.into() },
+                ..Default::default()
+            });
+            return wrapped.into();
         }
         if highlighted {
             let tint = iced::Color { a: 0.18, ..c.accent };

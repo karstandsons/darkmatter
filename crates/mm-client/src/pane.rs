@@ -41,6 +41,8 @@ pub struct PaneView {
     pub compact: bool,
     /// The unified inbox (unread messages from every channel) instead of a channel.
     pub inbox: bool,
+    /// The message picked with the vim keys (j/k), acted on by r, e, o, …
+    pub selected: Option<String>,
 }
 
 impl PaneView {
@@ -58,6 +60,7 @@ impl PaneView {
             hold_top: None,
             compact: false,
             inbox: false,
+            selected: None,
         }
     }
 
@@ -75,6 +78,11 @@ impl PaneView {
 
     pub fn thread_composer(&self) -> Id {
         self.id("thread-composer")
+    }
+
+    /// The selected post's container, kept in view as the selection moves.
+    pub fn selected_id(&self) -> Id {
+        self.id("selected")
     }
 
     /// The jumped-to post's container, found by `locate`.

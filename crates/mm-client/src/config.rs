@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub theme: ThemeConfig,
     pub layout: LayoutConfig,
+    pub keys: KeysConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct KeysConfig {
+    /// Vim-style keys (j/k, r, e, …) when no text box has the cursor. On unless false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vim: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

@@ -557,6 +557,7 @@ impl App {
     fn start_chat(&mut self, b: Bootstrap) -> Task<Message> {
         let Some((mut chat, task)) = Chat::start(b) else { return Task::none() };
         chat.inline_threads = self.config.layout.inline_threads();
+        chat.vim_keys = self.config.keys.vim != Some(false);
         chat.set_default_density(self.config.layout.compact());
         let task = Task::batch([task, chat.open_panes()]);
         self.screen = Screen::Chat(Box::new(chat));

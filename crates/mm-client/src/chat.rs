@@ -53,6 +53,10 @@ pub struct Chat {
     pub focus: pane_grid::Pane,
     cur: pane_grid::Pane,
     next_pane: usize,
+    /// Vim-style keys when no text box has the cursor.
+    pub vim_keys: bool,
+    /// A `g` was pressed: another makes `gg`.
+    pending_g: bool,
     /// The channel pane focused most recently: where the inbox opens messages.
     last_channel_pane: Option<pane_grid::Pane>,
     /// The layout changed since it was last saved (saved a second later, so
@@ -292,6 +296,8 @@ impl Chat {
             next_pane,
             layout_dirty: false,
             last_channel_pane: None,
+            vim_keys: true,
+            pending_g: false,
             drafts: HashMap::new(),
             sending: None,
             online: false,
@@ -336,6 +342,103 @@ impl Chat {
             },
             Message::CustomEmoji,
         )
+    }
+
+    /// What j/k step through in a pane, top to bottom: (post, thread root, channel).
+    fn nav_items(&self, pv: &PaneView) -> Vec<(String, String, String)> {
+        let root_of = |p: &Post| if p.is_reply() { p.root_id.clone() } else { p.id.clone() };
+        if pv.inbox {
+            return self.store.inbox(&self.team).iter().map(|e| (e.post.id.clone(), root_of(&e.post), e.post.channel_id.clone())).collect();
+        }
+        let mut items = Vec::new();
+        for e in self.store.timelines.get(&pv.channel).into_iter().flat_map(|t| &t.entries) {
+            if e.post.is_system() {
+                continue;
+            }
+            items.push((e.post.id.clone(), e.post.id.clone(), e.post.channel_id.clone()));
+            // Replies shown inline, as the view shows them.
+            if pv.expanded.contains(&e.post.id)
+                && self.is_inline_in(pv, &e.post.id)
+                && let Some(t) = self.store.threads.get(&e.post.id)
+            {
+                let replies: Vec<_> = t.entries.iter().filter(|r| r.post.is_reply()).collect();
+                let hidden = if pv.all_replies.contains(&e.post.id) { 0 } else { replies.len().saturating_sub(crate::chat_view::INLINE_REPLIES) };
+                items.extend(replies[hidden..].iter().map(|r| (r.post.id.clone(), e.post.id.clone(), r.post.channel_id.clone())));
+            }
+        }
+        items
+    }
+
+    /// Move the selection by `by` (or to the first/last with `i64::MIN`/`MAX`)
+    /// and keep it in view.
+    fn select_step(&mut self, by: i64) -> Task<Message> {
+        let items = self.nav_items(self.pv());
+        if items.is_empty() {
+            return Task::none();
+        }
+        let last = items.len() as i64 - 1;
+        let at = self.pv().selected.as_ref().and_then(|s| items.iter().position(|(id, ..)| id == s)).map(|i| i as i64);
+        let next = match (at, by) {
+            (_, i64::MIN) => 0,
+            (_, i64::MAX) | (None, _) => last,
+            (Some(i), by) => (i + by).clamp(0, last),
+        };
+        self.pv_mut().selected = Some(items[next as usize].0.clone());
+        reveal(self.pv())
+    }
+
+    /// The selected message: (post, thread root, channel).
+    fn selection(&self) -> Option<(String, String, String)> {
+        let id = self.pv().selected.as_ref()?;
+        self.nav_items(self.pv()).into_iter().find(|(p, ..)| p == id)
+    }
+
+    /// A vim-style key, pressed with no text box focused.
+    fn vim_key(&mut self, key: &str) -> Task<Message> {
+        let gg = std::mem::take(&mut self.pending_g);
+        let selected = self.selection();
+        match key {
+            "j" => self.select_step(1),
+            "k" => self.select_step(-1),
+            "G" => self.select_step(i64::MAX),
+            "g" if gg => self.select_step(i64::MIN),
+            "g" => {
+                self.pending_g = true;
+                Task::none()
+            }
+            "h" => self.update(Message::FocusAdjacent(pane_grid::Direction::Left)),
+            "l" => self.update(Message::FocusAdjacent(pane_grid::Direction::Right)),
+            "i" => {
+                self.pv_mut().selected = None;
+                self.update(Message::FocusComposer)
+            }
+            "/" => self.update(Message::OpenSearch),
+            _ => {
+                let Some((post, root, channel)) = selected else { return Task::none() };
+                let message = match key {
+                    "r" => Message::OpenThread(root),
+                    "o" if self.pv().inbox => Message::InboxOpen(channel, root, post),
+                    "o" if self.pv().expanded.contains(&root) => Message::ToggleThread(root),
+                    // Show the replies without moving the cursor into the reply box.
+                    "o" => {
+                        let has_replies = self.store.post(&root).is_some_and(|p| p.reply_count > 0);
+                        if !has_replies || !self.is_inline(&root) {
+                            return Task::none();
+                        }
+                        self.hold_view(&root);
+                        self.pv_mut().expanded.insert(root.clone());
+                        return if self.store.threads.get(&root).is_some_and(|t| t.loaded) { Task::none() } else { self.load_thread(root) };
+                    }
+                    "e" => Message::EditPost(post),
+                    // Delete asks first: `dd`.
+                    "d" => Message::DeletePost(post),
+                    "+" => Message::OpenEmoji(post),
+                    "u" => Message::MarkUnread(post),
+                    _ => return Task::none(),
+                };
+                self.update(message)
+            }
+        }
     }
 
     /// Split the current pane and focus the new one.
@@ -411,6 +514,7 @@ impl Chat {
     fn select_channel(&mut self, id: String) -> Task<Message> {
         self.layout_dirty = true;
         self.pv_mut().inbox = false;
+        self.pv_mut().selected = None;
         if self.pv().thread.as_ref().is_some_and(|r| self.is_inline(r)) {
             self.pv_mut().thread = None;
         }
@@ -1442,6 +1546,13 @@ impl Chat {
             }
             Message::Escape if self.switcher.is_some() => self.update(Message::CloseSwitcher),
             Message::Escape if self.pv().thread.is_some() => self.update(Message::CloseThread),
+            // Nothing else to close: Esc steps out of the message box into the
+            // messages (vim keys), or drops the selection.
+            Message::Escape if self.vim_keys && self.pv().selected.is_some() => {
+                self.pv_mut().selected = None;
+                Task::none()
+            }
+            Message::Escape if self.vim_keys && self.switcher.is_none() && self.panel.is_none() => self.select_step(i64::MAX),
             Message::React(post_id, emoji, add) => {
                 let client = self.client.clone();
                 let me = self.store.me.id.clone();
@@ -1464,6 +1575,17 @@ impl Chat {
                     }
                 }
                 Task::none()
+            }
+            // Vim-style keys: only reach here when no text box took them.
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
+                if self.vim_keys
+                    && !modifiers.command()
+                    && !modifiers.alt()
+                    && self.switcher.is_none()
+                    && self.emoji_picker.is_none()
+                    && self.editing.is_none() =>
+            {
+                self.vim_key(k.as_str())
             }
             // Ctrl+D splits right, Ctrl+Shift+D down (like terminal splits); Ctrl+W closes.
             Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
@@ -1638,22 +1760,35 @@ fn notify_mention(store: &Store, post: &Post) {
 /// Find the jump target in the timeline, as the offset from the bottom that
 /// puts it a little below the top of the view.
 fn locate(pv: &PaneView) -> Task<Message> {
+    find(pv.timeline(), pv.jump_target_id(), false)
+}
+
+/// Scroll the pane just enough to show the selected post.
+fn reveal(pv: &PaneView) -> Task<Message> {
+    find(pv.timeline(), pv.selected_id(), true)
+}
+
+/// Find a container in a timeline and work out the bottom-anchored offset
+/// that puts it a little below the top (`minimal`: that just brings it into
+/// view, or `None` if it's already visible).
+fn find(timeline_id: Id, target_id: Id, minimal: bool) -> Task<Message> {
     use iced::advanced::widget::{Operation, operation::Outcome, operation::Scrollable};
     use iced::{Rectangle, Vector};
 
     struct Find {
         timeline_id: Id,
         target_id: Id,
-        timeline: Option<(Rectangle, Rectangle)>,
+        minimal: bool,
+        timeline: Option<(Rectangle, Rectangle, f32)>,
         target: Option<Rectangle>,
     }
     impl Operation<Option<f32>> for Find {
         fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Option<f32>>)) {
             operate(self);
         }
-        fn scrollable(&mut self, id: Option<&Id>, bounds: Rectangle, content: Rectangle, _: Vector, _: &mut dyn Scrollable) {
+        fn scrollable(&mut self, id: Option<&Id>, bounds: Rectangle, content: Rectangle, translation: Vector, _: &mut dyn Scrollable) {
             if id == Some(&self.timeline_id) {
-                self.timeline = Some((bounds, content));
+                self.timeline = Some((bounds, content, translation.y));
             }
         }
         fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
@@ -1665,13 +1800,23 @@ fn locate(pv: &PaneView) -> Task<Message> {
         fn finish(&self) -> Outcome<Option<f32>> {
             // Layout bounds ignore scrolling, so the target's distance from the
             // content's top is fixed; convert it to the bottom-anchored offset.
-            Outcome::Some(self.timeline.zip(self.target).map(|((view, content), target)| {
+            let max = |view: Rectangle, content: Rectangle| (content.height - view.height).max(0.0);
+            Outcome::Some(self.timeline.zip(self.target).and_then(|((view, content, scrolled), target)| {
                 let top = target.y - content.y;
-                (content.height - view.height - (top - 48.0)).clamp(0.0, (content.height - view.height).max(0.0))
+                let new_top = if !self.minimal {
+                    top - 48.0
+                } else if top < scrolled {
+                    top - 8.0
+                } else if top + target.height > scrolled + view.height {
+                    top + target.height - view.height + 8.0
+                } else {
+                    return None; // already in view
+                };
+                Some((content.height - view.height - new_top).clamp(0.0, max(view, content)))
             }))
         }
     }
-    let find = Find { timeline_id: pv.timeline(), target_id: pv.jump_target_id(), timeline: None, target: None };
+    let find = Find { timeline_id, target_id, minimal, timeline: None, target: None };
     iced::advanced::widget::operate(find).map(Message::JumpLocated)
 }
 
@@ -1947,5 +2092,57 @@ mod tests {
         assert_eq!(chat.panes.len(), 1);
         // A late result for the closed pane is dropped.
         let _ = chat.update(Message::InPane(first, Box::new(Message::JumpLocated(Some(10.0)))));
+    }
+
+    #[test]
+    fn vim_keys_move_the_selection_and_act_on_it() {
+        let mut chat = chat();
+        with_post(&mut chat, "a", "bob", 1);
+        with_post(&mut chat, "b", "bob", 2);
+        with_post(&mut chat, "c", "me", 3);
+        let key = |k: &str| {
+            Message::Key(keyboard::Event::KeyPressed {
+                key: Key::Character(k.into()),
+                modified_key: Key::Character(k.into()),
+                physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            })
+        };
+        let selected = |chat: &Chat| chat.pv().selected.clone();
+        // Esc out of the message box selects the newest message.
+        let _ = chat.update(Message::Escape);
+        assert_eq!(selected(&chat).as_deref(), Some("c"));
+        let _ = chat.update(key("k"));
+        let _ = chat.update(key("k"));
+        let _ = chat.update(key("k"));
+        assert_eq!(selected(&chat).as_deref(), Some("a"), "stops at the top");
+        let _ = chat.update(key("G"));
+        assert_eq!(selected(&chat).as_deref(), Some("c"));
+        let _ = chat.update(key("g"));
+        let _ = chat.update(key("g"));
+        assert_eq!(selected(&chat).as_deref(), Some("a"), "gg");
+        // e edits only your own; dd deletes after confirming.
+        let _ = chat.update(key("e"));
+        assert!(chat.editing.is_none());
+        let _ = chat.update(key("G"));
+        let _ = chat.update(key("e"));
+        assert_eq!(chat.editing.as_ref().map(|e| e.post_id.as_str()), Some("c"));
+        let _ = chat.update(Message::Escape);
+        let _ = chat.update(key("d"));
+        assert_eq!(chat.confirm_delete.as_deref(), Some("c"));
+        // i goes back to typing; Esc with a selection just drops it.
+        let _ = chat.update(key("i"));
+        assert!(selected(&chat).is_none());
+        let _ = chat.update(Message::Escape);
+        let _ = chat.update(Message::Escape);
+        assert!(selected(&chat).is_none());
+
+        // Off in the config: letters do nothing.
+        chat.vim_keys = false;
+        let _ = chat.update(key("j"));
+        assert!(selected(&chat).is_none());
     }
 }
