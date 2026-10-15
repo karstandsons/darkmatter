@@ -235,3 +235,33 @@ async fn people_and_channel_discovery() {
     assert!(matches!(ro.create_direct("u1", "u2").await, Err(Error::ReadOnly(_))));
     assert!(matches!(ro.join_channel("c9", "u1").await, Err(Error::ReadOnly(_))));
 }
+
+#[tokio::test]
+async fn search_and_threads() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/teams/t1/posts/search"))
+        .and(body_json(json!({ "terms": "@alice", "is_or_search": false, "page": 0, "per_page": 40, "include_deleted_channels": false })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "order": ["p1"], "posts": { "p1": { "id": "p1", "message": "hi @alice" } } })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/users/me/teams/t1/threads"))
+        .and(query_param("extended", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total": 1, "total_unread_threads": 1, "total_unread_mentions": 0,
+            "threads": [{ "id": "r1", "reply_count": 2, "participants": null, "post": { "id": "r1" }, "unread_replies": 1 }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT")).and(path("/api/v4/users/me/teams/t1/threads/r1/read/123")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+
+    let client = Client::new(&server.uri()).unwrap().with_token("t");
+    assert_eq!(client.search_posts("t1", "@alice").await.unwrap().order, ["p1"]);
+    let threads = client.user_threads("t1").await.unwrap();
+    assert_eq!((threads.total_unread_threads, threads.threads[0].unread_replies), (1, 1));
+    client.mark_thread_read("t1", "r1", 123).await.unwrap();
+    let ro = Client::new(&server.uri()).unwrap().with_token("t").read_only(true);
+    assert!(ro.search_posts("t1", "@alice").await.is_ok());
+    assert!(matches!(ro.mark_thread_read("t1", "r1", 123).await, Err(Error::ReadOnly(_))));
+}

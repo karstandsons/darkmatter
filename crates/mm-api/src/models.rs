@@ -278,6 +278,35 @@ pub struct FileInfo {
     pub mini_preview: Option<String>,
 }
 
+/// A followed thread (collapsed threads), as listed in the threads inbox.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct UserThread {
+    /// The root post id.
+    pub id: Id,
+    pub reply_count: i64,
+    pub last_reply_at: Millis,
+    pub last_viewed_at: Millis,
+    #[serde(deserialize_with = "nullable")]
+    pub participants: Vec<User>,
+    #[serde(deserialize_with = "nullable")]
+    pub post: Post,
+    pub unread_replies: i64,
+    pub unread_mentions: i64,
+    pub is_urgent: bool,
+    pub delete_at: Millis,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct UserThreads {
+    pub total: i64,
+    pub total_unread_threads: i64,
+    pub total_unread_mentions: i64,
+    #[serde(deserialize_with = "nullable")]
+    pub threads: Vec<UserThread>,
+}
+
 /// Read state of a channel after "mark as unread": counts of messages already read.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]

@@ -156,6 +156,24 @@ impl Client {
         self.send_unit(Method::POST, "channels/members/me/view", Some(&body)).await
     }
 
+    /// Full-text search in a team (Mattermost's search syntax: `from:`, `in:`, quotes…).
+    pub async fn search_posts(&self, team_id: &str, terms: &str) -> Result<PostList, Error> {
+        let body = json!({ "terms": terms, "is_or_search": false, "page": 0, "per_page": 40, "include_deleted_channels": false });
+        self.send(Method::POST, &format!("teams/{team_id}/posts/search"), Some(&body)).await
+    }
+
+    /// Threads you follow in a team, newest activity first, with participants.
+    pub async fn user_threads(&self, team_id: &str) -> Result<UserThreads, Error> {
+        let path = format!("users/me/teams/{team_id}/threads");
+        let req = self.request(Method::GET, &path)?.query(&[("extended", "true"), ("per_page", "30")]);
+        decode(&path, check(req.send().await?).await?).await
+    }
+
+    pub async fn mark_thread_read(&self, team_id: &str, thread_id: &str, at: Millis) -> Result<(), Error> {
+        let path = format!("users/me/teams/{team_id}/threads/{thread_id}/read/{at}");
+        self.send_unit(Method::PUT, &path, None::<&()>).await
+    }
+
     /// Mark the channel unread from this post on (inclusive).
     pub async fn set_unread(&self, user_id: &str, post_id: &str) -> Result<ChannelUnreadAt, Error> {
         let body = json!({ "collapsed_threads_supported": true });

@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as Frame;
 use url::Url;
 
-use crate::models::{Post, Reaction};
+use crate::models::{Post, Reaction, UserThread};
 use crate::{Client, Error};
 
 /// No frame (the server pings every ~30s) for this long means the link is dead.
@@ -48,6 +48,10 @@ pub enum Event {
     ReactionAdded(Reaction),
     ReactionRemoved(Reaction),
     ChannelViewed { channel_id: String },
+    /// A followed thread got a reply (or changed); carries the whole thread.
+    ThreadUpdated(Box<UserThread>),
+    ThreadReadChanged { thread_id: String, unread_replies: i64, unread_mentions: i64 },
+    ThreadFollowChanged { thread_id: String, following: bool },
     /// Any event without a typed variant yet.
     Other(RawEvent),
 }
@@ -77,6 +81,10 @@ impl RawEvent {
         self.data.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
     }
 
+    fn int(&self, key: &str) -> i64 {
+        self.data.get(key).and_then(Value::as_i64).unwrap_or_default()
+    }
+
     /// Posts and reactions are sent as JSON-encoded strings inside `data`.
     fn nested<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
         serde_json::from_str(self.data.get(key)?.as_str()?).ok()
@@ -104,6 +112,16 @@ impl RawEvent {
             "reaction_added" => self.nested("reaction").map(Event::ReactionAdded),
             "reaction_removed" => self.nested("reaction").map(Event::ReactionRemoved),
             "channel_viewed" => Some(Event::ChannelViewed { channel_id: self.str("channel_id") }),
+            "thread_updated" => self.nested("thread").map(Event::ThreadUpdated),
+            "thread_read_changed" if !self.str("thread_id").is_empty() => Some(Event::ThreadReadChanged {
+                thread_id: self.str("thread_id"),
+                unread_replies: self.int("unread_replies"),
+                unread_mentions: self.int("unread_mentions"),
+            }),
+            "thread_follow_changed" => Some(Event::ThreadFollowChanged {
+                thread_id: self.str("thread_id"),
+                following: self.data.get("state").and_then(Value::as_bool).unwrap_or(false),
+            }),
             _ => None,
         };
         typed.unwrap_or(Event::Other(self))

@@ -65,3 +65,15 @@ fn nulls_from_the_server_become_defaults() {
     let post: mm_api::models::Post = serde_json::from_str(r#"{"id":"p2","metadata":null}"#).unwrap();
     assert!(post.metadata.files.is_empty());
 }
+
+#[test]
+fn thread_events() {
+    let Event::ThreadUpdated(t) = fixture("thread_updated") else { panic!() };
+    assert_eq!((t.id.as_str(), t.unread_replies, t.unread_mentions), ("r1aaaaaaaaaaaaaaaaaaaaaaaa", 2, 1));
+    assert_eq!(t.participants[0].username, "bob");
+    assert_eq!(t.post.message, "Thread test");
+    assert_eq!(
+        fixture("thread_read_changed"),
+        Event::ThreadReadChanged { thread_id: "r1aaaaaaaaaaaaaaaaaaaaaaaa".into(), unread_replies: 0, unread_mentions: 0 }
+    );
+}

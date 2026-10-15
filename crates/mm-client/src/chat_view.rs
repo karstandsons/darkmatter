@@ -35,6 +35,8 @@ impl Chat {
         layout = layout.push(self.sidebar(c)).push(self.main(c, theme));
         if let Some(root) = &self.thread {
             layout = layout.push(rule::vertical(1)).push(self.thread_pane(root, c, theme));
+        } else if let Some(panel) = &self.panel {
+            layout = layout.push(rule::vertical(1)).push(self.panel_view(panel, c, theme));
         }
         match (&self.switcher, &self.emoji_picker) {
             (Some(sw), _) => stack![layout, sw.view(&self.store, c)].into(),
@@ -101,7 +103,7 @@ impl Chat {
         };
         let section = |label: &'static str| text(label).size(11).font(bold()).color(c.muted);
 
-        let mut list = column![section("CHANNELS")].spacing(2);
+        let mut list = column![self.threads_entry(c), space().height(10), section("CHANNELS")].spacing(2);
         for ch in regular {
             list = list.push(item(ch));
         }

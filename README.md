@@ -29,7 +29,9 @@ MM_URL=http://localhost:8065 MM_TOKEN=<token> cargo run -p mm-client   # skip th
 
 | Key | Action |
 |---|---|
-| Ctrl+K | Quick switcher (fuzzy, all teams) |
+| Ctrl+K | Quick switcher: channels, people (new DM), channels to join |
+| Ctrl+F | Search messages |
+| Ctrl+Shift+M | Recent mentions |
 | Alt+Up / Alt+Down | Previous / next channel |
 | Up (empty composer) | Edit your last message (Esc cancels) |
 | Shift+Up | Open the thread of the latest message |

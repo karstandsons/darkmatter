@@ -20,6 +20,22 @@ pub const COMPOSER: &str = "composer";
 pub const TIMELINE: &str = "timeline";
 pub const THREAD: &str = "thread";
 pub const THREAD_COMPOSER: &str = "thread-composer";
+pub const SEARCH_INPUT: &str = "search-input";
+
+/// What the right side shows when no thread is open on top of it.
+pub enum Panel {
+    Search(SearchPane),
+    Threads,
+}
+
+pub struct SearchPane {
+    pub input: String,
+    /// The terms the results are for ("" before the first search).
+    pub terms: String,
+    pub mentions: bool,
+    /// None while loading.
+    pub results: Option<Result<Vec<crate::store::Entry>, String>>,
+}
 const TYPING_TTL: Duration = Duration::from_secs(6);
 
 pub struct Chat {
@@ -38,6 +54,7 @@ pub struct Chat {
     /// Root post id of the thread shown in the right pane.
     pub thread: Option<String>,
     pub switcher: Option<Switcher>,
+    pub panel: Option<Panel>,
     pub media: media::Cache,
     /// Files attached to the main composer, per channel, until sent.
     pub attachments: Vec<media::Pending>,
@@ -101,6 +118,7 @@ impl Chat {
             typing: HashMap::new(),
             thread: None,
             switcher: None,
+            panel: None,
             media: media::Cache::default(),
             attachments: Vec::new(),
             viewport: None,
@@ -117,7 +135,8 @@ impl Chat {
         };
         let mut chat = chat;
         let statuses = chat.load_statuses();
-        Some((chat, statuses))
+        let threads = chat.load_user_threads();
+        Some((chat, Task::batch([statuses, threads])))
     }
 
     pub fn open_default_channel(&mut self) -> Task<Message> {
@@ -235,6 +254,38 @@ impl Chat {
         Task::perform(async move { client.edit_post(&id, text.trim()).await.map_err(err) }, Message::Edited)
     }
 
+    fn load_user_threads(&self) -> Task<Message> {
+        let (client, team) = (self.client.clone(), self.team.clone());
+        if team.is_empty() {
+            return Task::none();
+        }
+        Task::perform(async move { client.user_threads(&team).await.map_err(err) }, Message::ThreadsLoaded)
+    }
+
+    fn search(&mut self, terms: String, mentions: bool) -> Task<Message> {
+        self.panel = Some(Panel::Search(SearchPane { input: terms.clone(), terms: terms.clone(), mentions, results: None }));
+        let (client, team) = (self.client.clone(), self.team.clone());
+        Task::perform(
+            async move {
+                let r = client.search_posts(&team, &terms).await.map_err(err);
+                (terms, r)
+            },
+            |(terms, r)| Message::SearchResults(terms, r),
+        )
+    }
+
+    /// Fetch users we don't know yet (e.g. authors of search results).
+    fn load_users(&self, ids: impl IntoIterator<Item = String>) -> Task<Message> {
+        let mut ids: Vec<String> = ids.into_iter().filter(|id| !id.is_empty() && !self.store.users.contains_key(id)).collect();
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            return Task::none();
+        }
+        let client = self.client.clone();
+        Task::perform(async move { client.users_by_ids(&ids).await.map_err(err) }, Message::Users)
+    }
+
     fn load_statuses(&mut self) -> Task<Message> {
         let ids = self.store.missing_statuses();
         if ids.is_empty() {
@@ -287,7 +338,8 @@ impl Chat {
         match message {
             Message::SelectTeam(id) => {
                 self.team = id;
-                self.open_default_channel()
+                self.store.set_user_threads(Vec::new());
+                Task::batch([self.open_default_channel(), self.load_user_threads()])
             }
             Message::SelectChannel(id) => self.select_channel(id),
             Message::History(id, Ok(list)) => {
@@ -404,6 +456,19 @@ impl Chat {
             }
             Message::OpenThread(root) => {
                 self.thread = Some(root.clone());
+                let mark_read = match self.store.user_threads.iter().find(|t| t.id == root) {
+                    Some(t) if t.unread_replies > 0 || t.unread_mentions > 0 => {
+                        self.store.thread_read(&root, 0, 0);
+                        if self.client.is_read_only() {
+                            Task::none()
+                        } else {
+                            let (client, team, id) = (self.client.clone(), self.team.clone(), root.clone());
+                            let now = chrono::Utc::now().timestamp_millis();
+                            Task::future(async move { client.mark_thread_read(&team, &id, now).await }).discard()
+                        }
+                    }
+                    _ => Task::none(),
+                };
                 let load = if self.store.threads.get(&root).is_some_and(|t| t.loaded) {
                     Task::none()
                 } else {
@@ -416,7 +481,7 @@ impl Chat {
                         |(root, r)| Message::Thread(root, r),
                     )
                 };
-                Task::batch([load, operation::snap_to_end(THREAD), operation::focus(THREAD_COMPOSER)])
+                Task::batch([load, mark_read, operation::snap_to_end(THREAD), operation::focus(THREAD_COMPOSER)])
             }
             Message::CloseThread => {
                 self.thread = None;
@@ -611,6 +676,73 @@ impl Chat {
                 self.cancel_edit();
                 Task::none()
             }
+            Message::OpenSearch => {
+                if !matches!(self.panel, Some(Panel::Search(ref p)) if !p.mentions) {
+                    self.panel = Some(Panel::Search(SearchPane {
+                        input: String::new(),
+                        terms: String::new(),
+                        mentions: false,
+                        results: Some(Ok(Vec::new())),
+                    }));
+                }
+                self.thread = None;
+                operation::focus(SEARCH_INPUT)
+            }
+            Message::OpenMentions => {
+                self.thread = None;
+                let terms = format!("@{}", self.store.me.username);
+                self.search(terms, true)
+            }
+            Message::OpenThreads => {
+                self.thread = None;
+                self.panel = Some(Panel::Threads);
+                self.load_user_threads()
+            }
+            Message::ClosePanel => {
+                self.panel = None;
+                operation::focus(COMPOSER)
+            }
+            Message::SearchInput(text) => {
+                if let Some(Panel::Search(p)) = &mut self.panel {
+                    p.input = text;
+                }
+                Task::none()
+            }
+            Message::RunSearch => match &self.panel {
+                Some(Panel::Search(p)) if !p.input.trim().is_empty() => {
+                    let terms = p.input.trim().to_string();
+                    self.search(terms, false)
+                }
+                _ => Task::none(),
+            },
+            Message::SearchResults(terms, result) => {
+                let Some(Panel::Search(p)) = &mut self.panel else { return Task::none() };
+                if p.terms != terms {
+                    return Task::none(); // a newer search replaced this one
+                }
+                let mut authors = Vec::new();
+                p.results = Some(result.map(|list| {
+                    // Search results come newest first in `order`.
+                    list.order
+                        .iter()
+                        .filter_map(|id| list.posts.get(id))
+                        .inspect(|post| authors.push(post.user_id.clone()))
+                        .map(|post| crate::store::Entry::new(post.clone()))
+                        .collect()
+                }));
+                self.load_users(authors)
+            }
+            Message::ThreadsLoaded(Ok(threads)) => {
+                let users: Vec<_> = threads.threads.iter().flat_map(|t| t.participants.iter().cloned()).collect();
+                self.store.add_users(users);
+                self.store.set_user_threads(threads.threads);
+                Task::none()
+            }
+            Message::ThreadsLoaded(Err(e)) => {
+                tracing::warn!("couldn't load threads: {e}");
+                Task::none()
+            }
+            Message::Escape if self.thread.is_none() && self.panel.is_some() => self.update(Message::ClosePanel),
             Message::OpenSwitcher => {
                 let mut sw = Switcher::default();
                 sw.refresh(&self.store);
@@ -732,6 +864,16 @@ impl Chat {
             Message::Left(_, Err(e)) => {
                 self.error = Some(format!("Couldn't leave: {e}"));
                 Task::none()
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
+                if modifiers.command() && !modifiers.shift() && k.as_str() == "f" =>
+            {
+                self.update(Message::OpenSearch)
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
+                if modifiers.command() && modifiers.shift() && k.eq_ignore_ascii_case("m") =>
+            {
+                self.update(Message::OpenMentions)
             }
             // Mattermost's upload shortcut.
             Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
@@ -914,6 +1056,25 @@ impl Chat {
                 self.store.mark_viewed(&channel_id);
                 Task::none()
             }
+            M::Event(Event::ThreadUpdated(thread)) => {
+                let mut thread = *thread;
+                // Reading it right now: don't count it as unread.
+                if self.thread.as_deref() == Some(thread.id.as_str()) {
+                    thread.unread_replies = 0;
+                    thread.unread_mentions = 0;
+                }
+                self.store.add_users(thread.participants.clone());
+                self.store.upsert_user_thread(thread);
+                Task::none()
+            }
+            M::Event(Event::ThreadReadChanged { thread_id, unread_replies, unread_mentions }) => {
+                self.store.thread_read(&thread_id, unread_replies, unread_mentions);
+                Task::none()
+            }
+            M::Event(Event::ThreadFollowChanged { thread_id, following: false }) => {
+                self.store.unfollow(&thread_id);
+                Task::none()
+            }
             M::Event(Event::StatusChange { user_id, status }) => {
                 self.store.statuses.insert(user_id, status);
                 Task::none()
@@ -1077,6 +1238,34 @@ mod tests {
         assert!(chat.confirm_delete.is_none());
         let _ = chat.handle(Message::Left("c1".into(), Ok(())));
         assert!(!chat.store.channels.contains_key("c1") && !chat.store.members.contains_key("c1"));
+    }
+
+    #[test]
+    fn opening_an_unread_thread_clears_it_and_esc_closes_layers() {
+        let mut chat = chat();
+        let unread = mm_api::models::UserThread { id: "r1".into(), unread_replies: 2, unread_mentions: 1, ..Default::default() };
+        chat.store.set_user_threads(vec![unread]);
+        let _ = chat.handle(Message::OpenThreads);
+        let _ = chat.handle(Message::OpenThread("r1".into()));
+        assert_eq!(chat.store.thread_unreads(), (0, 0));
+        // Esc closes the thread first, then the inbox behind it.
+        let _ = chat.handle(Message::Escape);
+        assert!(chat.thread.is_none() && chat.panel.is_some());
+        let _ = chat.handle(Message::Escape);
+        assert!(chat.panel.is_none());
+    }
+
+    #[test]
+    fn stale_search_results_are_dropped() {
+        let mut chat = chat();
+        let _ = chat.handle(Message::OpenSearch);
+        let _ = chat.handle(Message::SearchInput("first".into()));
+        let _ = chat.handle(Message::RunSearch);
+        let _ = chat.handle(Message::SearchInput("second".into()));
+        let _ = chat.handle(Message::RunSearch);
+        let _ = chat.handle(Message::SearchResults("first".into(), Ok(Default::default())));
+        let Some(Panel::Search(p)) = &chat.panel else { panic!() };
+        assert!(p.results.is_none(), "still waiting for 'second'");
     }
 
     #[test]

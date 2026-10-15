@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use iced::widget::markdown;
-use mm_api::models::{Channel, ChannelMember, ChannelType, Id, Post, PostList, Reaction, Team, User};
+use mm_api::models::{Channel, ChannelMember, ChannelType, Id, Post, PostList, Reaction, Team, User, UserThread};
 
 use crate::text;
 
@@ -14,7 +14,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    fn new(post: Post) -> Self {
+    pub fn new(post: Post) -> Self {
         let markdown = markdown::parse(&text::prepare(&post.message)).collect();
         Entry { post, markdown }
     }
@@ -61,6 +61,8 @@ pub struct Store {
     counted_replies: HashSet<Id>,
     /// Presence by user id: `online`, `away`, `dnd` or `offline`.
     pub statuses: HashMap<Id, String>,
+    /// Followed threads in the current team, most recent activity first.
+    pub user_threads: Vec<UserThread>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +85,7 @@ impl Store {
             threads: HashMap::new(),
             counted_replies: HashSet::new(),
             statuses: HashMap::new(),
+            user_threads: Vec::new(),
         }
     }
 
@@ -93,6 +96,34 @@ impl Store {
         for m in members {
             self.members.insert(m.channel_id.clone(), m);
         }
+    }
+
+    pub fn set_user_threads(&mut self, threads: Vec<UserThread>) {
+        self.user_threads = threads;
+    }
+
+    /// A thread changed (new reply, edit…): replace it and move it to the top.
+    pub fn upsert_user_thread(&mut self, thread: UserThread) {
+        self.user_threads.retain(|t| t.id != thread.id);
+        self.user_threads.insert(0, thread);
+        self.user_threads.sort_by_key(|t| std::cmp::Reverse(t.last_reply_at));
+    }
+
+    pub fn thread_read(&mut self, id: &str, unread_replies: i64, unread_mentions: i64) {
+        if let Some(t) = self.user_threads.iter_mut().find(|t| t.id == id) {
+            t.unread_replies = unread_replies;
+            t.unread_mentions = unread_mentions;
+        }
+    }
+
+    pub fn unfollow(&mut self, id: &str) {
+        self.user_threads.retain(|t| t.id != id);
+    }
+
+    /// (threads with unread replies, unread mentions in threads)
+    pub fn thread_unreads(&self) -> (usize, i64) {
+        let threads = self.user_threads.iter().filter(|t| t.unread_replies > 0).count();
+        (threads, self.user_threads.iter().map(|t| t.unread_mentions).sum())
     }
 
     /// Known users whose presence we haven't fetched yet.
@@ -470,6 +501,21 @@ mod tests {
         // A later resync of the newest page doesn't reset that.
         s.set_history("c1", page(&[("p4", 40)], "p3"));
         assert!(!s.timelines["c1"].has_more);
+    }
+
+    #[test]
+    fn threads_inbox_bookkeeping() {
+        let mut s = store();
+        let t = |id: &str, at: i64, unread: i64| UserThread { id: id.into(), last_reply_at: at, unread_replies: unread, ..Default::default() };
+        s.set_user_threads(vec![t("a", 20, 0), t("b", 10, 2)]);
+        assert_eq!(s.thread_unreads(), (1, 0));
+        s.upsert_user_thread(UserThread { unread_mentions: 1, ..t("b", 30, 3) });
+        assert_eq!(s.user_threads.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        assert_eq!(s.thread_unreads(), (1, 1));
+        s.thread_read("b", 0, 0);
+        assert_eq!(s.thread_unreads(), (0, 0));
+        s.unfollow("a");
+        assert_eq!(s.user_threads.len(), 1);
     }
 
     #[test]
