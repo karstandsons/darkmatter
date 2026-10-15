@@ -8,7 +8,7 @@ pkgver=0.1.0.r29.gd40e7e4
 pkgrel=1
 pkgdesc="Darkmatter: an Omarchy-themed Mattermost client"
 arch=('x86_64' 'aarch64')
-url="https://github.com/ckarst/darkmatter"
+url="https://github.com/karstandsons/darkmatter"
 license=('Apache-2.0')
 # Linked: glibc, gcc-libs. Loaded at runtime: Wayland/X11, xkbcommon, and a GPU
 # driver through Vulkan (it falls back to a CPU renderer without one).
