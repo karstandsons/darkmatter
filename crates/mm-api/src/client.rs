@@ -14,6 +14,13 @@ pub struct Client {
     http: reqwest::Client,
     base: Url,
     token: Option<String>,
+    read_only: bool,
+}
+
+/// POSTs that only read, allowed in read-only mode (paths relative to `/api/v4/`).
+fn read_only_post(path: &str) -> bool {
+    matches!(path, "users/login" | "users/logout" | "users/ids" | "users/status/ids" | "users/usernames")
+        || (path.starts_with("teams/") && path.ends_with("/posts/search"))
 }
 
 /// Which slice of a channel's history to fetch.
@@ -34,13 +41,24 @@ impl Client {
         if !base.path().ends_with('/') {
             base.set_path(&format!("{}/", base.path()));
         }
-        Ok(Client { http: reqwest::Client::new(), base: base.join("api/v4/")?, token: None })
+        Ok(Client { http: reqwest::Client::new(), base: base.join("api/v4/")?, token: None, read_only: false })
     }
 
     /// Use an existing session or personal access token.
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self
+    }
+
+    /// Refuse every request that could change server state (posting, reacting,
+    /// marking read, joining…). Reads, login and search still work.
+    pub fn read_only(mut self, on: bool) -> Self {
+        self.read_only = on;
+        self
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn token(&self) -> Option<&str> {
@@ -59,14 +77,14 @@ impl Client {
         if let Some(code) = mfa {
             body["token"] = code.into();
         }
-        let resp = check(self.http.post(self.url("users/login")?).json(&body).send().await?).await?;
+        let resp = check(self.request(Method::POST, "users/login")?.json(&body).send().await?).await?;
         let token = resp
             .headers()
             .get("Token")
             .and_then(|v| v.to_str().ok())
             .ok_or(Error::MissingToken)?
             .to_string();
-        let user = resp.json().await?;
+        let user = decode("users/login", resp).await?;
         self.token = Some(token);
         Ok(user)
     }
@@ -111,7 +129,7 @@ impl Client {
                 req.query(&[("before", post_id), ("per_page", per_page.to_string())])
             }
         };
-        Ok(check(req.send().await?).await?.json().await?)
+        decode(&path, check(req.send().await?).await?).await
     }
 
     /// The root post and all its replies.
@@ -160,7 +178,7 @@ impl Client {
         let part = reqwest::multipart::Part::bytes(bytes).file_name(name.to_string());
         let form = reqwest::multipart::Form::new().text("channel_id", channel_id.to_string()).part("files", part);
         let req = self.request(Method::POST, "files")?.multipart(form);
-        Ok(check(req.send().await?).await?.json().await?)
+        decode("files", check(req.send().await?).await?).await
     }
 
     pub async fn file(&self, file_id: &str) -> Result<Vec<u8>, Error> {
@@ -194,6 +212,9 @@ impl Client {
     }
 
     fn request(&self, method: Method, path: &str) -> Result<RequestBuilder, Error> {
+        if self.read_only && method != Method::GET && !read_only_post(path) {
+            return Err(Error::ReadOnly(format!("{method} {path}")));
+        }
         let mut req = self.http.request(method, self.url(path)?).header("X-Requested-With", "XMLHttpRequest");
         if let Some(token) = &self.token {
             req = req.bearer_auth(token);
@@ -202,7 +223,7 @@ impl Client {
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
-        Ok(check(self.request(Method::GET, path)?.send().await?).await?.json().await?)
+        decode(path, check(self.request(Method::GET, path)?.send().await?).await?).await
     }
 
     async fn bytes(&self, path: &str) -> Result<Vec<u8>, Error> {
@@ -215,7 +236,7 @@ impl Client {
         path: &str,
         body: Option<&B>,
     ) -> Result<T, Error> {
-        Ok(self.send_raw(method, path, body).await?.json().await?)
+        decode(path, self.send_raw(method, path, body).await?).await
     }
 
     async fn send_unit<B: Serialize + ?Sized>(&self, method: Method, path: &str, body: Option<&B>) -> Result<(), Error> {
@@ -229,6 +250,17 @@ impl Client {
         }
         check(req.send().await?).await
     }
+}
+
+/// Parse a JSON body, reporting the exact field that didn't match on failure.
+async fn decode<T: DeserializeOwned>(endpoint: &str, resp: Response) -> Result<T, Error> {
+    let bytes = resp.bytes().await?;
+    let de = &mut serde_json::Deserializer::from_slice(&bytes);
+    serde_path_to_error::deserialize(de).map_err(|e| Error::Decode {
+        endpoint: endpoint.to_string(),
+        path: e.path().to_string(),
+        message: e.inner().to_string(),
+    })
 }
 
 /// Turn a non-2xx response into [`Error::Api`], keeping the server's message.

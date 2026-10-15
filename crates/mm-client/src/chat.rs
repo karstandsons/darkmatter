@@ -27,13 +27,15 @@ pub struct Chat {
     pub store: Store,
     pub team: String,
     pub channel: String,
-    pub draft: String,
+    /// Unsent text per composer: channel id, or `thread:<root id>`.
+    pub drafts: HashMap<String, String>,
+    /// The last message handed to the server, restored to its composer if sending fails.
+    sending: Option<(String, String)>,
     pub online: bool,
     /// (channel id, user id, thread root or "") -> when they last typed.
     pub typing: HashMap<(String, String, String), Instant>,
     /// Root post id of the thread shown in the right pane.
     pub thread: Option<String>,
-    pub thread_draft: String,
     pub switcher: Option<Switcher>,
     pub media: media::Cache,
     /// Files attached to the main composer, per channel, until sent.
@@ -42,7 +44,19 @@ pub struct Chat {
     pub error: Option<String>,
 }
 
+fn thread_key(root: &str) -> String {
+    format!("thread:{root}")
+}
+
 impl Chat {
+    pub fn draft(&self) -> &str {
+        self.drafts.get(&self.channel).map_or("", String::as_str)
+    }
+
+    pub fn thread_draft(&self) -> &str {
+        self.thread.as_ref().and_then(|r| self.drafts.get(&thread_key(r))).map_or("", String::as_str)
+    }
+
     /// Build the chat screen from a fresh bootstrap. The returned task does follow-up loads.
     pub fn start(b: crate::app::Bootstrap) -> Option<(Self, Task<Message>)> {
         let client = b.session.client().ok()?;
@@ -57,11 +71,11 @@ impl Chat {
             store,
             team,
             channel: String::new(),
-            draft: String::new(),
+            drafts: HashMap::new(),
+            sending: None,
             online: false,
             typing: HashMap::new(),
             thread: None,
-            thread_draft: String::new(),
             switcher: None,
             media: media::Cache::default(),
             attachments: Vec::new(),
@@ -88,7 +102,10 @@ impl Chat {
         let prev = std::mem::replace(&mut self.channel, id.clone());
         self.store.mark_viewed(&id);
         let client = self.client.clone();
-        let view = {
+        // Marking a channel read is a write; read-only mode skips it quietly.
+        let view = if client.is_read_only() {
+            Task::none()
+        } else {
             let id = id.clone();
             Task::future(async move { client.view_channel(&id, Some(&prev)).await }).discard()
         };
@@ -161,16 +178,24 @@ impl Chat {
                 self.store.add_users(users);
                 Task::none()
             }
-            Message::History(_, Err(e)) | Message::Users(Err(e)) | Message::Sent(Err(e)) => {
+            Message::Sent(Err(e)) => {
+                // Put the text back so nothing typed is lost (unless they've started a new one).
+                if let Some((key, text)) = self.sending.take() {
+                    self.drafts.entry(key).or_insert(text);
+                }
+                self.error = Some(e);
+                Task::none()
+            }
+            Message::History(_, Err(e)) | Message::Users(Err(e)) => {
                 self.error = Some(e);
                 Task::none()
             }
             Message::Draft(d) => {
-                self.draft = d;
+                self.drafts.insert(self.channel.clone(), d);
                 Task::none()
             }
             Message::Send => {
-                let message = self.draft.trim().to_string();
+                let message = self.draft().trim().to_string();
                 let here = |a: &&media::Pending| a.channel_id == self.channel;
                 if self.attachments.iter().filter(here).any(|a| matches!(a.state, media::Upload::Uploading)) {
                     self.error = Some("Wait for uploads to finish".into());
@@ -188,7 +213,8 @@ impl Chat {
                 if (message.is_empty() && file_ids.is_empty()) || self.channel.is_empty() {
                     return Task::none();
                 }
-                self.draft.clear();
+                let text = self.drafts.remove(&self.channel).unwrap_or_default();
+                self.sending = Some((self.channel.clone(), text));
                 self.error = None;
                 let channel = self.channel.clone();
                 self.attachments.retain(|a| a.channel_id != channel);
@@ -203,6 +229,7 @@ impl Chat {
                 Task::perform(async move { client.create_post(&post).await.map_err(err) }, Message::Sent)
             }
             Message::Sent(Ok(post)) => {
+                self.sending = None;
                 let in_thread = post.is_reply();
                 self.store.sent(post);
                 operation::snap_to_end(if in_thread { THREAD } else { TIMELINE })
@@ -236,11 +263,13 @@ impl Chat {
                 Task::none()
             }
             Message::ThreadDraft(d) => {
-                self.thread_draft = d;
+                if let Some(root) = &self.thread {
+                    self.drafts.insert(thread_key(root), d);
+                }
                 Task::none()
             }
             Message::SendReply => {
-                let message = self.thread_draft.trim().to_string();
+                let message = self.thread_draft().trim().to_string();
                 let Some(root) = self.thread.clone() else { return Task::none() };
                 let Some(channel_id) = self.store.post(&root).map(|p| p.channel_id.clone()) else {
                     return Task::none();
@@ -248,7 +277,9 @@ impl Chat {
                 if message.is_empty() {
                     return Task::none();
                 }
-                self.thread_draft.clear();
+                let key = thread_key(&root);
+                let text = self.drafts.remove(&key).unwrap_or_default();
+                self.sending = Some((key, text));
                 let post = NewPost {
                     channel_id,
                     message,
@@ -533,6 +564,27 @@ mod tests {
     }
 
     #[test]
+    fn drafts_are_per_channel_and_survive_failed_sends() {
+        let mut chat = chat();
+        let _ = chat.handle(Message::Draft("for c1".into()));
+        chat.channel = "c2".into();
+        assert_eq!(chat.draft(), "");
+        let _ = chat.handle(Message::Draft("for c2".into()));
+        chat.channel = "c1".into();
+        assert_eq!(chat.draft(), "for c1");
+
+        let _ = chat.handle(Message::Send);
+        assert_eq!(chat.draft(), "");
+        let _ = chat.handle(Message::Sent(Err("offline".into())));
+        assert_eq!(chat.draft(), "for c1", "failed send restores the text");
+
+        let _ = chat.handle(Message::Send);
+        let _ = chat.handle(Message::Draft("newer".into()));
+        let _ = chat.handle(Message::Sent(Err("offline".into())));
+        assert_eq!(chat.draft(), "newer", "a new draft isn't overwritten");
+    }
+
+    #[test]
     fn attachments_stay_with_their_channel_and_can_be_removed() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
@@ -547,7 +599,7 @@ mod tests {
 
         // Sending in another channel leaves c1's attachment alone.
         chat.channel = "c2".into();
-        chat.draft = "hi".into();
+        chat.drafts.insert("c2".into(), "hi".into());
         let _ = chat.handle(Message::Send);
         assert_eq!(chat.attachments.len(), 1);
     }

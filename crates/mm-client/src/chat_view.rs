@@ -121,15 +121,16 @@ impl Chat {
         .spacing(8)
         .align_y(iced::Center);
 
-        container(
-            column![
-                text(team.map_or("", |t| t.display_name.as_str())).size(17).font(bold()).color(c.fg_bright),
-                scrollable(list.padding([0, 4])).height(Length::Fill),
-                footer,
-            ]
-            .spacing(14)
-            .padding(12),
-        )
+        let mut col = column![
+            text(team.map_or("", |t| t.display_name.as_str())).size(17).font(bold()).color(c.fg_bright),
+            scrollable(list.padding([0, 4])).height(Length::Fill),
+        ]
+        .spacing(14)
+        .padding(12);
+        if self.client.is_read_only() {
+            col = col.push(text("● read-only: nothing is sent to the server").size(11).color(c.yellow));
+        }
+        container(col.push(footer))
         .width(250)
         .height(Length::Fill)
         .style(c.panel(c.sidebar))
@@ -153,7 +154,7 @@ impl Chat {
             _ => center(text("Loading…").color(c.muted)).into(),
         };
 
-        let composer = text_input(&format!("Message {}", self.store.channel_label(channel)), &self.draft)
+        let composer = text_input(&format!("Message {}", self.store.channel_label(channel)), self.draft())
             .id(COMPOSER)
             .on_input(Message::Draft)
             .on_submit(Message::Send)
@@ -200,7 +201,7 @@ impl Chat {
             Some(t) if t.loaded => self.timeline(&t.entries, Pane::Thread, c, theme),
             _ => center(text("Loading…").color(c.muted)).into(),
         };
-        let composer = text_input("Reply…", &self.thread_draft)
+        let composer = text_input("Reply…", self.thread_draft())
             .id(THREAD_COMPOSER)
             .on_input(Message::ThreadDraft)
             .on_submit(Message::SendReply)

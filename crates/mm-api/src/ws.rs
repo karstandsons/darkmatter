@@ -118,6 +118,7 @@ pub enum Action {
 
 /// Live event stream. Dropping it closes the socket.
 pub struct EventStream {
+    read_only: bool,
     rx: mpsc::Receiver<Message>,
     actions: mpsc::Sender<Action>,
     task: JoinHandle<()>,
@@ -130,6 +131,10 @@ impl EventStream {
 
     /// Tell others in the channel (or thread) that the user is typing.
     pub fn send(&self, action: Action) {
+        // Typing notifications are writes too.
+        if self.read_only {
+            return;
+        }
         let _ = self.actions.try_send(action);
     }
 }
@@ -147,7 +152,7 @@ pub fn connect(client: &Client) -> Result<EventStream, Error> {
     let (tx, rx) = mpsc::channel(256);
     let (actions, action_rx) = mpsc::channel(16);
     let task = tokio::spawn(run(url, headers, tx, action_rx));
-    Ok(EventStream { rx, actions, task })
+    Ok(EventStream { read_only: client.is_read_only(), rx, actions, task })
 }
 
 fn websocket_url(api: &Url) -> Result<Url, Error> {

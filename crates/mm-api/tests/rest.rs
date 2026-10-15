@@ -118,3 +118,50 @@ async fn subpath_servers_keep_their_prefix() {
     let client = Client::new(&format!("{}/chat", server.uri())).unwrap().with_token("t");
     assert_eq!(client.my_teams().await.unwrap()[0].display_name, "Home");
 }
+
+#[tokio::test]
+async fn read_only_allows_reads_and_refuses_writes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/users/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "u1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/users/ids"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    // Any write reaching the server fails this test.
+    Mock::given(method("POST")).and(path("/api/v4/posts")).respond_with(ResponseTemplate::new(500)).expect(0).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/channels/members/me/view"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(&server.uri()).unwrap().with_token("t").read_only(true);
+    assert_eq!(client.me().await.unwrap().id, "u1");
+    assert!(client.users_by_ids(&["u1".into()]).await.is_ok());
+
+    let post = NewPost { channel_id: "c1".into(), message: "hi".into(), ..Default::default() };
+    assert!(matches!(client.create_post(&post).await, Err(Error::ReadOnly(_))));
+    assert!(matches!(client.view_channel("c1", None).await, Err(Error::ReadOnly(_))));
+    assert!(matches!(client.add_reaction("u1", "p1", "+1").await, Err(Error::ReadOnly(_))));
+    assert!(matches!(client.delete_post("p1").await, Err(Error::ReadOnly(_))));
+    assert!(matches!(client.upload_file("c1", "a.txt", vec![1]).await, Err(Error::ReadOnly(_))));
+}
+
+#[tokio::test]
+async fn decode_errors_name_the_field() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/users/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "u1", "props": { "a": 5 } })))
+        .mount(&server)
+        .await;
+    let err = Client::new(&server.uri()).unwrap().with_token("t").me().await.unwrap_err();
+    let Error::Decode { endpoint, path, .. } = err else { panic!("{err:?}") };
+    assert_eq!((endpoint.as_str(), path.as_str()), ("users/me", "props.a"));
+}

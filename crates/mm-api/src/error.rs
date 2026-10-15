@@ -21,6 +21,13 @@ pub enum Error {
     WebSocket(#[from] Box<tokio_tungstenite::tungstenite::Error>),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// The server's JSON didn't match our model; `path` says where, e.g.
+    /// `posts.p1.metadata.files[0].width`.
+    #[error("unexpected response from {endpoint} at {path}: {message}")]
+    Decode { endpoint: String, path: String, message: String },
+    /// A write was attempted while the client is in read-only mode.
+    #[error("read-only mode: refused {0}")]
+    ReadOnly(String),
     #[error("invalid server url: {0}")]
     Url(#[from] url::ParseError),
     #[error("login succeeded but the server sent no session token")]
