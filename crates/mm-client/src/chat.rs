@@ -58,11 +58,6 @@ pub struct Chat {
     pub media: media::Cache,
     /// Files attached to the main composer, per channel, until sent.
     pub attachments: Vec<media::Pending>,
-    /// Latest timeline viewport, and (content height, offset) captured before
-    /// prepending older posts so the view can stay on the same messages.
-    viewport: Option<iced::widget::scrollable::Viewport>,
-    /// (height, offset, older page applied yet)
-    keep_position: Option<(f32, f32, bool)>,
     /// `last_viewed_at` of each channel when it was opened, for the "New messages" line.
     pub viewed_before: HashMap<String, i64>,
     pub emoji_picker: Option<EmojiPicker>,
@@ -121,8 +116,6 @@ impl Chat {
             panel: None,
             media: media::Cache::default(),
             attachments: Vec::new(),
-            viewport: None,
-            keep_position: None,
             viewed_before: HashMap::new(),
             emoji_picker: None,
             recent_emoji: Vec::new(),
@@ -155,8 +148,6 @@ impl Chat {
     fn select_channel(&mut self, id: String) -> Task<Message> {
         let prev = std::mem::replace(&mut self.channel, id.clone());
         self.marked_unread.remove(&id);
-        self.viewport = None;
-        self.keep_position = None;
         if let Some(m) = self.store.members.get_mut(&id) {
             // Unread posts are the ones after this; remember it before marking read.
             self.viewed_before.insert(id.clone(), m.last_viewed_at);
@@ -178,7 +169,7 @@ impl Chat {
         } else {
             self.load_history(id)
         };
-        Task::batch([view, history, operation::snap_to_end(TIMELINE), operation::focus(COMPOSER)])
+        Task::batch([view, history, to_latest(TIMELINE), operation::focus(COMPOSER)])
     }
 
     fn load_history(&self, id: String) -> Task<Message> {
@@ -203,7 +194,6 @@ impl Chat {
         }
         tracing::debug!("loading posts before {oldest} in {id}");
         t.loading_older = true;
-        self.keep_position = self.viewport.map(|v| (v.content_bounds().height, v.absolute_offset().y, false));
         let client = self.client.clone();
         Task::perform(
             async move {
@@ -346,37 +336,15 @@ impl Chat {
                 let first = !self.store.timelines.get(&id).is_some_and(|t| t.loaded);
                 tracing::debug!("history for {id}: {} posts, prev={:?}, first={first}", list.order.len(), list.prev_post_id);
                 self.store.set_history(&id, list);
-                if let Some(keep) = &mut self.keep_position {
-                    keep.2 = true;
-                }
                 let users = self.load_missing_users();
-                if first { Task::batch([users, operation::snap_to_end(TIMELINE)]) } else { users }
+                if first { Task::batch([users, to_latest(TIMELINE)]) } else { users }
             }
             Message::TimelineScrolled(viewport) => {
-                // Measured from the top even with anchor_bottom() (checked against PageUp).
-                let from_top = viewport.absolute_offset().y;
-                let height = viewport.content_bounds().height;
-                // Stick to the bottom: if we were at the end and content grew
-                // (an image loaded, a post arrived), stay at the end.
-                let was_at_bottom = self.viewport.is_some_and(|v| {
-                    v.absolute_offset().y + v.bounds().height >= v.content_bounds().height - 4.0
-                });
-                let grew = self.viewport.is_some_and(|v| height > v.content_bounds().height + 1.0);
-                self.viewport = Some(viewport);
-                if was_at_bottom && grew && self.keep_position.is_none() {
-                    return operation::snap_to_end(TIMELINE);
-                }
-                tracing::trace!("timeline scrolled: {from_top}px from top, content {height}px");
-                // Older posts were just prepended: shift by the added height so the
-                // same messages stay on screen (otherwise every page triggers the next).
-                if let Some((old_height, old_top, applied)) = self.keep_position {
-                    if applied && height > old_height + 1.0 {
-                        self.keep_position = None;
-                        let y = old_top + (height - old_height);
-                        return operation::scroll_to(TIMELINE, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y });
-                    }
-                    return Task::none();
-                }
+                // With anchor_bottom() iced measures the offset from the bottom, so
+                // older posts prepended above (or images loading) leave the view put.
+                let from_bottom = viewport.absolute_offset().y;
+                let from_top = viewport.content_bounds().height - viewport.bounds().height - from_bottom;
+                tracing::trace!("timeline scrolled: {from_top}px from top, {from_bottom}px from bottom");
                 if from_top < 400.0 { self.load_older() } else { Task::none() }
             }
             Message::Users(Ok(users)) => {
@@ -452,7 +420,7 @@ impl Chat {
                 self.sending = None;
                 let in_thread = post.is_reply();
                 self.store.sent(post);
-                operation::snap_to_end(if in_thread { THREAD } else { TIMELINE })
+                to_latest(if in_thread { THREAD } else { TIMELINE })
             }
             Message::OpenThread(root) => {
                 self.thread = Some(root.clone());
@@ -481,7 +449,7 @@ impl Chat {
                         |(root, r)| Message::Thread(root, r),
                     )
                 };
-                Task::batch([load, mark_read, operation::snap_to_end(THREAD), operation::focus(THREAD_COMPOSER)])
+                Task::batch([load, mark_read, to_latest(THREAD), operation::focus(THREAD_COMPOSER)])
             }
             Message::CloseThread => {
                 self.thread = None;
@@ -489,7 +457,7 @@ impl Chat {
             }
             Message::Thread(root, Ok(list)) => {
                 self.store.set_thread(&root, list);
-                Task::batch([self.load_missing_users(), operation::snap_to_end(THREAD)])
+                Task::batch([self.load_missing_users(), to_latest(THREAD)])
             }
             Message::Thread(_, Err(e)) => {
                 self.error = Some(e);
@@ -895,7 +863,8 @@ impl Chat {
                 Task::none()
             }
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(named @ (Named::PageUp | Named::PageDown)), .. }) => {
-                let dy = if named == Named::PageUp { -500.0 } else { 500.0 };
+                // Offsets count up from the bottom (anchor_bottom), so PageUp is positive.
+                let dy = if named == Named::PageUp { 500.0 } else { -500.0 };
                 operation::scroll_by(TIMELINE, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: dy })
             }
             // Mattermost's Ctrl+Shift+\\: react to the latest message.
@@ -1017,20 +986,13 @@ impl Chat {
                     }
                 }
                 self.typing.retain(|(ch, user, _), _| !(*ch == post.channel_id && *user == post.user_id));
-                let in_open_thread = post.is_reply() && self.thread.as_deref() == Some(post.root_id.as_str());
                 let notify = self.store.posted(*post.clone(), &mentions, viewing);
                 if notify {
                     notify_mention(&self.store, &post);
                 }
-                let users = self.load_missing_users();
-                let mut tasks = vec![users];
-                if viewing {
-                    tasks.push(operation::snap_to_end(TIMELINE));
-                }
-                if in_open_thread {
-                    tasks.push(operation::snap_to_end(THREAD));
-                }
-                Task::batch(tasks)
+                // Bottom-anchored lists stay on the newest post by themselves, and
+                // someone reading further up isn't yanked down.
+                self.load_missing_users()
             }
             M::Event(Event::PostEdited(post)) => {
                 self.store.edited(*post);
@@ -1298,4 +1260,10 @@ mod tests {
         let _ = chat.handle(Message::Send);
         assert_eq!(chat.attachments.len(), 1);
     }
+}
+
+/// Scroll a bottom-anchored list to its newest post. Offsets count from the
+/// bottom with anchor_bottom(), so this is 0 (`snap_to_end` would go to the top).
+fn to_latest(id: &'static str) -> Task<Message> {
+    operation::scroll_to(id, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 })
 }
