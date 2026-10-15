@@ -9,6 +9,21 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     pub theme: ThemeConfig,
+    pub layout: LayoutConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct LayoutConfig {
+    /// "inline" (replies expand under their message) or "pane" (a side pane).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads: Option<String>,
+}
+
+impl LayoutConfig {
+    pub fn inline_threads(&self) -> bool {
+        self.threads.as_deref() != Some("pane")
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -89,6 +104,13 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn threads_default_to_inline() {
+        assert!(Config::default().layout.inline_threads());
+        let c: Config = toml::from_str("[layout]\nthreads = \"pane\"\n").unwrap();
+        assert!(!c.layout.inline_threads());
+    }
 
     #[test]
     fn defaults_depend_on_platform() {

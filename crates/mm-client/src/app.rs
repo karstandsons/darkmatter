@@ -91,6 +91,10 @@ pub enum Message {
     Send,
     Sent(Result<Post, String>),
     OpenThread(String),
+    /// Expand or collapse a thread under its message (inline layout).
+    ToggleThread(String),
+    /// Switch threads between inline and the side pane.
+    ToggleThreadLayout,
     CloseThread,
     Thread(String, Result<PostList, String>),
     ThreadDraft(String),
@@ -440,6 +444,22 @@ impl App {
                 Task::none()
             }
             Message::Key(keyboard::Event::KeyPressed { key: keyboard::Key::Character(k), modifiers, .. })
+                if modifiers.command() && modifiers.shift() && k.eq_ignore_ascii_case("t") =>
+            {
+                self.update(Message::ToggleThreadLayout)
+            }
+            Message::ToggleThreadLayout => {
+                let inline = !self.config.layout.inline_threads();
+                self.config.layout.threads = Some(if inline { "inline" } else { "pane" }.into());
+                if let Err(e) = self.config.save() {
+                    tracing::warn!("couldn't save config: {e}");
+                }
+                match &mut self.screen {
+                    Screen::Chat(chat) => chat.set_inline_threads(inline),
+                    _ => Task::none(),
+                }
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: keyboard::Key::Character(k), modifiers, .. })
                 if modifiers.command() && k.as_str() == "t" =>
             {
                 self.update(if self.picker.is_some() { Message::CloseThemes } else { Message::OpenThemes })
@@ -500,6 +520,7 @@ impl App {
 
     fn start_chat(&mut self, b: Bootstrap) -> Task<Message> {
         let Some((mut chat, task)) = Chat::start(b) else { return Task::none() };
+        chat.inline_threads = self.config.layout.inline_threads();
         let task = Task::batch([task, chat.open_default_channel()]);
         self.screen = Screen::Chat(Box::new(chat));
         task

@@ -33,7 +33,7 @@ impl Chat {
             layout = layout.push(self.team_rail(c));
         }
         layout = layout.push(self.sidebar(c)).push(self.main(c, theme));
-        if let Some(root) = &self.thread {
+        if let Some(root) = self.pane_thread() {
             layout = layout.push(rule::vertical(1)).push(self.thread_pane(root, c, theme));
         } else if let Some(panel) = &self.panel {
             layout = layout.push(rule::vertical(1)).push(self.panel_view(panel, c, theme));
@@ -359,6 +359,11 @@ impl Chat {
             });
             col = col.push(self.post_view(entry, continued, pane, c, md_settings));
             prev = Some(post);
+            if pane == Pane::Channel && self.expanded.contains(&post.id) && self.is_inline(&post.id) {
+                col = col.push(self.inline_thread(&post.id, c, md_settings));
+                // Whatever follows the thread starts a fresh group.
+                prev = None;
+            }
         }
         let id = match pane {
             Pane::Channel => TIMELINE,
@@ -369,6 +374,56 @@ impl Chat {
             Pane::Channel => scroll.on_scroll(Message::TimelineScrolled).into(),
             Pane::Thread => scroll.into(),
         }
+    }
+
+    /// Replies shown under their root, indented behind an accent bar, with the
+    /// reply box when this is the thread being replied to.
+    fn inline_thread<'a>(&'a self, root_id: &'a str, c: Colors, md: markdown::Settings) -> Element<'a, Message> {
+        // Replies get their own column so the reply box keeps its place in the
+        // widget tree (and its focus) when they finish loading.
+        let mut replies = Column::new().spacing(2);
+        match self.store.threads.get(root_id) {
+            Some(t) if t.loaded => {
+                let mut prev: Option<&Post> = None;
+                for entry in t.entries.iter().filter(|e| e.post.is_reply()) {
+                    let post = &entry.post;
+                    let continued = prev.is_some_and(|p| p.user_id == post.user_id && post.create_at - p.create_at < 5 * 60 * 1000);
+                    replies = replies.push(self.post_view(entry, continued, Pane::Thread, c, md));
+                    prev = Some(post);
+                }
+            }
+            _ => replies = replies.push(text("Loading replies…").size(12).color(c.muted)),
+        }
+        let mut col = column![replies];
+        if self.thread.as_deref() == Some(root_id) {
+            let composer = text_input("Reply…", self.thread_draft())
+                .id(THREAD_COMPOSER)
+                .on_input(Message::ThreadDraft)
+                .on_submit(Message::SendReply)
+                .padding(10)
+                .style(c.input());
+            let channel_id = self.store.post(root_id).map_or("", |p| p.channel_id.as_str());
+            let key = format!("thread:{root_id}");
+            let note = self.editing_note(&key, c).unwrap_or_else(|| self.typing_line(channel_id, root_id, c));
+            col = col.push(container(column![note, composer].spacing(4)).padding(iced::Padding { top: 6.0, bottom: 4.0, ..iced::Padding::ZERO }));
+        } else {
+            col = col.push(
+                button(text("↩ Reply").size(12).color(c.accent))
+                    .padding([4, 0])
+                    .on_press(Message::OpenThread(root_id.to_string()))
+                    .style(c.link_button()),
+            );
+        }
+        let accent = c.accent;
+        let bar = container(space().width(2).height(Length::Fill)).style(move |_: &Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color { a: 0.6, ..accent })),
+            ..Default::default()
+        });
+        // The thread sizes the stack, so the bar spans its full height.
+        let body = container(col).padding(iced::Padding { left: 16.0, ..iced::Padding::ZERO });
+        container(stack![body, bar])
+            .padding(iced::Padding { left: GUTTER, top: 2.0, bottom: 6.0, right: 0.0 })
+            .into()
     }
 
     fn post_view<'a>(
@@ -398,16 +453,14 @@ impl Chat {
         }
         let thread_root = if post.is_reply() { &post.root_id } else { &post.id };
         if pane == Pane::Channel && !post.is_reply() && post.reply_count > 0 {
-            let label = match post.reply_count {
-                1 => "💬 1 reply".to_string(),
-                n => format!("💬 {n} replies"),
+            let open = self.expanded.contains(&post.id) && self.is_inline(&post.id);
+            let label = match (open, post.reply_count) {
+                (true, _) => "▾ Hide replies".to_string(),
+                (false, 1) => "💬 1 reply".to_string(),
+                (false, n) => format!("💬 {n} replies"),
             };
-            body = body.push(
-                button(text(label).size(12).color(c.accent))
-                    .padding([2, 0])
-                    .on_press(Message::OpenThread(post.id.clone()))
-                    .style(c.link_button()),
-            );
+            let msg = if self.inline_threads { Message::ToggleThread(post.id.clone()) } else { Message::OpenThread(post.id.clone()) };
+            body = body.push(button(text(label).size(12).color(c.accent)).padding([2, 0]).on_press(msg).style(c.link_button()));
         }
 
         let content: Element<'_, Message> = if continued {

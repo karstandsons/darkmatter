@@ -1,6 +1,6 @@
 //! Chat screen state and logic. Views live in `chat_view.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use iced::Task;
@@ -51,8 +51,17 @@ pub struct Chat {
     pub online: bool,
     /// (channel id, user id, thread root or "") -> when they last typed.
     pub typing: HashMap<(String, String, String), Instant>,
-    /// Root post id of the thread shown in the right pane.
+    /// Root post id of the thread being read and replied to: in the right pane,
+    /// or expanded inline with the reply box under it.
     pub thread: Option<String>,
+    /// Threads expand under their message instead of opening a side pane.
+    pub inline_threads: bool,
+    /// Roots whose replies are expanded inline.
+    pub expanded: HashSet<String>,
+    /// Latest timeline viewport, and while a thread expands or collapses above
+    /// the bottom, the (content height, offset from bottom) to keep the top still.
+    viewport: Option<iced::widget::scrollable::Viewport>,
+    hold_top: Option<(f32, f32)>,
     pub switcher: Option<Switcher>,
     pub panel: Option<Panel>,
     pub media: media::Cache,
@@ -66,7 +75,7 @@ pub struct Chat {
     pub editing: Option<Editing>,
     pub confirm_delete: Option<String>,
     /// Channels marked unread: leaving them must not mark them read again.
-    marked_unread: std::collections::HashSet<String>,
+    marked_unread: HashSet<String>,
     /// Which composer was used last, for Up-to-edit.
     last_in_thread: bool,
     next_local_id: u64,
@@ -87,6 +96,34 @@ fn thread_key(root: &str) -> String {
 impl Chat {
     pub fn draft(&self) -> &str {
         self.drafts.get(&self.channel).map_or("", String::as_str)
+    }
+
+    /// Whether `root` shows inline: inline layout and it's in the open channel.
+    /// Threads from elsewhere (search, the threads inbox) still use the pane.
+    pub fn is_inline(&self, root: &str) -> bool {
+        self.inline_threads && self.store.timelines.get(&self.channel).is_some_and(|t| t.entries.iter().any(|e| e.post.id == root))
+    }
+
+    /// The thread to show in the side pane, if any.
+    pub fn pane_thread(&self) -> Option<&String> {
+        self.thread.as_ref().filter(|r| !self.is_inline(r))
+    }
+
+    pub fn set_inline_threads(&mut self, inline: bool) -> Task<Message> {
+        self.inline_threads = inline;
+        match self.thread.clone() {
+            Some(root) if self.is_inline(&root) => {
+                self.expanded.insert(root);
+                operation::focus(THREAD_COMPOSER)
+            }
+            _ => Task::none(),
+        }
+    }
+
+    /// Keep the messages on screen still while a thread above the bottom
+    /// expands or collapses (the bottom anchor would otherwise push them up).
+    fn hold_view(&mut self) {
+        self.hold_top = self.viewport.map(|v| (v.content_bounds().height, v.absolute_offset().y)).filter(|(_, from_bottom)| *from_bottom > 4.0);
     }
 
     pub fn thread_draft(&self) -> &str {
@@ -112,6 +149,10 @@ impl Chat {
             online: false,
             typing: HashMap::new(),
             thread: None,
+            inline_threads: true,
+            expanded: HashSet::new(),
+            viewport: None,
+            hold_top: None,
             switcher: None,
             panel: None,
             media: media::Cache::default(),
@@ -146,6 +187,11 @@ impl Chat {
     }
 
     fn select_channel(&mut self, id: String) -> Task<Message> {
+        if self.thread.as_ref().is_some_and(|r| self.is_inline(r)) {
+            self.thread = None;
+        }
+        self.viewport = None;
+        self.hold_top = None;
         let prev = std::mem::replace(&mut self.channel, id.clone());
         self.marked_unread.remove(&id);
         if let Some(m) = self.store.members.get_mut(&id) {
@@ -194,6 +240,7 @@ impl Chat {
         }
         tracing::debug!("loading posts before {oldest} in {id}");
         t.loading_older = true;
+        self.hold_top = None;
         let client = self.client.clone();
         Task::perform(
             async move {
@@ -214,6 +261,7 @@ impl Chat {
         self.cancel_edit();
         let (key, composer) = if post.is_reply() {
             self.thread = Some(post.root_id.clone());
+            self.expanded.insert(post.root_id.clone());
             (thread_key(&post.root_id), THREAD_COMPOSER)
         } else {
             (post.channel_id.clone(), COMPOSER)
@@ -343,8 +391,24 @@ impl Chat {
                 // With anchor_bottom() iced measures the offset from the bottom, so
                 // older posts prepended above (or images loading) leave the view put.
                 let from_bottom = viewport.absolute_offset().y;
-                let from_top = viewport.content_bounds().height - viewport.bounds().height - from_bottom;
+                let height = viewport.content_bounds().height;
+                let from_top = height - viewport.bounds().height - from_bottom;
                 tracing::trace!("timeline scrolled: {from_top}px from top, {from_bottom}px from bottom");
+                self.viewport = Some(viewport);
+                if let Some((held_height, held_offset)) = self.hold_top {
+                    let grew = height - held_height;
+                    if grew.abs() > 0.5 {
+                        // A thread opened or closed: shift by the change so the top stays put.
+                        self.hold_top = Some((height, held_offset + grew));
+                        return operation::scroll_by(TIMELINE, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: grew });
+                    }
+                    if (from_bottom - held_offset).abs() > 1.0 {
+                        // The user scrolled; stop holding.
+                        self.hold_top = None;
+                    } else {
+                        return Task::none();
+                    }
+                }
                 if from_top < 400.0 { self.load_older() } else { Task::none() }
             }
             Message::Users(Ok(users)) => {
@@ -422,7 +486,20 @@ impl Chat {
                 self.store.sent(post);
                 to_latest(if in_thread { THREAD } else { TIMELINE })
             }
+            Message::ToggleThread(root) if self.expanded.contains(&root) => {
+                self.hold_view();
+                self.expanded.remove(&root);
+                if self.thread.as_ref() == Some(&root) {
+                    self.thread = None;
+                }
+                Task::none()
+            }
+            Message::ToggleThread(root) => self.update(Message::OpenThread(root)),
             Message::OpenThread(root) => {
+                if self.is_inline(&root) && !self.expanded.contains(&root) {
+                    self.hold_view();
+                    self.expanded.insert(root.clone());
+                }
                 self.thread = Some(root.clone());
                 let mark_read = match self.store.user_threads.iter().find(|t| t.id == root) {
                     Some(t) if t.unread_replies > 0 || t.unread_mentions > 0 => {
@@ -452,7 +529,10 @@ impl Chat {
                 Task::batch([load, mark_read, to_latest(THREAD), operation::focus(THREAD_COMPOSER)])
             }
             Message::CloseThread => {
-                self.thread = None;
+                if let Some(root) = self.thread.take().filter(|r| self.is_inline(r)) {
+                    self.hold_view();
+                    self.expanded.remove(&root);
+                }
                 operation::focus(COMPOSER)
             }
             Message::Thread(root, Ok(list)) => {
@@ -1058,6 +1138,12 @@ fn notify_mention(store: &Store, post: &Post) {
     });
 }
 
+/// Scroll a bottom-anchored list to its newest post. Offsets count from the
+/// bottom with anchor_bottom(), so this is 0 (`snap_to_end` would go to the top).
+fn to_latest(id: &'static str) -> Task<Message> {
+    operation::scroll_to(id, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,6 +1304,34 @@ mod tests {
     }
 
     #[test]
+    fn inline_threads_expand_in_place_and_others_use_the_pane() {
+        let mut chat = chat();
+        with_post(&mut chat, "root", "bob", 1);
+        let _ = chat.handle(Message::ToggleThread("root".into()));
+        assert!(chat.expanded.contains("root"));
+        assert_eq!(chat.thread.as_deref(), Some("root"), "the reply box goes under it");
+        assert!(chat.pane_thread().is_none());
+        let _ = chat.handle(Message::ToggleThread("root".into()));
+        assert!(!chat.expanded.contains("root") && chat.thread.is_none());
+
+        // Esc collapses the thread being replied to.
+        let _ = chat.handle(Message::OpenThread("root".into()));
+        let _ = chat.handle(Message::Escape);
+        assert!(!chat.expanded.contains("root") && chat.thread.is_none());
+
+        // A thread from another channel (search, inbox) still opens in the pane.
+        let _ = chat.handle(Message::OpenThread("elsewhere".into()));
+        assert_eq!(chat.pane_thread().map(String::as_str), Some("elsewhere"));
+
+        // Switching to the pane layout moves the open thread there.
+        let _ = chat.handle(Message::OpenThread("root".into()));
+        let _ = chat.set_inline_threads(false);
+        assert_eq!(chat.pane_thread().map(String::as_str), Some("root"));
+        let _ = chat.set_inline_threads(true);
+        assert!(chat.pane_thread().is_none() && chat.expanded.contains("root"));
+    }
+
+    #[test]
     fn stale_search_results_are_dropped() {
         let mut chat = chat();
         let _ = chat.handle(Message::OpenSearch);
@@ -1260,10 +1374,4 @@ mod tests {
         let _ = chat.handle(Message::Send);
         assert_eq!(chat.attachments.len(), 1);
     }
-}
-
-/// Scroll a bottom-anchored list to its newest post. Offsets count from the
-/// bottom with anchor_bottom(), so this is 0 (`snap_to_end` would go to the top).
-fn to_latest(id: &'static str) -> Task<Message> {
-    operation::scroll_to(id, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 })
 }
