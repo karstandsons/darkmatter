@@ -84,6 +84,7 @@ pub enum Message {
     SelectTeam(String),
     SelectChannel(String),
     History(String, Result<PostList, String>),
+    TimelineScrolled(iced::widget::scrollable::Viewport),
     Users(Result<Vec<User>, String>),
     Draft(String),
     Send,
@@ -500,6 +501,13 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        let started = std::time::Instant::now();
+        let element = self.view_inner();
+        tracing::trace!(target: "mm_rust::perf", "view built in {:?}", started.elapsed());
+        element
+    }
+
+    fn view_inner(&self) -> Element<'_, Message> {
         let c = self.colors;
         let body = match &self.screen {
             Screen::Loading => center(text("Connecting…").color(c.muted)).into(),

@@ -150,7 +150,14 @@ impl Chat {
         }
 
         let timeline: Element<'_, Message> = match self.store.timelines.get(&self.channel) {
-            Some(t) if t.loaded => self.timeline(&t.entries, Pane::Channel, c, theme),
+            Some(t) if t.loaded => {
+                let top = if t.has_more {
+                    if t.loading_older { "Loading older messages…".to_string() } else { String::new() }
+                } else {
+                    format!("Beginning of {}", self.store.channel_label(channel))
+                };
+                self.timeline(&t.entries, Some(top), Pane::Channel, c, theme)
+            }
             _ => center(text("Loading…").color(c.muted)).into(),
         };
 
@@ -198,7 +205,7 @@ impl Chat {
         .align_y(iced::Center);
 
         let body: Element<'_, Message> = match self.store.threads.get(root_id) {
-            Some(t) if t.loaded => self.timeline(&t.entries, Pane::Thread, c, theme),
+            Some(t) if t.loaded => self.timeline(&t.entries, None, Pane::Thread, c, theme),
             _ => center(text("Loading…").color(c.muted)).into(),
         };
         let composer = text_input("Reply…", self.thread_draft())
@@ -269,10 +276,21 @@ impl Chat {
         .into()
     }
 
-    fn timeline<'a>(&'a self, entries: &'a [Entry], pane: Pane, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
+    fn timeline<'a>(
+        &'a self,
+        entries: &'a [Entry],
+        top: Option<String>,
+        pane: Pane,
+        c: Colors,
+        theme: &'a Theme,
+    ) -> Element<'a, Message> {
         let md_settings = c.markdown(theme);
         let now = chrono::Local::now();
         let mut col = Column::new().spacing(2).padding([12, 20]);
+        // Fixed height whether or not there's text, so toggling "Loading…" doesn't shift content.
+        if let Some(top) = top {
+            col = col.push(container(text(top).size(12).color(c.muted)).center_x(Length::Fill).height(32).center_y(32));
+        }
         let mut prev: Option<&Post> = None;
         for entry in entries {
             let post = &entry.post;
@@ -299,7 +317,11 @@ impl Chat {
             Pane::Channel => TIMELINE,
             Pane::Thread => THREAD,
         };
-        scrollable(col).id(id).anchor_bottom().height(Length::Fill).into()
+        let scroll = scrollable(col).id(id).anchor_bottom().height(Length::Fill);
+        match pane {
+            Pane::Channel => scroll.on_scroll(Message::TimelineScrolled).into(),
+            Pane::Thread => scroll.into(),
+        }
     }
 
     fn post_view<'a>(

@@ -25,6 +25,9 @@ pub struct Timeline {
     /// Oldest first.
     pub entries: Vec<Entry>,
     pub loaded: bool,
+    /// The server has older posts than the oldest loaded one.
+    pub has_more: bool,
+    pub loading_older: bool,
 }
 
 impl Timeline {
@@ -212,12 +215,29 @@ impl Store {
         }
     }
 
+    /// Merge a page of history (the newest page or an older one) into a channel.
     pub fn set_history(&mut self, channel_id: &str, list: PostList) {
         let t = self.timelines.entry(channel_id.to_string()).or_default();
+        let first = !t.loaded;
+        let older = !first && list.order.last().and_then(|id| list.posts.get(id)).is_some_and(|oldest| {
+            t.entries.first().is_none_or(|e| oldest.create_at <= e.post.create_at)
+        });
+        // `prev_post_id` is empty once the page reaches the start of the channel.
+        if first || older {
+            t.has_more = !list.prev_post_id.is_empty();
+        }
         for p in list.posts.into_values() {
             t.upsert(p);
         }
         t.loaded = true;
+        t.loading_older = false;
+    }
+
+    /// The oldest loaded post, for fetching the page before it.
+    pub fn oldest(&self, channel_id: &str) -> Option<&Post> {
+        self.timelines.get(channel_id)?.entries.iter().map(|e| &e.post).find(|p| !p.is_system()).or_else(|| {
+            self.timelines.get(channel_id)?.entries.first().map(|e| &e.post)
+        })
     }
 
     /// A new post arrived. `viewing` is true when it's in the channel on screen.
@@ -417,6 +437,29 @@ mod tests {
         assert_eq!(s.threads["root"].entries.len(), 2);
         assert_eq!(s.timelines["c1"].entries[0].post.reply_count, 1);
         assert!(s.post("root").is_some());
+    }
+
+    #[test]
+    fn older_pages_prepend_and_track_the_start() {
+        let mut s = store();
+        let page = |ids: &[(&str, i64)], prev: &str| {
+            let mut l = PostList { prev_post_id: prev.into(), ..Default::default() };
+            for (id, at) in ids.iter().rev() {
+                l.order.push(id.to_string());
+                l.posts.insert(id.to_string(), post(id, "c1", "bob", *at));
+            }
+            l
+        };
+        s.set_history("c1", page(&[("p3", 30), ("p4", 40)], "p2"));
+        assert!(s.timelines["c1"].has_more);
+        assert_eq!(s.oldest("c1").unwrap().id, "p3");
+        s.set_history("c1", page(&[("p1", 10), ("p2", 20)], ""));
+        let ids: Vec<_> = s.timelines["c1"].entries.iter().map(|e| e.post.id.as_str()).collect();
+        assert_eq!(ids, ["p1", "p2", "p3", "p4"]);
+        assert!(!s.timelines["c1"].has_more, "reached the beginning");
+        // A later resync of the newest page doesn't reset that.
+        s.set_history("c1", page(&[("p4", 40)], "p3"));
+        assert!(!s.timelines["c1"].has_more);
     }
 
     #[test]

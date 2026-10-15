@@ -40,6 +40,11 @@ pub struct Chat {
     pub media: media::Cache,
     /// Files attached to the main composer, per channel, until sent.
     pub attachments: Vec<media::Pending>,
+    /// Latest timeline viewport, and (content height, offset) captured before
+    /// prepending older posts so the view can stay on the same messages.
+    viewport: Option<iced::widget::scrollable::Viewport>,
+    /// (height, offset, older page applied yet)
+    keep_position: Option<(f32, f32, bool)>,
     next_local_id: u64,
     pub error: Option<String>,
 }
@@ -79,6 +84,8 @@ impl Chat {
             switcher: None,
             media: media::Cache::default(),
             attachments: Vec::new(),
+            viewport: None,
+            keep_position: None,
             next_local_id: 0,
             error: None,
         };
@@ -100,6 +107,8 @@ impl Chat {
 
     fn select_channel(&mut self, id: String) -> Task<Message> {
         let prev = std::mem::replace(&mut self.channel, id.clone());
+        self.viewport = None;
+        self.keep_position = None;
         self.store.mark_viewed(&id);
         let client = self.client.clone();
         // Marking a channel read is a write; read-only mode skips it quietly.
@@ -122,6 +131,29 @@ impl Chat {
         Task::perform(
             async move {
                 let r = client.posts(&id, PostsQuery::Page { page: 0, per_page: 60 }, true).await.map_err(err);
+                (id, r)
+            },
+            |(id, r)| Message::History(id, r),
+        )
+    }
+
+    /// Fetch the page before the oldest loaded post, once at a time.
+    fn load_older(&mut self) -> Task<Message> {
+        let id = self.channel.clone();
+        let Some(oldest) = self.store.oldest(&id).map(|p| p.id.clone()) else { return Task::none() };
+        let Some(t) = self.store.timelines.get_mut(&id) else { return Task::none() };
+        if !t.has_more || t.loading_older {
+            tracing::trace!("load_older skipped: has_more={} loading={}", t.has_more, t.loading_older);
+            return Task::none();
+        }
+        tracing::debug!("loading posts before {oldest} in {id}");
+        t.loading_older = true;
+        self.keep_position = self.viewport.map(|v| (v.content_bounds().height, v.absolute_offset().y, false));
+        let client = self.client.clone();
+        Task::perform(
+            async move {
+                let query = PostsQuery::Before { post_id: oldest, per_page: 60 };
+                let r = client.posts(&id, query, true).await.map_err(err);
                 (id, r)
             },
             |(id, r)| Message::History(id, r),
@@ -171,8 +203,32 @@ impl Chat {
             }
             Message::SelectChannel(id) => self.select_channel(id),
             Message::History(id, Ok(list)) => {
+                let first = !self.store.timelines.get(&id).is_some_and(|t| t.loaded);
+                tracing::debug!("history for {id}: {} posts, prev={:?}, first={first}", list.order.len(), list.prev_post_id);
                 self.store.set_history(&id, list);
-                Task::batch([self.load_missing_users(), operation::snap_to_end(TIMELINE)])
+                if let Some(keep) = &mut self.keep_position {
+                    keep.2 = true;
+                }
+                let users = self.load_missing_users();
+                if first { Task::batch([users, operation::snap_to_end(TIMELINE)]) } else { users }
+            }
+            Message::TimelineScrolled(viewport) => {
+                // Measured from the top even with anchor_bottom() (checked against PageUp).
+                let from_top = viewport.absolute_offset().y;
+                let height = viewport.content_bounds().height;
+                self.viewport = Some(viewport);
+                tracing::trace!("timeline scrolled: {from_top}px from top, content {height}px");
+                // Older posts were just prepended: shift by the added height so the
+                // same messages stay on screen (otherwise every page triggers the next).
+                if let Some((old_height, old_top, applied)) = self.keep_position {
+                    if applied && height > old_height + 1.0 {
+                        self.keep_position = None;
+                        let y = old_top + (height - old_height);
+                        return operation::scroll_to(TIMELINE, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y });
+                    }
+                    return Task::none();
+                }
+                if from_top < 400.0 { self.load_older() } else { Task::none() }
             }
             Message::Users(Ok(users)) => {
                 self.store.add_users(users);
@@ -390,6 +446,10 @@ impl Chat {
                     _ => None,
                 };
                 Task::none()
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Named(named @ (Named::PageUp | Named::PageDown)), .. }) => {
+                let dy = if named == Named::PageUp { -500.0 } else { 500.0 };
+                operation::scroll_by(TIMELINE, iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: dy })
             }
             // Mattermost's shortcut: reply to the latest message in the channel.
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::ArrowUp), modifiers, .. })
