@@ -12,13 +12,17 @@ cargo=$(command -v cargo || echo "$HOME/.cargo/bin/cargo")
 
 sed -i "0,/^version = \".*\"/s//version = \"$version\"/" Cargo.toml
 "$cargo" update --workspace -q
-if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+today=$(date +%Y-%m-%d)
+if grep -q "^## \[$version\]$" CHANGELOG.md; then
+  # Already written up (like the first release): just date it.
+  sed -i "s/^## \[$version\]$/## [$version] - $today/" CHANGELOG.md
+elif ! grep -q "^## \[$version\]" CHANGELOG.md; then
   # Unreleased becomes this version, and a fresh Unreleased goes on top.
-  sed -i "s/^## \[Unreleased\]/## [Unreleased]\n\n## [$version]/" CHANGELOG.md
+  sed -i "s/^## \[Unreleased\]/## [Unreleased]\n\n## [$version] - $today/" CHANGELOG.md
 fi
 packaging/release-notes.sh "$version" >/dev/null
 "$cargo" test --workspace -q --locked
 
-git commit -qam "Release v$version"
+git diff --quiet || git commit -qam "Release v$version"
 git tag -a "v$version" -m "Darkmatter $version"
 echo "Tagged v$version. Push it to release: git push --follow-tags"
