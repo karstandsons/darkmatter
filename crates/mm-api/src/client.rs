@@ -251,6 +251,15 @@ impl Client {
         self.bytes(&format!("files/{file_id}/thumbnail")).await
     }
 
+    /// A page of the server's custom emoji, by name.
+    pub async fn custom_emoji(&self, page: u32, per_page: u32) -> Result<Vec<CustomEmoji>, Error> {
+        self.get(&format!("emoji?page={page}&per_page={per_page}&sort=name")).await
+    }
+
+    pub async fn emoji_image(&self, emoji_id: &str) -> Result<Vec<u8>, Error> {
+        self.bytes(&format!("emoji/{emoji_id}/image")).await
+    }
+
     pub async fn profile_image(&self, user_id: &str) -> Result<Vec<u8>, Error> {
         self.bytes(&format!("users/{user_id}/image")).await
     }

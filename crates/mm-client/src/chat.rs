@@ -287,7 +287,28 @@ impl Chat {
         let mut chat = chat;
         let statuses = chat.load_statuses();
         let threads = chat.load_user_threads();
-        Some((chat, Task::batch([statuses, threads])))
+        let emoji = chat.load_custom_emoji();
+        Some((chat, Task::batch([statuses, threads, emoji])))
+    }
+
+    /// Every custom emoji on the server, a page of 200 at a time.
+    fn load_custom_emoji(&self) -> Task<Message> {
+        let client = self.client.clone();
+        Task::perform(
+            async move {
+                let mut all = Vec::new();
+                for page in 0..25 {
+                    let batch = client.custom_emoji(page, 200).await.map_err(err)?;
+                    let done = batch.len() < 200;
+                    all.extend(batch);
+                    if done {
+                        break;
+                    }
+                }
+                Ok(all)
+            },
+            Message::CustomEmoji,
+        )
     }
 
     pub fn open_default_channel(&mut self) -> Task<Message> {
@@ -478,14 +499,26 @@ impl Chat {
         Task::batch([task, self.fetch_media()])
     }
 
-    /// Avatars and image previews needed by what's on screen and not fetched yet.
+    /// Avatars, image previews and custom emoji needed by what's on screen
+    /// and not fetched yet.
     fn fetch_media(&mut self) -> Task<Message> {
-        let visible = [Some(&self.channel), self.thread.as_ref()];
+        // Inline threads are on screen too.
+        let visible: Vec<&String> = [&self.channel].into_iter().chain(self.thread.as_ref()).chain(&self.expanded).collect();
         let mut keys = Vec::new();
+        let mut learned = Vec::new();
         for (i, id) in visible.into_iter().enumerate() {
-            let Some(id) = id else { continue };
             let timeline = if i == 0 { self.store.timelines.get(id) } else { self.store.threads.get(id) };
             for post in timeline.into_iter().flat_map(|t| &t.entries).map(|e| &e.post) {
+                for e in &post.metadata.emojis {
+                    learned.push((e.name.clone(), e.id.clone()));
+                    keys.push(media::Key::Emoji(e.id.clone()));
+                }
+                // Live reactions carry only the name.
+                for r in &post.metadata.reactions {
+                    if let Some(id) = self.store.custom_emoji.get(&r.emoji_name) {
+                        keys.push(media::Key::Emoji(id.clone()));
+                    }
+                }
                 if let Some(u) = self.store.users.get(&post.user_id) {
                     keys.push(media::Key::Avatar(u.id.clone(), u.last_picture_update));
                 }
@@ -496,6 +529,7 @@ impl Chat {
                 }
             }
         }
+        self.store.custom_emoji.extend(learned);
         self.media.fetch(&self.client, keys)
     }
 
@@ -661,6 +695,15 @@ impl Chat {
                 Task::none()
             }
             Message::JumpToLatest => self.reload_latest(),
+            Message::CustomEmoji(Ok(list)) => {
+                self.store.custom_emoji.extend(list.into_iter().filter(|e| e.delete_at == 0).map(|e| (e.name, e.id)));
+                self.fetch_media()
+            }
+            Message::CustomEmoji(Err(e)) => {
+                // Servers can turn custom emoji off; they just show as :name: then.
+                tracing::info!("no custom emoji: {e}");
+                Task::none()
+            }
             Message::JumpLocated(Some(from_bottom)) => {
                 operation::scroll_to(TIMELINE, iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(from_bottom) })
             }
@@ -810,18 +853,19 @@ impl Chat {
                 Task::none()
             }
             Message::OpenEmoji(post_id) => {
-                self.emoji_picker = Some(EmojiPicker::open(post_id, &self.recent_emoji));
-                operation::focus(emoji_picker::INPUT)
+                let picker = EmojiPicker::open(post_id, &self.recent_emoji, &self.store.custom_emoji);
+                let images = self.media.fetch(&self.client, picker.media_keys());
+                self.emoji_picker = Some(picker);
+                Task::batch([images, operation::focus(emoji_picker::INPUT)])
             }
             Message::CloseEmoji => {
                 self.emoji_picker = None;
                 Task::none()
             }
             Message::EmojiQuery(q) => {
-                if let Some(p) = &mut self.emoji_picker {
-                    p.set_query(q, &self.recent_emoji);
-                }
-                Task::none()
+                let Some(p) = &mut self.emoji_picker else { return Task::none() };
+                p.set_query(q, &self.recent_emoji, &self.store.custom_emoji);
+                self.media.fetch(&self.client, p.media_keys())
             }
             Message::EmojiPick(name) => {
                 let Some(picker) = self.emoji_picker.take() else { return Task::none() };

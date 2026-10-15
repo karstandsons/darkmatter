@@ -206,13 +206,24 @@ impl Post {
     }
 }
 
+/// An emoji uploaded to the server, used as `:name:`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct CustomEmoji {
+    pub id: Id,
+    pub name: String,
+    pub creator_id: Id,
+    pub delete_at: Millis,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct PostMetadata {
     #[serde(deserialize_with = "nullable")]
     pub embeds: Vec<Value>,
+    /// Custom emoji used in the message and its reactions.
     #[serde(deserialize_with = "nullable")]
-    pub emojis: Vec<Value>,
+    pub emojis: Vec<CustomEmoji>,
     #[serde(deserialize_with = "nullable")]
     pub files: Vec<FileInfo>,
     #[serde(deserialize_with = "nullable")]

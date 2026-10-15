@@ -13,6 +13,8 @@ pub enum Key {
     /// User id + picture timestamp, so a changed avatar is refetched.
     Avatar(String, i64),
     Preview(String),
+    /// A custom emoji's image, by emoji id.
+    Emoji(String),
 }
 
 pub enum Media {
@@ -53,6 +55,7 @@ impl Cache {
                         let bytes = match &key {
                             Key::Avatar(id, _) => client.profile_image(id).await,
                             Key::Preview(id) => client.file_preview(id).await,
+                            Key::Emoji(id) => client.emoji_image(id).await,
                         };
                         (key, bytes.map_err(|e| e.to_string()))
                     },

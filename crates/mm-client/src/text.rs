@@ -107,6 +107,38 @@ pub fn emojify(s: &str) -> String {
     out
 }
 
+/// One piece of a message made only of emoji.
+#[derive(Debug, PartialEq)]
+pub enum EmojiToken<'a> {
+    /// `:name:`, built in or custom.
+    Code(&'a str),
+    /// A Unicode emoji typed directly.
+    Glyph(&'a str),
+}
+
+/// The emoji of a message that is nothing but emoji (and spaces), like
+/// `:rustacean: :tada:`; `None` if it has any other text. Shown large, as
+/// Mattermost does, and the only place custom emoji can be drawn as images.
+pub fn emoji_only(message: &str) -> Option<Vec<EmojiToken<'_>>> {
+    let mut out = Vec::new();
+    for word in message.split_whitespace() {
+        if let Some(inner) = word.strip_prefix(':').and_then(|w| w.strip_suffix(':')) {
+            // Adjacent codes: `:a::b:`.
+            for code in inner.split("::") {
+                if code.is_empty() || !code.chars().all(|c| c.is_ascii_alphanumeric() || "_+-".contains(c)) {
+                    return None;
+                }
+                out.push(EmojiToken::Code(code));
+            }
+        } else if emojis::get(word).is_some() {
+            out.push(EmojiToken::Glyph(word));
+        } else {
+            return None;
+        }
+    }
+    (!out.is_empty() && out.len() <= 12).then_some(out)
+}
+
 /// Mattermost emoji names are GitHub shortcodes, with a few aliases of its own.
 pub fn emoji(name: &str) -> Option<&'static str> {
     let name = match name {
@@ -155,6 +187,16 @@ mod tests {
         assert_eq!(emojify("hi :wave: there"), "hi 👋 there");
         assert_eq!(emojify(":thumbsup::+1:"), "👍👍");
         assert_eq!(emojify("custom :partyparrot: stays"), "custom :partyparrot: stays");
+    }
+
+    #[test]
+    fn emoji_only_messages() {
+        use EmojiToken::*;
+        assert_eq!(emoji_only(":parrot:"), Some(vec![Code("parrot")]));
+        assert_eq!(emoji_only(" :a::b:  🎉 "), Some(vec![Code("a"), Code("b"), Glyph("🎉")]));
+        assert_eq!(emoji_only("hi :parrot:"), None);
+        assert_eq!(emoji_only(":not code:"), None);
+        assert_eq!(emoji_only(""), None);
         assert_eq!(emojify("time 10:30:00 ok"), "time 10:30:00 ok");
         assert_eq!(emojify("a: b :"), "a: b :");
         assert_eq!(emojify("::"), "::");

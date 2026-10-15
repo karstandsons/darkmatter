@@ -105,6 +105,8 @@ pub enum Message {
     Newer(String, Result<PostList, String>),
     /// Leave an older stretch for the newest messages.
     JumpToLatest,
+    /// The server's custom emoji.
+    CustomEmoji(Result<Vec<mm_api::models::CustomEmoji>, String>),
     /// Switch threads between inline and the side pane.
     ToggleThreadLayout,
     CloseThread,

@@ -44,7 +44,7 @@ impl Chat {
         }
         match (&self.switcher, &self.emoji_picker) {
             (Some(sw), _) => stack![layout, sw.view(&self.store, c)].into(),
-            (None, Some(picker)) => stack![layout, picker.view(c)].into(),
+            (None, Some(picker)) => stack![layout, picker.view(c, &self.media)].into(),
             (None, None) => layout.into(),
         }
     }
@@ -472,7 +472,10 @@ impl Chat {
                 .into();
         }
         let viewer = crate::viewer::PostViewer { colors: c };
-        let mut body = column![markdown::view_with(&entry.markdown, md, &viewer)].spacing(4);
+        let mut body = match self.jumbo_emoji(&post.message, c) {
+            Some(big) => column![big].spacing(4),
+            None => column![markdown::view_with(&entry.markdown, md, &viewer)].spacing(4),
+        };
         if post.edit_at > 0 {
             body = body.push(text("(edited)").size(11).color(c.muted));
         }
@@ -627,6 +630,34 @@ impl Chat {
         button(label).padding([8, 12]).on_press(open).style(c.chip(false)).into()
     }
 
+    /// A `:name:` emoji at `size`: the glyph, the server's image, or the name.
+    fn emoji_face(&self, name: &str, size: f32, c: Colors) -> Element<'_, Message> {
+        if let Some(glyph) = fmt::emoji(name) {
+            return text(glyph).size(size).into();
+        }
+        let id = self.store.custom_emoji.get(name);
+        match id.and_then(|id| self.media.get(&media::Key::Emoji(id.clone()))) {
+            // A little larger than the text, as glyphs render.
+            Some(handle) => image(handle.clone()).width(size * 1.25).height(size * 1.25).into(),
+            None => text(format!(":{name}:")).size(size.min(14.0)).color(c.muted).into(),
+        }
+    }
+
+    /// A message of only emoji, shown large. Custom emoji can only be drawn as
+    /// images here: iced's text can't hold an image mid-sentence.
+    fn jumbo_emoji(&self, message: &str, c: Colors) -> Option<Element<'_, Message>> {
+        let tokens = fmt::emoji_only(message)?;
+        let known = |name: &str| fmt::emoji(name).is_some() || self.store.custom_emoji.contains_key(name);
+        if !tokens.iter().all(|t| matches!(t, fmt::EmojiToken::Glyph(_)) || matches!(t, fmt::EmojiToken::Code(n) if known(n))) {
+            return None;
+        }
+        let faces = tokens.into_iter().map(|t| match t {
+            fmt::EmojiToken::Code(name) => self.emoji_face(name, 28.0, c),
+            fmt::EmojiToken::Glyph(g) => text(g.to_string()).size(28).into(),
+        });
+        Some(iced::widget::Row::with_children(faces).spacing(6).align_y(iced::Center).into())
+    }
+
     fn reactions(&self, post: &Post, c: Colors) -> Option<Element<'_, Message>> {
         let reactions = &post.metadata.reactions;
         if reactions.is_empty() {
@@ -644,8 +675,8 @@ impl Chat {
             }
         }
         let chips = counts.into_iter().map(|(name, n, mine)| {
-            let glyph = fmt::emoji(name).map_or_else(|| format!(":{name}:"), str::to_string);
-            button(text(format!("{glyph} {n}")).size(12))
+            let label = row![self.emoji_face(name, 13.0, c), text(n.to_string()).size(12)].spacing(5).align_y(iced::Center);
+            button(label)
                 .padding([2, 8])
                 .on_press(Message::React(post.id.clone(), name.to_string(), !mine))
                 .style(c.chip(mine))

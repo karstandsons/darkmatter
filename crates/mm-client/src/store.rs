@@ -67,6 +67,8 @@ pub struct Store {
     pub statuses: HashMap<Id, String>,
     /// Followed threads in the current team, most recent activity first.
     pub user_threads: Vec<UserThread>,
+    /// The server's custom emoji: name -> id.
+    pub custom_emoji: HashMap<String, Id>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +92,7 @@ impl Store {
             counted_replies: HashSet::new(),
             statuses: HashMap::new(),
             user_threads: Vec::new(),
+            custom_emoji: HashMap::new(),
         }
     }
 
