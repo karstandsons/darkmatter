@@ -191,3 +191,47 @@ async fn edit_delete_and_mark_unread() {
     let unread = client.set_unread("u1", "p1").await.unwrap();
     assert_eq!((unread.msg_count_root, unread.last_viewed_at), (3, 99));
 }
+
+#[tokio::test]
+async fn people_and_channel_discovery() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/users/autocomplete"))
+        .and(query_param("in_team", "t1"))
+        .and(query_param("name", "bo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "users": [{ "id": "u2", "username": "bob" }] })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/teams/t1/channels/search"))
+        .and(body_json(json!({ "term": "ru" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{ "id": "c9", "name": "rust", "type": "O" }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/channels/direct"))
+        .and(body_json(json!(["u1", "u2"])))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1", "type": "D", "name": "u1__u2" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/channels/c9/members"))
+        .and(body_json(json!({ "user_id": "u1" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "channel_id": "c9", "user_id": "u1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE")).and(path("/api/v4/channels/c9/members/u1")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+
+    let client = Client::new(&server.uri()).unwrap().with_token("t");
+    assert_eq!(client.autocomplete_users("t1", "bo").await.unwrap()[0].username, "bob");
+    assert_eq!(client.search_channels("t1", "ru").await.unwrap()[0].name, "rust");
+    assert_eq!(client.create_direct("u1", "u2").await.unwrap().dm_partner("u1"), Some("u2"));
+    assert_eq!(client.join_channel("c9", "u1").await.unwrap().channel_id, "c9");
+    client.leave_channel("c9", "u1").await.unwrap();
+
+    // Search is allowed read-only; DMs and joins are not.
+    let ro = Client::new(&server.uri()).unwrap().with_token("t").read_only(true);
+    assert!(ro.search_channels("t1", "ru").await.is_ok());
+    assert!(matches!(ro.create_direct("u1", "u2").await, Err(Error::ReadOnly(_))));
+    assert!(matches!(ro.join_channel("c9", "u1").await, Err(Error::ReadOnly(_))));
+}

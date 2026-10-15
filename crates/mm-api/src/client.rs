@@ -20,7 +20,7 @@ pub struct Client {
 /// POSTs that only read, allowed in read-only mode (paths relative to `/api/v4/`).
 fn read_only_post(path: &str) -> bool {
     matches!(path, "users/login" | "users/logout" | "users/ids" | "users/status/ids" | "users/usernames")
-        || (path.starts_with("teams/") && path.ends_with("/posts/search"))
+        || (path.starts_with("teams/") && (path.ends_with("/posts/search") || path.ends_with("/channels/search")))
 }
 
 /// Which slice of a channel's history to fetch.
@@ -170,6 +170,36 @@ impl Client {
     pub async fn remove_reaction(&self, user_id: &str, post_id: &str, emoji: &str) -> Result<(), Error> {
         let path = format!("users/{user_id}/posts/{post_id}/reactions/{emoji}");
         self.send_unit(Method::DELETE, &path, None::<&()>).await
+    }
+
+    /// Users whose username or name starts with `name`, limited to a team.
+    pub async fn autocomplete_users(&self, team_id: &str, name: &str) -> Result<Vec<User>, Error> {
+        #[derive(serde::Deserialize)]
+        struct Found {
+            #[serde(default)]
+            users: Vec<User>,
+        }
+        let req = self.request(Method::GET, "users/autocomplete")?.query(&[("in_team", team_id), ("name", name), ("limit", "8")]);
+        let found: Found = decode("users/autocomplete", check(req.send().await?).await?).await?;
+        Ok(found.users)
+    }
+
+    /// Public channels in a team matching `term` (joined or not).
+    pub async fn search_channels(&self, team_id: &str, term: &str) -> Result<Vec<Channel>, Error> {
+        self.send(Method::POST, &format!("teams/{team_id}/channels/search"), Some(&json!({ "term": term }))).await
+    }
+
+    /// The DM channel between two users, created if it doesn't exist yet.
+    pub async fn create_direct(&self, me: &str, other: &str) -> Result<Channel, Error> {
+        self.send(Method::POST, "channels/direct", Some(&[me, other])).await
+    }
+
+    pub async fn join_channel(&self, channel_id: &str, user_id: &str) -> Result<ChannelMember, Error> {
+        self.send(Method::POST, &format!("channels/{channel_id}/members"), Some(&json!({ "user_id": user_id }))).await
+    }
+
+    pub async fn leave_channel(&self, channel_id: &str, user_id: &str) -> Result<(), Error> {
+        self.send_unit(Method::DELETE, &format!("channels/{channel_id}/members/{user_id}"), None::<&()>).await
     }
 
     pub async fn users_by_ids(&self, ids: &[Id]) -> Result<Vec<User>, Error> {

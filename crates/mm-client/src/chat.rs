@@ -14,7 +14,7 @@ use crate::session::Session;
 use crate::emoji_picker::{self, EmojiPicker};
 use crate::media;
 use crate::store::Store;
-use crate::switcher::{self, Switcher};
+use crate::switcher::{self, Item, Switcher};
 
 pub const COMPOSER: &str = "composer";
 pub const TIMELINE: &str = "timeline";
@@ -622,22 +622,116 @@ impl Chat {
                 operation::focus(COMPOSER)
             }
             Message::SwitcherQuery(q) => {
+                let Some(sw) = &mut self.switcher else { return Task::none() };
+                sw.query = q;
+                sw.selected = 0;
+                sw.generation += 1;
+                sw.refresh(&self.store);
+                if sw.query.trim().is_empty() {
+                    return Task::none();
+                }
+                // Wait for a pause in typing before asking the server.
+                let generation = sw.generation;
+                Task::perform(tokio::time::sleep(std::time::Duration::from_millis(150)), move |_| {
+                    Message::SwitcherFetch(generation)
+                })
+            }
+            Message::SwitcherFetch(generation) => {
+                let Some(sw) = self.switcher.as_ref().filter(|sw| sw.generation == generation) else {
+                    return Task::none();
+                };
+                let (client, team, term) = (self.client.clone(), self.team.clone(), sw.query.trim().to_string());
+                Task::perform(
+                    async move {
+                        let people = client.autocomplete_users(&team, &term).await.unwrap_or_default();
+                        let channels = client.search_channels(&team, &term).await.unwrap_or_default();
+                        (people, channels)
+                    },
+                    move |(people, channels)| Message::SwitcherRemote(generation, people, channels),
+                )
+            }
+            Message::SwitcherRemote(generation, people, channels) => {
                 if let Some(sw) = &mut self.switcher {
-                    sw.query = q;
-                    sw.selected = 0;
-                    sw.refresh(&self.store);
+                    sw.set_remote(generation, people, channels, &self.store);
                 }
                 Task::none()
             }
-            Message::SwitcherPick(id) => {
+            Message::SwitcherPick(index) => {
                 let Some(sw) = self.switcher.take() else { return Task::none() };
-                let Some(id) = id.or_else(|| sw.current().cloned()) else { return Task::none() };
-                if let Some(team) = self.store.channels.get(&id).map(|c| c.team_id.clone())
-                    && !team.is_empty()
-                {
-                    self.team = team;
+                let item = match index {
+                    Some(i) => sw.results.get(i),
+                    None => sw.current(),
+                };
+                match item.cloned() {
+                    Some(Item::Channel(id)) => {
+                        if let Some(team) = self.store.channels.get(&id).map(|c| c.team_id.clone())
+                            && !team.is_empty()
+                        {
+                            self.team = team;
+                        }
+                        self.select_channel(id)
+                    }
+                    Some(Item::Person(user)) => {
+                        let (client, me) = (self.client.clone(), self.store.me.id.clone());
+                        self.store.add_users(vec![user.clone()]);
+                        Task::perform(
+                            async move {
+                                let ch = client.create_direct(&me, &user.id).await.map_err(err)?;
+                                let member = mm_api::models::ChannelMember { channel_id: ch.id.clone(), user_id: me, ..Default::default() };
+                                Ok((ch, member))
+                            },
+                            Message::ChannelReady,
+                        )
+                    }
+                    Some(Item::Join(ch)) => {
+                        let (client, me) = (self.client.clone(), self.store.me.id.clone());
+                        Task::perform(
+                            async move {
+                                let member = client.join_channel(&ch.id, &me).await.map_err(err)?;
+                                Ok((ch, member))
+                            },
+                            Message::ChannelReady,
+                        )
+                    }
+                    None => Task::none(),
                 }
+            }
+            Message::ChannelReady(Ok((channel, member))) => {
+                let id = channel.id.clone();
+                if !channel.team_id.is_empty() {
+                    self.team = channel.team_id.clone();
+                }
+                self.store.add_channels(vec![channel], vec![member]);
                 self.select_channel(id)
+            }
+            Message::ChannelReady(Err(e)) => {
+                self.error = Some(e);
+                Task::none()
+            }
+            Message::LeaveChannel(id) if self.confirm_delete.as_deref() != Some(id.as_str()) => {
+                self.confirm_delete = Some(id);
+                Task::none()
+            }
+            Message::LeaveChannel(id) => {
+                self.confirm_delete = None;
+                let (client, me) = (self.client.clone(), self.store.me.id.clone());
+                Task::perform(
+                    async move {
+                        let r = client.leave_channel(&id, &me).await.map_err(err);
+                        (id, r)
+                    },
+                    |(id, r)| Message::Left(id, r),
+                )
+            }
+            Message::Left(id, Ok(())) => {
+                self.store.channels.remove(&id);
+                self.store.members.remove(&id);
+                self.store.timelines.remove(&id);
+                if self.channel == id { self.open_default_channel() } else { Task::none() }
+            }
+            Message::Left(_, Err(e)) => {
+                self.error = Some(format!("Couldn't leave: {e}"));
+                Task::none()
             }
             // Mattermost's upload shortcut.
             Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
@@ -972,6 +1066,17 @@ mod tests {
         assert!(chat.confirm_delete.is_none());
         let _ = chat.handle(Message::Deleted("mine".into(), Ok(())));
         assert!(chat.store.post("mine").is_none());
+    }
+
+    #[test]
+    fn leaving_needs_confirmation_and_drops_the_channel() {
+        let mut chat = chat();
+        let _ = chat.handle(Message::LeaveChannel("c1".into()));
+        assert_eq!(chat.confirm_delete.as_deref(), Some("c1"));
+        let _ = chat.handle(Message::LeaveChannel("c1".into()));
+        assert!(chat.confirm_delete.is_none());
+        let _ = chat.handle(Message::Left("c1".into(), Ok(())));
+        assert!(!chat.store.channels.contains_key("c1") && !chat.store.members.contains_key("c1"));
     }
 
     #[test]

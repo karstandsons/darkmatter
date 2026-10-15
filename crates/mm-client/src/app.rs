@@ -117,8 +117,15 @@ pub enum Message {
     OpenSwitcher,
     CloseSwitcher,
     SwitcherQuery(String),
-    /// Enter (None = the highlighted row) or a click on a row.
-    SwitcherPick(Option<String>),
+    /// Enter (None = the highlighted row) or a click on a row index.
+    SwitcherPick(Option<usize>),
+    /// Debounce tick: fetch people/channels if the query is still `generation`'s.
+    SwitcherFetch(u64),
+    SwitcherRemote(u64, Vec<User>, Vec<Channel>),
+    /// A DM or newly joined channel to add to the sidebar and open.
+    ChannelReady(Result<(Channel, mm_api::models::ChannelMember), String>),
+    LeaveChannel(String),
+    Left(String, Result<(), String>),
     React(String, String, bool),
     Ws(ws::Message),
     Link(markdown::Uri),

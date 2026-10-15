@@ -154,6 +154,16 @@ impl Chat {
         if !topic.is_empty() {
             header = header.push(text(topic.lines().next().unwrap_or_default()).size(13).color(c.muted));
         }
+        // Town Square can't be left; DMs are closed, not left.
+        if matches!(channel.kind, ChannelType::Open | ChannelType::Private) && channel.name != "town-square" {
+            let confirming = self.confirm_delete.as_deref() == Some(channel.id.as_str());
+            header = header.push(space::horizontal()).push(
+                button(text(if confirming { "Leave? click again" } else { "Leave" }).size(12).color(if confirming { c.red } else { c.muted }))
+                    .padding([2, 8])
+                    .on_press(Message::LeaveChannel(channel.id.clone()))
+                    .style(c.row_button(false)),
+            );
+        }
 
         let timeline: Element<'_, Message> = match self.store.timelines.get(&self.channel) {
             Some(t) if t.loaded => {
