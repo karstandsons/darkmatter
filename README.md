@@ -1,5 +1,12 @@
 # Darkmatter
 
+[![CI](https://github.com/karstandsons/darkmatter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/karstandsons/darkmatter/actions/workflows/ci.yml)
+[![Release](https://github.com/karstandsons/darkmatter/actions/workflows/release.yml/badge.svg?event=push)](https://github.com/karstandsons/darkmatter/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/karstandsons/darkmatter?sort=semver)](https://github.com/karstandsons/darkmatter/releases/latest)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![pacman: karstandsons](https://img.shields.io/badge/pacman-karstandsons-1793d1?logo=archlinux&logoColor=white)](https://github.com/karstandsons/archlinux)
+[![Homebrew: karstandsons/tap](https://img.shields.io/badge/homebrew-karstandsons%2Ftap-fbb040?logo=homebrew&logoColor=white)](https://github.com/karstandsons/homebrew-tap)
+
 An Omarchy-themed Mattermost client in Rust, with tiled panes, a unified
 inbox and vim keys. It works with any Mattermost server. A compatible Rust
 server, **axiond**, is to follow.
@@ -15,14 +22,35 @@ server, **axiond**, is to follow.
 
 ## Install
 
+**Arch, CachyOS, Omarchy** (signed pacman repository; updates come with `pacman -Syu`):
+
+```sh
+curl -sL https://karstandsons.github.io/archlinux/karstandsons.asc | sudo pacman-key --add -
+sudo pacman-key --lsign-key 21F3F82B682C36A4F3576168D033CB9918675079
+printf '\n[karstandsons]\nServer = https://karstandsons.github.io/archlinux/$arch\n' | sudo tee -a /etc/pacman.conf
+sudo pacman -Sy darkmatter
+```
+
+**macOS** (Apple Silicon and Intel; updates with `brew upgrade`):
+
+```sh
+brew install --cask karstandsons/tap/darkmatter
+```
+
+**Other Linux:** download `darkmatter-<version>-<arch>-linux.tar.gz` from the
+[latest release](https://github.com/karstandsons/darkmatter/releases/latest),
+unpack it and run `./install.sh`. It installs to `~/.local`, with no root needed.
+
+**From source:**
+
 ```sh
 packaging/install.sh               # build and install to ~/.local (binary, launcher entry, icon); no root
 packaging/install.sh --uninstall   # remove them again (settings, layout and login are kept)
 ```
 
-On Arch/Omarchy, `packaging/arch/PKGBUILD` builds a `darkmatter-git` package:
-run `makepkg -si` in `packaging/arch`. It then shows up in the app launcher as
-**Darkmatter**. Add `--read-only` (or `MM_READONLY=1`) to look around a server
+Or build an Arch package from source with `makepkg -si` in `packaging/arch`
+(`darkmatter-git`). However it's installed, Darkmatter shows up in the app
+launcher. Add `--read-only` (or `MM_READONLY=1`) to look around a server
 without changing anything on it.
 
 ## Dev server
