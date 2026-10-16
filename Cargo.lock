@@ -1001,7 +1001,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "darkmatter"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arboard",
  "chrono",
@@ -2836,7 +2836,7 @@ dependencies = [
 
 [[package]]
 name = "mm-api"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "futures-util",
  "reqwest",
@@ -3518,7 +3518,7 @@ dependencies = [
 
 [[package]]
 name = "omarchy-theme"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "dirs",
  "notify",

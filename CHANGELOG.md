@@ -5,6 +5,8 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-16
+
 - **Built-in plugins:** meme, GIF, kaomoji and Quote now ship with
   Darkmatter and work out of the box (they need python3; meme also
   ImageMagick). One that's missing what it needs is off, and the shortcuts
