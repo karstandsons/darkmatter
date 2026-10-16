@@ -176,19 +176,41 @@ impl Chat {
             col = col.push(text("● read-only: nothing is sent to the server").size(11).color(c.yellow));
         }
         if let Some(release) = &self.new_release {
-            let install = std::env::current_exe().map_or(crate::update::Install::Local, |exe| crate::update::install_method(&exe));
-            let notice = column![
-                text(format!("⬆ Darkmatter {} is out", release.version)).size(12).font(bold()).color(c.accent),
-                text(crate::update::hint(install)).size(11).color(c.muted),
-            ]
-            .spacing(2);
-            col = col.push(button(notice).width(Length::Fill).padding([6, 8]).on_press(Message::Link(release.url.clone())).style(c.chip(false)));
+            col = col.push(self.update_notice(release, c));
         }
         container(col.push(footer))
         .width(250)
         .height(Length::Fill)
         .style(c.panel(c.sidebar))
         .into()
+    }
+
+    /// "Darkmatter X is out", with Update and What's new, then progress and
+    /// Restart now.
+    fn update_notice<'a>(&'a self, release: &'a crate::update::Available, c: Colors) -> Element<'a, Message> {
+        use crate::chat::UpdateState;
+        use crate::update::Install;
+        let install = crate::update::exe_path().map_or(Install::Local, |exe| crate::update::install_method(&exe));
+        let small = |label: &'a str, msg: Message, primary: bool| {
+            let b = button(text(label).size(12)).padding([3, 10]).on_press(msg);
+            if primary { b.style(c.primary_button()) } else { b.style(c.row_button(false)) }
+        };
+        let notes = small("What's new", Message::Link(release.url.clone()), false);
+        let mut notice = column![text(format!("⬆ Darkmatter {} is out", release.version)).size(12).font(bold()).color(c.accent)].spacing(6);
+        notice = match &self.updating {
+            _ if install == Install::Dev => notice.push(text(crate::update::hint(install)).size(11).color(c.muted)).push(notes),
+            UpdateState::Idle => notice
+                .push(text(crate::update::hint(install)).size(11).color(c.muted))
+                .push(row![small("Update", Message::UpdateNow, true), notes].spacing(6)),
+            UpdateState::Working => notice.push(text(crate::update::working(install, &release.version)).size(11).color(c.muted)),
+            UpdateState::Ready => notice
+                .push(text(format!("✓ Installed {}", release.version)).size(11).color(c.green))
+                .push(small("Restart now", Message::RestartNow, true)),
+            UpdateState::Failed(e) => notice
+                .push(text(e.as_str()).size(11).color(c.red))
+                .push(row![small("Try again", Message::UpdateNow, true), notes].spacing(6)),
+        };
+        container(notice).width(Length::Fill).padding([8, 10]).style(c.panel(c.surface)).into()
     }
 
     /// A pane's title bar: the channel name and topic, and Leave. It's also

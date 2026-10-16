@@ -111,6 +111,11 @@ pub enum Message {
     /// Time to look for a newer Darkmatter release.
     CheckUpdate,
     UpdateChecked(Result<Option<crate::update::Available>, String>),
+    /// The notice's Update button: install the new release.
+    UpdateNow,
+    UpdateInstalled(Result<(), String>),
+    /// Start the newly installed version and quit this one.
+    RestartNow,
     /// The server's custom emoji.
     CustomEmoji(Result<Vec<mm_api::models::CustomEmoji>, String>),
     /// A message from a pane's widgets, or a result for that pane.

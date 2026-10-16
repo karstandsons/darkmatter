@@ -27,6 +27,16 @@ pub enum Panel {
     Threads,
 }
 
+/// Where the Update button has got to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpdateState {
+    Idle,
+    Working,
+    /// Installed: restart to use it.
+    Ready,
+    Failed(String),
+}
+
 pub struct SearchPane {
     pub input: String,
     /// The terms the results are for ("" before the first search).
@@ -56,6 +66,7 @@ pub struct Chat {
     /// Look for newer releases; and the one found, if any.
     pub check_updates: bool,
     pub new_release: Option<crate::update::Available>,
+    pub updating: UpdateState,
     /// Vim-style keys when no text box has the cursor.
     pub vim_keys: bool,
     /// A `g` was pressed: another makes `gg`.
@@ -302,6 +313,7 @@ impl Chat {
             vim_keys: true,
             check_updates: true,
             new_release: None,
+            updating: UpdateState::Idle,
             pending_g: false,
             drafts: HashMap::new(),
             sending: None,
@@ -944,6 +956,34 @@ impl Chat {
             Message::UpdateChecked(Err(e)) => {
                 tracing::debug!("update check failed: {e}");
                 Task::none()
+            }
+            Message::UpdateNow => {
+                let (Some(release), Some(exe)) = (self.new_release.clone(), crate::update::exe_path()) else { return Task::none() };
+                if self.updating == UpdateState::Working {
+                    return Task::none();
+                }
+                self.updating = UpdateState::Working;
+                Task::perform(crate::update::install(release, exe), Message::UpdateInstalled)
+            }
+            Message::UpdateInstalled(result) => {
+                self.updating = match result {
+                    Ok(()) => UpdateState::Ready,
+                    Err(e) => {
+                        tracing::warn!("update failed: {e}");
+                        UpdateState::Failed(e)
+                    }
+                };
+                Task::none()
+            }
+            Message::RestartNow => {
+                let restarted = crate::update::exe_path().ok_or_else(|| "couldn't find Darkmatter's binary".to_string()).and_then(|exe| crate::update::relaunch(&exe));
+                match restarted {
+                    Ok(()) => iced::exit(),
+                    Err(e) => {
+                        self.updating = UpdateState::Failed(e);
+                        Task::none()
+                    }
+                }
             }
             Message::FocusComposer => operation::focus(self.pv().composer()),
             Message::SaveLayout => {

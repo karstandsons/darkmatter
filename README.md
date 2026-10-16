@@ -41,6 +41,12 @@ brew install --cask karstandsons/tap/darkmatter
 [latest release](https://github.com/karstandsons/darkmatter/releases/latest),
 unpack it and run `./install.sh`. It installs to `~/.local`, with no root needed.
 
+**Updates:** when a new release is out, the sidebar says so, with an **Update**
+button. A copy installed with `install.sh` downloads the release, checks it
+against the release's SHA256SUMS and replaces itself. On macOS the button runs
+`brew upgrade --cask darkmatter`. With pacman it opens a terminal for
+`sudo pacman -Syu`. Then **Restart now** starts the new version.
+
 **From source:**
 
 ```sh
@@ -130,7 +136,7 @@ density = "comfortable"    # default for new panes: "comfortable" | "compact"
 vim = true                 # vim-style keys when no text box has the cursor
 
 [updates]
-check = true               # look for a newer release on GitHub at startup and daily
+check = true               # look for a newer release on GitHub at startup and daily (and offer to install it)
 ```
 
 The bundled themes are copied from Omarchy (MIT, see `crates/omarchy-theme/themes/LICENSE`). Refresh them with `dev/sync-omarchy-themes.sh`.

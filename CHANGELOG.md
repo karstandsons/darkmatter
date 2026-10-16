@@ -5,6 +5,12 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **Update from the app:** the "new version" notice has an **Update** button,
+  then **Restart now**. A copy installed with `install.sh` downloads the
+  release, checks it against its SHA256SUMS, and replaces itself. With
+  Homebrew it runs `brew upgrade --cask darkmatter`. With pacman it opens a
+  terminal for `sudo pacman -Syu`. **What's new** opens the release notes.
+
 ## [0.1.1] - 2026-10-15
 
 - **Theme picker:** clicking a theme now uses it. Before, a click only
