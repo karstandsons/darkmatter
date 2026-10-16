@@ -5,6 +5,11 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **Update from the app:** the "new version" notice has an **Update** button,
+  then **Restart now**. A copy installed with `install.sh` downloads the
+  release, checks it against its SHA256SUMS, and replaces itself. With
+  Homebrew it runs `brew upgrade --cask darkmatter`. With pacman it opens a
+  terminal for `sudo pacman -Syu`. **What's new** opens the release notes.
 - **Slash commands** in the message box and replies, with completions as you
   type. Darkmatter's own (`/split`, `/inbox`, `/theme nord`, `/search`…) run
   locally; the rest go to the server (`/join`, `/msg`, `/away`, plugin
@@ -29,11 +34,8 @@ The release workflow uses each version's section here as its release notes.
   with people from the server and @here, @channel and @all.
 - Your own status dot follows `/away`, `/dnd` and `/online`.
 
-- **Update from the app:** the "new version" notice has an **Update** button,
-  then **Restart now**. A copy installed with `install.sh` downloads the
-  release, checks it against its SHA256SUMS, and replaces itself. With
-  Homebrew it runs `brew upgrade --cask darkmatter`. With pacman it opens a
-  terminal for `sudo pacman -Syu`. **What's new** opens the release notes.
+**Changed:** compact mode is one app-wide setting now (any per-pane setting
+from 0.1 is dropped), and Leave, Themes and Log out moved into the ☰ menu.
 
 ## [0.1.1] - 2026-10-15
 
