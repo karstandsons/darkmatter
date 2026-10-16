@@ -260,6 +260,12 @@ impl Chat {
                     .style(c.row_button(false)),
             );
         }
+        list = list.push(rule::horizontal(1)).push(item(
+            "🧩",
+            "Plugins…",
+            crate::commands::key_label(crate::commands::Command::Plugins),
+            Message::Run(crate::commands::Command::Plugins, String::new()),
+        ));
         Some(container(list).padding(4).width(300).style(c.panel(c.surface)).into())
     }
 
@@ -431,6 +437,7 @@ impl Chat {
             .push(rule::horizontal(1))
             .push(heading("Darkmatter"))
             .push(item("Themes".into(), C::Themes, None))
+            .push(item("Plugins".into(), C::Plugins, None))
             .push(item("Keyboard shortcuts".into(), C::Shortcuts, None))
             .push(item(format!("About Darkmatter {}", env!("CARGO_PKG_VERSION")), C::About, None))
             .push(rule::horizontal(1))

@@ -4,6 +4,13 @@ version = "0.1.0"
 run = ["python3", "gif.py"]
 requires = ["python3"]
 
+[[setting]]
+name = "api_key"
+label = "Giphy API key"
+secret = true
+description = "Free: create an app (API, not SDK) and copy its key."
+link = "https://developers.giphy.com/dashboard/?create=true"
+
 [[insert]]
 name = "gif"
 label = "GIF"

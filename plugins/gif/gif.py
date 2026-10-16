@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Darkmatter GIF plugin: search Giphy, attach the GIF you pick.
 
-Needs a Giphy API key (free at developers.giphy.com). Give it once with
-`/gif key <your key>` (kept in Darkmatter's data folder), or set `api_key`
-under `[plugins.gif]` in config.toml, or GIPHY_API_KEY.
+Needs a Giphy API key (free at developers.giphy.com). Set it in the Plugins
+window (Ctrl+Shift+P) or with `/gif key <your key>`; either way it's kept in
+secrets.json in Darkmatter's data folder for this plugin, and arrives in each
+request's config. GIPHY_API_KEY works too.
 """
 import concurrent.futures
 import json
@@ -16,7 +17,7 @@ import urllib.request
 
 OUT = os.environ.get("DARKMATTER_OUTPUT_DIR") or os.path.expanduser("~/.cache/darkmatter/plugins/gif")
 DATA = os.environ.get("DARKMATTER_DATA_DIR") or os.path.expanduser("~/.local/share/darkmatter/plugins/gif")
-KEY_FILE = os.path.join(DATA, "api_key")
+SECRETS = os.path.join(DATA, "secrets.json")
 SIGN_UP = "https://developers.giphy.com/dashboard/?create=true"
 THUMBS = os.path.join(OUT, "thumbs")
 SHOWN = 16
@@ -27,19 +28,24 @@ CONFIG = {}
 
 def key():
     k = str(CONFIG.get("api_key", "")).strip() or os.environ.get("GIPHY_API_KEY", "").strip()
-    if not k and os.path.exists(KEY_FILE):
-        with open(KEY_FILE) as f:
-            k = f.read().strip()
     if not k:
-        raise RuntimeError(f"needs a Giphy API key: get a free one at {SIGN_UP}, then send /gif key <your key>")
+        raise RuntimeError(f"needs a Giphy API key: get a free one at {SIGN_UP}, then add it in Plugins (Ctrl+Shift+P) or send /gif key <your key>")
     return k
 
 
 def save_key(k):
+    """Where the Plugins window keeps it too (only you can read it)."""
     os.makedirs(DATA, exist_ok=True)
-    fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    secrets = {}
+    if os.path.exists(SECRETS):
+        with open(SECRETS) as f:
+            secrets = json.load(f)
+    secrets["api_key"] = k.strip()
+    part = SECRETS + ".part"
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(k.strip() + "\n")
+        json.dump(secrets, f, indent=2)
+    os.replace(part, SECRETS)
 
 
 def get(url, path=None):

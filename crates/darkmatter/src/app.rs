@@ -10,6 +10,7 @@ use mm_api::{Client, ws};
 
 use crate::chat::Chat;
 use crate::config::Config;
+use crate::plugin_manager::{self, PluginManager};
 use crate::theme_picker::{self, ModeTab, ThemePicker};
 use omarchy_theme::{Catalog, ThemeChoice};
 use crate::session::Session;
@@ -33,6 +34,8 @@ pub struct App {
     picker: Option<ThemePicker>,
     /// Theme previewed from the picker, not yet saved.
     preview: Option<String>,
+    /// The Plugins window.
+    plugin_manager: Option<PluginManager>,
 }
 
 enum Screen {
@@ -75,6 +78,8 @@ pub enum Message {
     ThemeUpdate(String),
     ThemeRemove(String),
     ThemeDone(Result<String, String>),
+    /// The Plugins window.
+    Plugins(plugin_manager::Msg),
     Login(LoginField, String),
     /// Enter in a login field: next field, or sign in from the last one.
     LoginNext(LoginField),
@@ -277,6 +282,7 @@ impl App {
             os_mode: omarchy_theme::Mode::Dark,
             picker: None,
             preview: None,
+            plugin_manager: None,
         };
         app.apply_theme();
         let os_theme = iced::system::theme().map(Message::OsTheme);
@@ -322,6 +328,36 @@ impl App {
                 Err(e) => (true, e),
             });
         }
+    }
+
+    /// Plugins-window messages, and keys while it's open.
+    fn update_plugin_manager(&mut self, message: Message) -> ControlFlow<Task<Message>, Message> {
+        use plugin_manager::Msg;
+        let open = self.plugin_manager.is_some();
+        let msg = match message {
+            Message::Plugins(m) => m,
+            Message::Escape if open => Msg::Close,
+            Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) if open => match key {
+                Key::Named(Named::ArrowUp) => Msg::Step(-1),
+                Key::Named(Named::ArrowDown) => Msg::Step(1),
+                Key::Named(Named::Tab) => {
+                    let to = if modifiers.shift() { plugin_manager::FILTER } else { plugin_manager::URL };
+                    return ControlFlow::Break(operation::focus(to));
+                }
+                k if crate::commands::for_key(&k, modifiers) == Some(crate::commands::Command::Plugins) => Msg::Close,
+                _ => return ControlFlow::Break(Task::none()),
+            },
+            // Swallow other keys so the chat doesn't react.
+            Message::Key(_) if open => return ControlFlow::Break(Task::none()),
+            other => return ControlFlow::Continue(other),
+        };
+        let Screen::Chat(chat) = &mut self.screen else { return ControlFlow::Break(Task::none()) };
+        let (task, reloaded) = plugin_manager::update(&mut self.plugin_manager, &mut self.config, &mut chat.plugins, msg);
+        if reloaded {
+            // Its plugin numbers may have moved.
+            chat.plugin_picker = None;
+        }
+        ControlFlow::Break(task)
     }
 
     /// Theme-picker messages. `Continue` hands back a message that isn't the picker's.
@@ -545,6 +581,10 @@ impl App {
             Message::InPane(_, m) if matches!(*m, Message::Key(_)) => *m,
             m => m,
         };
+        let message = match self.update_plugin_manager(message) {
+            ControlFlow::Break(task) => return task,
+            ControlFlow::Continue(message) => message,
+        };
         let message = match self.update_picker(message) {
             ControlFlow::Break(task) => return task,
             ControlFlow::Continue(message) => message,
@@ -581,7 +621,7 @@ impl App {
                     && command != C::Leave
                 {
                     chat.menu = false;
-                    refocus = !matches!(command, C::QuickSwitcher | C::Search | C::Shortcuts | C::Themes | C::Logout);
+                    refocus = !matches!(command, C::QuickSwitcher | C::Search | C::Shortcuts | C::Themes | C::Plugins | C::Logout);
                 }
                 let task = self.run(command, arg);
                 if refocus { Task::batch([task, Task::done(Message::FocusComposer)]) } else { task }
@@ -676,6 +716,16 @@ impl App {
                 }
             }
             C::Themes => self.update(if self.picker.is_some() { Message::CloseThemes } else { Message::OpenThemes }),
+            C::Plugins => {
+                if let Screen::Chat(chat) = &mut self.screen {
+                    chat.plus = None;
+                }
+                self.picker = None;
+                self.preview = None;
+                self.apply_theme();
+                let msg = if self.plugin_manager.is_some() { plugin_manager::Msg::Close } else { plugin_manager::Msg::Open };
+                self.update(Message::Plugins(msg))
+            }
             C::ThreadLayout => self.update(Message::ToggleThreadLayout),
             C::ToggleDensity | C::Compact | C::Cozy => {
                 let compact = match command {
@@ -776,6 +826,9 @@ impl App {
         if let Some(p) = &self.picker {
             let choice = self.choice();
             body = body.push(p.view(&self.catalog, &choice, &self.theme.name, self.os_mode == omarchy_theme::Mode::Dark, self.omarchy, c));
+        }
+        if let (Some(m), Screen::Chat(chat)) = (&self.plugin_manager, &self.screen) {
+            body = body.push(m.view(&chat.plugins, &self.config, c));
         }
         container(body).width(Length::Fill).height(Length::Fill).style(c.panel(c.bg)).into()
     }

@@ -37,6 +37,29 @@ pub struct Manifest {
     pub inserts: Vec<InsertDef>,
     #[serde(default, rename = "action")]
     pub actions: Vec<ActionDef>,
+    /// What you can set in the Plugins window (an API key, say).
+    #[serde(default, rename = "setting")]
+    pub settings: Vec<SettingDef>,
+}
+
+/// A setting the Plugins window shows. Plain ones are kept in config.toml
+/// under `[plugins.<name>]`; secret ones in the plugin's data folder, readable
+/// only by you. Both reach the plugin in each request's `config`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingDef {
+    pub name: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub placeholder: String,
+    /// Hidden as you type, and kept out of config.toml.
+    #[serde(default)]
+    pub secret: bool,
+    /// Where to get it (a sign-up page).
+    #[serde(default)]
+    pub link: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -86,11 +109,20 @@ pub struct Plugin {
     pub config: serde_json::Value,
 }
 
+/// A plugin that loaded but is off.
+#[derive(Clone, Debug)]
+pub struct Off {
+    pub plugin: Plugin,
+    pub why: String,
+    /// You switched it off (rather than it missing something it needs).
+    pub by_you: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Plugins {
     pub list: Vec<Plugin>,
-    /// Plugins that loaded but are off: (name, why).
-    pub off: Vec<(String, String)>,
+    /// Plugins that loaded but are off.
+    pub off: Vec<Off>,
     /// Their slash commands, so typing one says why instead of sending it
     /// (and what you typed, a key say) to the server: (command, plugin).
     pub off_commands: Vec<(String, String)>,
@@ -125,6 +157,38 @@ pub fn output_dir(name: &str) -> Option<PathBuf> {
 /// Where a plugin may keep things between runs (an API key you gave it).
 pub fn data_dir(name: &str) -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("darkmatter/plugins").join(name))
+}
+
+fn secrets_path(name: &str) -> Option<PathBuf> {
+    Some(data_dir(name)?.join("secrets.json"))
+}
+
+/// A plugin's secret settings (API keys): `secrets.json` in its data folder.
+pub fn read_secrets(name: &str) -> serde_json::Map<String, serde_json::Value> {
+    secrets_path(name)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Set (or with None, clear) one secret setting. The file is only readable by you.
+pub fn write_secret(name: &str, key: &str, value: Option<&str>) -> Result<(), String> {
+    let path = secrets_path(name).ok_or("no data directory")?;
+    let mut secrets = read_secrets(name);
+    match value {
+        Some(v) => secrets.insert(key.to_string(), serde_json::Value::String(v.to_string())),
+        None => secrets.remove(key),
+    };
+    std::fs::create_dir_all(path.parent().expect("has a parent")).map_err(|e| e.to_string())?;
+    let text = serde_json::to_string_pretty(&secrets).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.part");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&tmp).map_err(|e| e.to_string())?;
+    std::io::Write::write_all(&mut file, text.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
 
 /// The built-in plugins, then yours (one of yours with the same name
@@ -181,20 +245,20 @@ fn settle(mut plugins: Plugins, config: &crate::config::PluginsConfig, found: &d
                 plugins.off_commands.push((c.name.clone(), name.clone()));
             }
         };
+        if let Some(settings) = config.settings.get(&name) {
+            p.config = serde_json::to_value(settings).unwrap_or_default();
+        }
         if config.off.contains(&name) {
             off_commands(&mut plugins);
-            plugins.off.push((name, "switched off in config.toml".into()));
+            plugins.off.push(Off { plugin: p, why: "switched off".into(), by_you: true });
             continue;
         }
         let missing: Vec<&String> = p.manifest.requires.iter().filter(|r| !r.split('|').any(|alt| found(alt.trim()))).collect();
         if !missing.is_empty() {
             off_commands(&mut plugins);
             let need: Vec<String> = missing.iter().map(|r| r.replace('|', " or ")).collect();
-            plugins.off.push((name, format!("needs {}", need.join(", "))));
+            plugins.off.push(Off { plugin: p, why: format!("needs {}", need.join(", ")), by_you: false });
             continue;
-        }
-        if let Some(settings) = config.settings.get(&name) {
-            p.config = serde_json::to_value(settings).unwrap_or_default();
         }
         plugins.list.push(p);
     }
@@ -243,7 +307,7 @@ impl Plugins {
     pub fn off_command(&self, input: &str) -> Option<String> {
         let name = input.strip_prefix('/')?.split_whitespace().next()?;
         let (_, plugin) = self.off_commands.iter().find(|(c, _)| c.eq_ignore_ascii_case(name))?;
-        let why = self.off.iter().find(|(n, _)| n == plugin).map_or("", |(_, w)| w.as_str());
+        let why = self.off.iter().find(|o| &o.plugin.manifest.name == plugin).map_or("", |o| o.why.as_str());
         Some(format!("/{name} is from the {plugin} plugin, which is off: {why}"))
     }
 
@@ -389,9 +453,12 @@ impl Plugin {
             cmd.env_remove(var);
         }
         let mut child = cmd.spawn().map_err(|e| format!("{name}: can't start {}: {e}", self.manifest.run[0]))?;
-        // The request, with this plugin's settings.
+        // The request, with this plugin's settings (secret ones read fresh,
+        // since the plugin itself may have just saved one).
         let mut value = serde_json::to_value(request).map_err(|e| e.to_string())?;
-        value["config"] = self.config.clone();
+        let mut config = self.config.as_object().cloned().unwrap_or_default();
+        config.extend(read_secrets(name));
+        value["config"] = serde_json::Value::Object(config);
         let mut line = value.to_string();
         line.push('\n');
         let mut stdin = child.stdin.take().ok_or("no stdin")?;
@@ -457,8 +524,8 @@ pub fn cli(args: &[String]) -> i32 {
             for p in &plugins.list {
                 describe(&p.manifest, if p.built_in { "built in" } else { "yours" });
             }
-            for (name, why) in &plugins.off {
-                println!("○ {name}: off, {why}");
+            for o in &plugins.off {
+                println!("○ {}: off, {}", o.plugin.manifest.name, o.why);
             }
             for (dir, e) in &plugins.errors {
                 println!("✗ {}: {e}", dir.display());
@@ -498,42 +565,121 @@ fn describe(m: &Manifest, whose: &str) {
 /// after showing what it adds and asking.
 fn add(source: &str) -> Result<(), String> {
     use std::io::Write;
-    let root = dir().ok_or("no config directory")?;
-    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    let staging = tempfile::Builder::new().prefix(".adding-").tempdir_in(&root).map_err(|e| e.to_string())?;
-    let fetched = staging.path().join("plugin");
-    let local = Path::new(source);
-    if local.is_dir() {
-        copy_dir(local, &fetched).map_err(|e| format!("can't copy {source}: {e}"))?;
-    } else {
-        let ok = std::process::Command::new("git")
-            .args(["clone", "--depth", "1", "--", source])
-            .arg(&fetched)
-            .status()
-            .map_err(|e| format!("can't run git: {e}"))?
-            .success();
-        if !ok {
-            return Err(format!("couldn't clone {source}"));
-        }
-    }
-    let m = read_manifest(&fetched)?;
-    let dest = root.join(&m.name);
-    if dest.exists() {
-        return Err(format!("{} is already installed at {}", m.name, dest.display()));
-    }
+    let (staged, m) = fetch(source)?;
     println!("This plugin runs programs on your computer as you:\n");
     describe(&m, "to add");
-    print!("\nInstall it to {}? [y/N] ", dest.display());
+    print!("\nInstall it to {}? [y/N] ", dir().unwrap_or_default().join(&m.name).display());
     std::io::stdout().flush().ok();
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer).map_err(|e| e.to_string())?;
     if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        discard(&staged);
         println!("Not installed.");
         return Ok(());
     }
-    std::fs::rename(&fetched, &dest).map_err(|e| e.to_string())?;
+    install_staged(&staged, &m)?;
     println!("Installed. Restart Darkmatter to use it.");
     Ok(())
+}
+
+/// Get a plugin (a folder, or a git repository to clone) into a staging
+/// folder beside yours, and read what it adds. Nothing runs yet; then
+/// `install_staged` or `discard`.
+pub fn fetch(source: &str) -> Result<(PathBuf, Manifest), String> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err("paste a git URL or a folder".into());
+    }
+    let root = dir().ok_or("no config directory")?;
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let staging = tempfile::Builder::new().prefix(".adding-").tempdir_in(&root).map_err(|e| e.to_string())?.keep();
+    let fetched = staging.join("plugin");
+    let expanded = match source.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
+        None => PathBuf::from(source),
+    };
+    let result = if expanded.is_dir() {
+        copy_dir(&expanded, &fetched).map_err(|e| format!("can't copy {source}: {e}"))
+    } else {
+        let out = std::process::Command::new("git")
+            .args(["clone", "--quiet", "--depth", "1", "--", source])
+            .arg(&fetched)
+            // Fail rather than wait for a password nobody can type.
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("can't run git: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            let why = String::from_utf8_lossy(&out.stderr);
+            let why = why.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().trim_start_matches("fatal: ").to_string();
+            Err(format!("couldn't clone {source}: {why}"))
+        }
+    };
+    let manifest = result.and_then(|()| read_manifest(&fetched)).and_then(|m| {
+        let dest = root.join(&m.name);
+        if dest.exists() { Err(format!("{} is already installed at {}", m.name, dest.display())) } else { Ok(m) }
+    });
+    match manifest {
+        Ok(m) => Ok((staging, m)),
+        Err(e) => {
+            discard(&staging);
+            Err(e)
+        }
+    }
+}
+
+/// Move a fetched plugin into your plugins folder.
+pub fn install_staged(staging: &Path, m: &Manifest) -> Result<PathBuf, String> {
+    let dest = dir().ok_or("no config directory")?.join(&m.name);
+    if dest.exists() {
+        discard(staging);
+        return Err(format!("{} is already installed", m.name));
+    }
+    std::fs::rename(staging.join("plugin"), &dest).map_err(|e| e.to_string())?;
+    discard(staging);
+    Ok(dest)
+}
+
+/// Throw away a fetched plugin that wasn't installed.
+pub fn discard(staging: &Path) {
+    if staging.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(".adding-")) {
+        let _ = std::fs::remove_dir_all(staging);
+    }
+}
+
+/// Delete one of your plugins (never a built-in one, nor anything outside
+/// your plugins folder).
+pub fn remove(plugin: &Plugin) -> Result<(), String> {
+    let root = dir().ok_or("no config directory")?.canonicalize().map_err(|e| e.to_string())?;
+    let target = plugin.dir.canonicalize().map_err(|e| e.to_string())?;
+    if plugin.built_in || target.parent() != Some(root.as_path()) {
+        return Err(format!("{} isn't in your plugins folder", plugin.manifest.name));
+    }
+    std::fs::remove_dir_all(&target).map_err(|e| e.to_string())
+}
+
+/// Whether a plugin came from git, so it can be updated.
+pub fn from_git(plugin: &Plugin) -> bool {
+    !plugin.built_in && plugin.dir.join(".git").exists()
+}
+
+/// Pull the latest version of a plugin installed from git.
+pub fn update(plugin: &Plugin) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&plugin.dir)
+        .args(["pull", "--ff-only", "--quiet"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("can't run git: {e}"))?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("couldn't update {}: {}", plugin.manifest.name, why.trim()));
+    }
+    read_manifest(&plugin.dir).map(|m| format!("Updated {}{}", m.name, if m.version.is_empty() { String::new() } else { format!(" to {}", m.version) }))
 }
 
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -624,9 +770,11 @@ glyph = "❝"
         let names: Vec<&str> = p.list.iter().map(|x| x.manifest.name.as_str()).collect();
         assert_eq!(names, ["echo", "meme"]);
         assert_eq!(p.list[0].config["key"], "k");
-        assert_eq!(p.off, [("gif".to_string(), "switched off in config.toml".to_string())]);
+        let off: Vec<(&str, &str, bool)> = p.off.iter().map(|o| (o.plugin.manifest.name.as_str(), o.why.as_str(), o.by_you)).collect();
+        assert_eq!(off, [("gif", "switched off", true)]);
         let p = settle(p, &crate::config::PluginsConfig::default(), &|prog| prog == "python3");
-        assert_eq!(p.off.last().unwrap(), &("meme".to_string(), "needs magick or convert".to_string()));
+        let last = p.off.last().unwrap();
+        assert_eq!((last.plugin.manifest.name.as_str(), last.why.as_str(), last.by_you), ("meme", "needs magick or convert", false));
         assert_eq!(p.off_command("/meme key secret").unwrap(), "/meme is from the meme plugin, which is off: needs magick or convert");
         assert_eq!(p.off_command("/echo hi"), None);
     }

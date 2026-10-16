@@ -9,6 +9,7 @@ mod media;
 mod pane;
 mod panels;
 mod plugin_picker;
+mod plugin_manager;
 mod plugins;
 mod session;
 mod shortcuts;

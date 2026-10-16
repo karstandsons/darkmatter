@@ -24,35 +24,55 @@ writing your own.
 | Plugin | Adds | Needs |
 |---|---|---|
 | [`meme`](../plugins/meme) | + Meme picker (`template \| top \| bottom`), `/meme drake \| tabs \| spaces` | python3, ImageMagick (`magick` or `convert`), internet for imgflip's templates |
-| [`gif`](../plugins/gif) | + GIF picker, `/gif <search>` | python3 and a free [Giphy API key](https://developers.giphy.com/dashboard/?create=true): send `/gif key <your key>` once |
+| [`gif`](../plugins/gif) | + GIF picker, `/gif <search>` | python3 and a free [Giphy API key](https://developers.giphy.com/dashboard/?create=true): paste it in Plugins (Ctrl+Shift+P), or send `/gif key <your key>` once |
 | [`kaomoji`](../plugins/kaomoji) | + Kaomoji picker, `/kao <name>` | python3 |
 | [`quote`](../plugins/quote) | ❝ on the hover bar: quote the message in your reply | python3 |
 
-A built-in plugin whose programs are missing is off; the shortcuts sheet
-(Ctrl+/, type "plugin") and `darkmatter plugins` say what it needs. They're
+A built-in plugin whose programs are missing is off; the Plugins window and
+`darkmatter plugins` say what it needs. They're
 installed in `share/darkmatter/plugins` beside the `darkmatter` binary
 (`/usr/share/darkmatter/plugins` with pacman, `~/.local/share/…` with
 install.sh) or in `Darkmatter.app/Contents/Resources/plugins`, and updates
 replace them.
 
+## The Plugins window
+
+**Ctrl+Shift+P**, `/plugins`, or ☰ → Plugins. Like Themes, it lists every
+plugin, built in or yours, with what it adds and whether it's on. There you
+can:
+
+- switch a plugin on or off;
+- fill in its settings, such as an API key;
+- install one from a git URL or a folder: Darkmatter fetches it and shows
+  what it adds and what it runs before you press Install;
+- update one you installed from git, or remove one of yours.
+
+Changes take effect right away; no restart.
+
 ## Settings
 
-In `~/.config/darkmatter/config.toml`:
+The Plugins window writes these; you can also edit
+`~/.config/darkmatter/config.toml` by hand:
 
 ```toml
 [plugins]
 off = ["gif"]          # switch plugins off (built in or yours)
 
-[plugins.gif]          # a plugin's own settings, sent with each request as "config"
-api_key = "…"
+[plugins.hello]        # a plugin's own settings, sent with each request as "config"
+greeting = "Howdy"
 ```
+
+Settings a plugin marks `secret` (API keys) are kept out of config.toml, so
+they don't end up in a dotfiles repository. They're in `secrets.json` in the
+plugin's data folder (`~/.local/share/darkmatter/plugins/<name>/`), readable
+only by you, and are added to `config` too.
 
 ## Installing your own
 
 Your plugins live in `~/.config/darkmatter/plugins/<name>/` (on macOS,
 `~/Library/Application Support/darkmatter/plugins/<name>/`). One with the
-same name as a built-in plugin replaces it. Restart Darkmatter after adding
-one.
+same name as a built-in plugin replaces it. Install them from the Plugins
+window, or from a terminal (then reopen the window or restart to load them):
 
 ```sh
 darkmatter plugins                       # what's installed (built in and yours), what's off and why
@@ -60,10 +80,9 @@ darkmatter plugins add ./my-plugin       # copy a folder in (shows what it adds,
 darkmatter plugins add https://github.com/you/darkmatter-thing.git
 ```
 
-To switch one of yours off without removing it, rename its folder to start
-with `_` or `.` (or list it in `off`). The keyboard shortcuts sheet (Ctrl+/)
-lists every plugin's commands, pickers and actions; type "plugin" in its
-filter.
+A folder whose name starts with `_` or `.` is ignored. The keyboard
+shortcuts sheet (Ctrl+/) lists every plugin's commands, pickers and actions;
+type "plugin" in its filter.
 
 ## plugin.toml
 
@@ -89,6 +108,14 @@ placeholder = "template | top text | bottom text"
 name = "quote"
 label = "Quote"
 glyph = "❝"
+
+[[setting]]                      # a field in the Plugins window
+name = "api_key"                 # its key in the request's config
+label = "API key"
+secret = true                    # hidden, and kept out of config.toml
+description = "Free at example.com"
+link = "https://example.com/keys"
+placeholder = "…"
 ```
 
 `run`'s first word runs from the plugin's folder if it names a file there (or
@@ -131,7 +158,7 @@ Each request is one JSON object with a `type`:
 `thread` is the root post's id when the answer is for a thread's reply box.
 
 Every request also has `config`: the plugin's `[plugins.<name>]` settings
-from config.toml (`{}` if none).
+from config.toml plus its secret settings (`{}` if none).
 
 ## Answers
 
@@ -192,6 +219,7 @@ echo '{"type":"command","name":"hello","args":"bob","context":{}}' | ./hello.sh
 
 ## Later
 
+- A library of plugins to browse and install from the Plugins window.
 - A sandboxed (WASM) kind of plugin, with permissions you grant, for plugins
   from people you don't know.
 - Server plugins on axiond, with the same `plugin.toml` and messages

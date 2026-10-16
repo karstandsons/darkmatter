@@ -628,7 +628,7 @@ impl Chat {
                 operation::focus(SHORTCUTS_INPUT)
             }
             // The app's: they change its config.
-            C::Themes | C::ThreadLayout | C::Logout | C::ToggleDensity | C::Compact | C::Cozy | C::ToggleSidebar | C::About => Task::none(),
+            C::Themes | C::Plugins | C::ThreadLayout | C::Logout | C::ToggleDensity | C::Compact | C::Cozy | C::ToggleSidebar | C::About => Task::none(),
         }
     }
 

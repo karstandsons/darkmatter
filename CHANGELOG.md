@@ -5,6 +5,14 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **Plugins window** (Ctrl+Shift+P, `/plugins`, ☰ → Plugins, or + →
+  Plugins…): see every plugin and what it adds, switch them on and off, fill
+  in settings like the GIF plugin's Giphy key, and install plugins from a git
+  URL or a folder (it shows what a plugin adds and runs before installing),
+  update or remove them. Changes apply right away.
+- Plugins can declare settings (`[[setting]]` in plugin.toml). Secret ones,
+  like API keys, are kept out of config.toml, in a file only you can read.
+
 ## [0.3.1] - 2026-10-16
 
 - **Built-in plugins:** meme, GIF, kaomoji and Quote now ship with
