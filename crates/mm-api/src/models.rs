@@ -361,3 +361,30 @@ pub struct NewPost {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub pending_post_id: String,
 }
+
+/// What the server says after running a slash command.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct CommandResponse {
+    #[serde(default, alias = "ResponseType", deserialize_with = "nullable")]
+    pub response_type: String,
+    #[serde(default, alias = "Text", deserialize_with = "nullable")]
+    pub text: String,
+    /// Where the client should go next, e.g. `/team/channels/name` after /join.
+    #[serde(default, alias = "GotoLocation", deserialize_with = "nullable")]
+    pub goto_location: String,
+}
+
+/// One completion for a partly typed slash command. The server sends these
+/// with Go's field names.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct CommandSuggestion {
+    /// The whole input once completed, without the leading slash.
+    #[serde(default, rename = "Complete", alias = "complete")]
+    pub complete: String,
+    #[serde(default, rename = "Suggestion", alias = "suggestion")]
+    pub suggestion: String,
+    #[serde(default, rename = "Hint", alias = "hint")]
+    pub hint: String,
+    #[serde(default, rename = "Description", alias = "description")]
+    pub description: String,
+}

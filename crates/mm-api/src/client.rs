@@ -205,6 +205,21 @@ impl Client {
         Ok(found.users)
     }
 
+    /// Run a slash command (`/join town-square`) as if typed in `channel_id`
+    /// (in the thread `root_id`, if not empty). Built-in and plugin commands alike.
+    pub async fn execute_command(&self, team_id: &str, channel_id: &str, root_id: &str, command: &str) -> Result<CommandResponse, Error> {
+        let body = json!({ "team_id": team_id, "channel_id": channel_id, "root_id": root_id, "parent_id": root_id, "command": command });
+        self.send(Method::POST, "commands/execute", Some(&body)).await
+    }
+
+    /// Completions for a partly typed slash command, from the server's built-in
+    /// and plugin commands.
+    pub async fn command_suggestions(&self, team_id: &str, channel_id: &str, input: &str) -> Result<Vec<CommandSuggestion>, Error> {
+        let path = format!("teams/{team_id}/commands/autocomplete_suggestions");
+        let req = self.request(Method::GET, &path)?.query(&[("user_input", input), ("channel_id", channel_id)]);
+        decode(&path, check(req.send().await?).await?).await
+    }
+
     /// Public channels in a team matching `term` (joined or not).
     pub async fn search_channels(&self, team_id: &str, term: &str) -> Result<Vec<Channel>, Error> {
         self.send(Method::POST, &format!("teams/{team_id}/channels/search"), Some(&json!({ "term": term }))).await

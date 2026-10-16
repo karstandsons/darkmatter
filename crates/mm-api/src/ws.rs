@@ -43,6 +43,8 @@ pub enum Event {
     Posted { post: Box<Post>, team_id: String, mentions: Vec<String> },
     PostEdited(Box<Post>),
     PostDeleted(Box<Post>),
+    /// A post only this user sees, e.g. a slash command's reply.
+    Ephemeral(Box<Post>),
     Typing { channel_id: String, user_id: String, parent_id: String },
     StatusChange { user_id: String, status: String },
     ReactionAdded(Reaction),
@@ -103,6 +105,7 @@ impl RawEvent {
             }),
             "post_edited" => self.nested("post").map(Event::PostEdited),
             "post_deleted" => self.nested("post").map(Event::PostDeleted),
+            "ephemeral_message" => self.nested("post").map(Event::Ephemeral),
             "typing" => Some(Event::Typing {
                 channel_id: self.broadcast.channel_id.clone(),
                 user_id: self.str("user_id"),

@@ -1,6 +1,7 @@
 mod app;
 mod chat;
 mod chat_view;
+mod commands;
 mod config;
 mod emoji_picker;
 mod layout;
@@ -8,6 +9,7 @@ mod media;
 mod pane;
 mod panels;
 mod session;
+mod shortcuts;
 mod store;
 mod style;
 mod switcher;

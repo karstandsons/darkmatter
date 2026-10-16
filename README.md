@@ -75,6 +75,17 @@ cargo run -p darkmatter                                   # login screen; the lo
 MM_URL=http://localhost:8065 MM_TOKEN=<token> cargo run -p darkmatter   # skip the login screen
 ```
 
+**Ctrl+/** (or `/shortcuts`, or `?` with vim keys) lists every shortcut and
+slash command. Ctrl+K with a leading `>` runs any command by name.
+
+**Slash commands** work in the message box and in replies, with completions
+as you type (Tab or Enter completes). Darkmatter's own: `/jump [name]`,
+`/search [terms]`, `/mentions`, `/inbox`, `/threads`, `/split`, `/split down`,
+`/close`, `/compact`, `/cozy`, `/theme [name]`, `/upload`, `/shortcuts`,
+`/logout`. Anything else goes to the server, so Mattermost's own (`/join`,
+`/msg`, `/away`, `/dnd`, `/shrug`…) and server plugins' commands work too.
+Start a message with `//` to send one that begins with a slash.
+
 | Key | Action |
 |---|---|
 | Ctrl+K | Quick switcher: channels, people (new DM), channels to join |
@@ -104,7 +115,7 @@ comes back next time.
 **Vim keys**, when no text box has the cursor (Esc leaves the message box):
 `j`/`k` move between messages, `gg`/`G` first/last, `h`/`l` panes, `r` reply,
 `o` show replies (or open an inbox message), `e` edit, `dd` delete, `+` react,
-`u` mark unread, `i` back to typing, `/` search.
+`u` mark unread, `i` back to typing, `/` search, `?` shortcuts.
 
 The window class is `darkmatter`, for Hyprland rules.
 

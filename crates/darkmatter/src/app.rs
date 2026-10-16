@@ -142,6 +142,18 @@ pub enum Message {
     InboxOpen(String, String, String),
     /// Switch threads between inline and the side pane.
     ToggleThreadLayout,
+    /// Run a command (from its keys, a slash command, the menu or Ctrl+K),
+    /// with what was typed after a slash command.
+    Run(crate::commands::Command, String),
+    /// The shortcuts sheet's filter.
+    ShortcutsQuery(String),
+    CloseShortcuts,
+    /// Server completions for a slash command being typed: (the input, results).
+    SlashSuggestions(String, Result<Vec<mm_api::models::CommandSuggestion>, String>),
+    /// Complete the composer's slash command with this text (without the slash).
+    SlashComplete(String),
+    /// The server ran a slash command.
+    CommandRan(Result<mm_api::models::CommandResponse, String>),
     CloseThread,
     Thread(String, Result<PostList, String>),
     ThreadDraft(String),
@@ -513,11 +525,13 @@ impl App {
                 self.apply_theme();
                 Task::none()
             }
-            Message::Key(keyboard::Event::KeyPressed { key: keyboard::Key::Character(k), modifiers, .. })
-                if modifiers.command() && modifiers.shift() && k.eq_ignore_ascii_case("t") =>
+            // Every command's keys, from the one list in commands.rs.
+            Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. })
+                if let Some(command) = crate::commands::for_key(&key, modifiers) =>
             {
-                self.update(Message::ToggleThreadLayout)
+                self.update(Message::Run(command, String::new()))
             }
+            Message::Run(command, arg) => self.run(command, arg),
             Message::ToggleThreadLayout => {
                 let inline = !self.config.layout.inline_threads();
                 self.config.layout.threads = Some(if inline { "inline" } else { "pane" }.into());
@@ -528,11 +542,6 @@ impl App {
                     Screen::Chat(chat) => chat.set_inline_threads(inline),
                     _ => Task::none(),
                 }
-            }
-            Message::Key(keyboard::Event::KeyPressed { key: keyboard::Key::Character(k), modifiers, .. })
-                if modifiers.command() && k.as_str() == "t" =>
-            {
-                self.update(if self.picker.is_some() { Message::CloseThemes } else { Message::OpenThemes })
             }
             // `mention:` links are @usernames; a profile popover can hook in here later.
             Message::Link(uri) if uri.starts_with("mention:") => Task::none(),
@@ -564,7 +573,7 @@ impl App {
                     chat.store.teams = b.teams;
                     chat.store.add_channels(b.channels, b.members);
                     chat.store.add_users(b.users);
-                    Task::none()
+                    chat.goto_pending()
                 }
                 _ => self.start_chat(b),
             },
@@ -583,6 +592,40 @@ impl App {
             }
             _ => match &mut self.screen {
                 Screen::Chat(chat) => chat.update(message),
+                _ => Task::none(),
+            },
+        }
+    }
+
+    fn run(&mut self, command: crate::commands::Command, arg: String) -> Task<Message> {
+        use crate::commands::Command as C;
+        match command {
+            C::Themes if !arg.is_empty() => {
+                // `/theme nord`: the best name match, used as the fixed theme.
+                let best = self
+                    .catalog
+                    .entries
+                    .iter()
+                    .filter_map(|e| crate::switcher::score(&arg, &e.display_name).or_else(|| crate::switcher::score(&arg, &e.slug)).map(|s| (s, e)))
+                    .max_by_key(|(s, _)| *s)
+                    .map(|(_, e)| e.clone());
+                match best {
+                    Some(entry) => {
+                        let choice = theme_picker::commit(&self.choice(), &entry, None);
+                        self.save_choice(&choice);
+                        Task::none()
+                    }
+                    None => match &mut self.screen {
+                        Screen::Chat(chat) => chat.notify(format!("No theme called {arg}")),
+                        _ => Task::none(),
+                    },
+                }
+            }
+            C::Themes => self.update(if self.picker.is_some() { Message::CloseThemes } else { Message::OpenThemes }),
+            C::ThreadLayout => self.update(Message::ToggleThreadLayout),
+            C::Logout => self.update(Message::Logout),
+            _ => match &mut self.screen {
+                Screen::Chat(chat) => chat.run(command, arg),
                 _ => Task::none(),
             },
         }

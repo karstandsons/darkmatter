@@ -70,10 +70,11 @@ impl Chat {
         }
         // Always a stack, so opening or closing an overlay keeps the widget
         // state under it (a focus set as the switcher closes would be lost).
-        let overlay = match (&self.switcher, &self.emoji_picker) {
-            (Some(sw), _) => Some(sw.view(&self.store, c)),
-            (None, Some(picker)) => Some(picker.view(c, &self.media)),
-            (None, None) => None,
+        let overlay = match (&self.shortcuts, &self.switcher, &self.emoji_picker) {
+            (Some(q), ..) => Some(crate::shortcuts::view(q, self.vim_keys, c)),
+            (None, Some(sw), _) => Some(sw.view(&self.store, c)),
+            (None, None, Some(picker)) => Some(picker.view(c, &self.media)),
+            (None, None, None) => None,
         };
         let mut layers = stack![layout];
         if let Some(overlay) = overlay {
@@ -149,7 +150,8 @@ impl Chat {
             list = list.push(item(ch));
         }
 
-        let status_color = if self.online { c.green } else { c.yellow };
+        // Your presence (/away, /dnd…); muted while the connection is down.
+        let status_color = if self.online { self.presence_color(&self.store.me.id, c).unwrap_or(c.green) } else { c.muted };
         let footer = row![
             text("●").size(10).color(status_color),
             text(format!("@{}", self.store.me.username)).size(13).color(c.fg),
@@ -183,6 +185,37 @@ impl Chat {
         .height(Length::Fill)
         .style(c.panel(c.sidebar))
         .into()
+    }
+
+    /// The slash menu's place above a composer: always a container (empty
+    /// when closed). Adding or swapping a widget before the composer would
+    /// cost it the focus.
+    fn slash_slot<'a>(&'a self, thread: bool, pv: &PaneView, c: Colors) -> Element<'a, Message> {
+        container(self.slash_view(thread, pv, c).unwrap_or_else(|| space().height(0).into())).into()
+    }
+
+    /// Completions above a composer while a slash command is typed.
+    fn slash_view<'a>(&'a self, thread: bool, pv: &PaneView, c: Colors) -> Option<Element<'a, Message>> {
+        let menu = self.slash.as_ref().filter(|m| m.thread == thread && !m.items.is_empty())?;
+        if pv.n != self.focused().n {
+            return None;
+        }
+        const SHOWN: usize = 8;
+        let start = menu.selected.saturating_sub(SHOWN - 1);
+        let rows = menu.items.iter().enumerate().skip(start).take(SHOWN).map(|(i, item)| {
+            let line = row![
+                text(format!("/{}", item.complete)).size(13).font(bold()).color(c.fg_bright),
+                text(&item.hint).size(12).color(c.muted),
+                space::horizontal(),
+                text(&item.description).size(12).color(c.muted),
+            ]
+            .spacing(8)
+            .align_y(iced::Center);
+            button(line).width(Length::Fill).padding([4, 10]).on_press(Message::SlashComplete(item.complete.clone())).style(c.row_button(i == menu.selected)).into()
+        });
+        let hint = text("Tab or Enter completes · ↑↓ to move · Esc to close").size(11).color(c.muted);
+        let list = Column::with_children(rows).push(container(hint).padding([2, 10])).spacing(1);
+        Some(container(list).padding(4).width(Length::Fill).style(c.panel(c.surface)).into())
     }
 
     /// "Darkmatter X is out", with Update and What's new, then progress and
@@ -327,23 +360,26 @@ impl Chat {
             .padding(12)
             .style(c.input());
 
-        let mut col = column![rule::horizontal(1), timeline];
-        if self.store.timelines.get(&pv.channel).is_some_and(|t| t.has_newer) {
-            col = col.push(
-                container(
-                    row![
-                        text("Viewing older messages").size(12).color(c.muted),
-                        space::horizontal(),
-                        button(text("Jump to latest ↓").size(12)).padding([3, 10]).on_press(Message::JumpToLatest).style(c.chip(false)),
-                    ]
-                    .align_y(iced::Center),
-                )
-                .padding([4, 20]),
-            );
-        }
-        if let Some(e) = self.error.as_ref().filter(|_| pv.n == self.focused().n) {
-            col = col.push(container(text(e).size(12).color(c.red)).padding([4, 20]));
-        }
+        // Rows above the composer sit in fixed slots, empty when unused:
+        // adding a widget before the composer would cost it the focus.
+        // (Always a container: swapping widget kinds in a slot loses the state after it too.)
+        let slot = |e: Option<Element<'a, Message>>| -> Element<'a, Message> { container(e.unwrap_or_else(|| space().height(0).into())).into() };
+        let older = self.store.timelines.get(&pv.channel).is_some_and(|t| t.has_newer).then(|| {
+            container(
+                row![
+                    text("Viewing older messages").size(12).color(c.muted),
+                    space::horizontal(),
+                    button(text("Jump to latest ↓").size(12)).padding([3, 10]).on_press(Message::JumpToLatest).style(c.chip(false)),
+                ]
+                .align_y(iced::Center),
+            )
+            .padding([4, 20])
+            .into()
+        });
+        let here = pv.n == self.focused().n;
+        let error = self.error.as_ref().filter(|_| here).map(|e| container(text(e).size(12).color(c.red)).padding([4, 20]).into());
+        let note = self.notice.as_ref().filter(|_| here).map(|n| container(text(n).size(12).color(c.muted)).padding([4, 20]).into());
+        let col = column![rule::horizontal(1), timeline, slot(older), slot(error), slot(note)];
         let attach = button(text("📎").size(16))
             .padding([10, 12])
             .on_press(Message::PickFiles)
@@ -351,9 +387,8 @@ impl Chat {
         let composer = row![attach, composer].spacing(8).align_y(iced::Center);
         let typing = self.editing_note(&pv.channel, c).unwrap_or_else(|| self.typing_line(&pv.channel, "", c));
         let mut footer = column![typing].spacing(6);
-        if let Some(chips) = self.attachment_chips(&pv.channel, c) {
-            footer = footer.push(chips);
-        }
+        footer = footer.push(self.slash_slot(false, pv, c));
+        footer = footer.push(slot(self.attachment_chips(&pv.channel, c)));
         col.push(container(footer.push(composer)).padding(PANE_FOOTER))
             .width(Length::Fill)
             .into()
@@ -395,7 +430,7 @@ impl Chat {
                 container(header).padding([12, 20]),
                 rule::horizontal(1),
                 body,
-                container(column![typing, composer].spacing(4)).padding(PANE_FOOTER),
+                container(Column::new().push(typing).push(self.slash_slot(true, self.focused(), c)).push(composer).spacing(4)).padding(PANE_FOOTER),
             ]
             .width(Length::Fill),
         )
@@ -574,7 +609,11 @@ impl Chat {
             let channel_id = self.store.post(root_id).map_or("", |p| p.channel_id.as_str());
             let key = format!("thread:{root_id}");
             let note = self.editing_note(&key, c).unwrap_or_else(|| self.typing_line(channel_id, root_id, c));
-            col = col.push(container(column![note, composer].spacing(4)).padding(iced::Padding { top: 6.0, bottom: 4.0, ..iced::Padding::ZERO }));
+            let menu = self.slash_slot(true, pv, c);
+            col = col.push(
+                container(Column::new().push(note).push(menu).push(composer).spacing(4))
+                    .padding(iced::Padding { top: 6.0, bottom: 4.0, ..iced::Padding::ZERO }),
+            );
         } else {
             col = col.push(
                 button(text("↩ Reply").size(12).color(c.accent))

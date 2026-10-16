@@ -20,6 +20,8 @@ pub enum Item {
     Person(User),
     /// A public channel you haven't joined.
     Join(Channel),
+    /// A command, when the query starts with `>`.
+    Command(crate::commands::Command),
 }
 
 #[derive(Default)]
@@ -69,6 +71,19 @@ pub fn score(query: &str, candidate: &str) -> Option<i64> {
 
 impl Switcher {
     pub fn refresh(&mut self, store: &Store) {
+        if let Some(q) = self.query.strip_prefix('>') {
+            let mut scored: Vec<(i64, &crate::commands::Spec)> = crate::commands::ALL
+                .iter()
+                .filter_map(|s| {
+                    let by_slash = s.slash.iter().filter_map(|n| score(q, n)).max();
+                    Some((score(q, s.title).max(by_slash)?, s))
+                })
+                .collect();
+            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            self.results = scored.into_iter().map(|(_, s)| Item::Command(s.command)).collect();
+            self.selected = self.selected.min(self.results.len().saturating_sub(1));
+            return;
+        }
         let mut scored: Vec<(i64, bool, i64, &Id)> = store
             .channels
             .values()
@@ -112,7 +127,7 @@ impl Switcher {
     }
 
     pub fn view<'a>(&'a self, store: &'a Store, c: Colors) -> Element<'a, Message> {
-        let input = text_input("Jump to a channel or person…", &self.query)
+        let input = text_input("Jump to a channel or person (> for commands)…", &self.query)
             .id(INPUT)
             .on_input(Message::SwitcherQuery)
             .on_submit(Message::SwitcherPick(None))
@@ -134,6 +149,17 @@ impl Switcher {
                     ],
                     i,
                 )),
+                Item::Command(command) => {
+                    let spec = crate::commands::spec_of(*command);
+                    let mut line = row![text("›").size(13).color(c.muted).width(20), text(spec.title).size(14).color(c.fg), space::horizontal()];
+                    if let Some(slash) = spec.slash.first() {
+                        line = line.push(text(format!("/{slash}")).size(12).color(c.accent));
+                    }
+                    if let Some(key) = crate::commands::key_label(*command) {
+                        line = line.push(text(key).size(12).color(c.muted));
+                    }
+                    Some((line, i))
+                }
                 Item::Join(ch) => Some((
                     row![
                         text("#").size(13).color(c.muted).width(20),
@@ -242,10 +268,19 @@ mod tests {
                 Item::Channel(id) => format!("ch:{id}"),
                 Item::Person(u) => format!("dm:{}", u.id),
                 Item::Join(c) => format!("join:{}", c.id),
+                Item::Command(c) => format!("cmd:{c:?}"),
             })
             .collect();
         // bob already has a DM and c1 is joined, so neither is offered again.
         assert_eq!(kinds, ["ch:d1", "ch:c1", "dm:bonnie", "join:c2"]);
+    }
+
+    #[test]
+    fn a_leading_angle_bracket_lists_commands() {
+        let store = Store::new(User { id: "me".into(), ..Default::default() });
+        let mut sw = Switcher { query: ">split d".into(), ..Default::default() };
+        sw.refresh(&store);
+        assert!(matches!(sw.current(), Some(Item::Command(crate::commands::Command::SplitDown))), "{:?}", sw.results);
     }
 
     #[test]

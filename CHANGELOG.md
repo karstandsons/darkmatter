@@ -5,6 +5,15 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **Slash commands** in the message box and replies, with completions as you
+  type. Darkmatter's own (`/split`, `/inbox`, `/theme nord`, `/search`…) run
+  locally; the rest go to the server (`/join`, `/msg`, `/away`, plugin
+  commands), and their replies show up in the channel.
+- **Keyboard shortcuts sheet** (Ctrl+/, `/shortcuts`, or `?`): every command
+  with its keys and slash form, searchable.
+- **Commands in Ctrl+K:** type `>` and a command's name.
+- Your own status dot follows `/away`, `/dnd` and `/online`.
+
 - **Update from the app:** the "new version" notice has an **Update** button,
   then **Restart now**. A copy installed with `install.sh` downloads the
   release, checks it against its SHA256SUMS, and replaces itself. With

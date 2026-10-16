@@ -10,6 +10,7 @@ use mm_api::models::{NewPost, Post};
 use mm_api::{Client, PostsQuery, ws};
 
 use crate::app::{Message, bootstrap, err};
+use crate::commands::{self, Command};
 use crate::session::Session;
 use crate::emoji_picker::{self, EmojiPicker};
 use crate::media;
@@ -20,6 +21,7 @@ use crate::switcher::{self, Item, Switcher};
 /// The side thread pane's scrollable (only the focused pane's thread shows there).
 pub const THREAD: &str = "thread";
 pub const SEARCH_INPUT: &str = "search-input";
+pub const SHORTCUTS_INPUT: &str = "shortcuts-input";
 
 /// What the right side shows when no thread is open on top of it.
 pub enum Panel {
@@ -35,6 +37,24 @@ pub enum UpdateState {
     /// Installed: restart to use it.
     Ready,
     Failed(String),
+}
+
+/// Completions for a slash command being typed in a composer.
+#[derive(Debug, Default)]
+pub struct SlashMenu {
+    /// The thread's reply box, not the pane's message box.
+    pub thread: bool,
+    pub input: String,
+    pub items: Vec<SlashItem>,
+    pub selected: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlashItem {
+    /// The completed command, without the slash.
+    pub complete: String,
+    pub hint: String,
+    pub description: String,
 }
 
 pub struct SearchPane {
@@ -103,6 +123,17 @@ pub struct Chat {
     last_in_thread: bool,
     next_local_id: u64,
     pub error: Option<String>,
+    /// A note for the focused pane, such as a slash command's reply.
+    pub notice: Option<String>,
+    /// The shortcuts sheet, with its filter.
+    pub shortcuts: Option<String>,
+    pub slash: Option<SlashMenu>,
+    /// Server completions, by the input they're for.
+    slash_server: (String, Vec<SlashItem>),
+    /// A server command's text, put back if it fails: (draft key, text).
+    command_sent: Option<(String, String)>,
+    /// A channel to open once the channel list is refreshed (after /join).
+    pending_goto: Option<String>,
 }
 
 pub struct Editing {
@@ -333,6 +364,12 @@ impl Chat {
             last_in_thread: false,
             next_local_id: 0,
             error: None,
+            notice: None,
+            shortcuts: None,
+            slash: None,
+            slash_server: Default::default(),
+            command_sent: None,
+            pending_goto: None,
         };
         let mut chat = chat;
         let statuses = chat.load_statuses();
@@ -430,6 +467,7 @@ impl Chat {
                 self.update(Message::FocusComposer)
             }
             "/" => self.update(Message::OpenSearch),
+            "?" => self.run(Command::Shortcuts, String::new()),
             _ => {
                 let Some((post, root, channel)) = selected else { return Task::none() };
                 let message = match key {
@@ -455,6 +493,176 @@ impl Chat {
                 };
                 self.update(message)
             }
+        }
+    }
+
+    /// Run a command from the registry. Themes, the thread layout and logging
+    /// out are the app's, and never get here.
+    pub fn run(&mut self, command: Command, arg: String) -> Task<Message> {
+        use Command as C;
+        match command {
+            C::QuickSwitcher if arg.is_empty() => {
+                self.update(if self.switcher.is_some() { Message::CloseSwitcher } else { Message::OpenSwitcher })
+            }
+            C::QuickSwitcher => {
+                let open = self.update(Message::OpenSwitcher);
+                Task::batch([open, self.update(Message::SwitcherQuery(arg))])
+            }
+            C::Search if arg.is_empty() => self.update(Message::OpenSearch),
+            C::Search => {
+                self.pv_mut().thread = None;
+                self.search(arg, false)
+            }
+            C::Mentions => self.update(Message::OpenMentions),
+            C::Inbox => self.update(Message::OpenInbox),
+            C::Threads => self.update(Message::OpenThreads),
+            C::PrevChannel => self.step_channel(-1),
+            C::NextChannel => self.step_channel(1),
+            C::SplitRight => self.update(Message::SplitPane(pane_grid::Axis::Vertical)),
+            C::SplitDown => self.update(Message::SplitPane(pane_grid::Axis::Horizontal)),
+            C::ClosePane => self.update(Message::ClosePane),
+            C::FocusLeft => self.update(Message::FocusAdjacent(pane_grid::Direction::Left)),
+            C::FocusRight => self.update(Message::FocusAdjacent(pane_grid::Direction::Right)),
+            C::FocusUp => self.update(Message::FocusAdjacent(pane_grid::Direction::Up)),
+            C::FocusDown => self.update(Message::FocusAdjacent(pane_grid::Direction::Down)),
+            C::ToggleDensity => self.update(Message::ToggleDensity),
+            C::Compact if !self.pv().compact => self.update(Message::ToggleDensity),
+            C::Cozy if self.pv().compact => self.update(Message::ToggleDensity),
+            C::Compact | C::Cozy => Task::none(),
+            C::Attach => self.update(Message::PickFiles),
+            C::ReactLatest => match self.latest_post().map(|p| p.id.clone()) {
+                Some(id) => self.update(Message::OpenEmoji(id)),
+                None => Task::none(),
+            },
+            C::ReplyLatest => match self.latest_post().map(|p| if p.is_reply() { p.root_id.clone() } else { p.id.clone() }) {
+                Some(root) => self.update(Message::OpenThread(root)),
+                None => Task::none(),
+            },
+            C::Shortcuts if self.shortcuts.is_some() => self.update(Message::CloseShortcuts),
+            C::Shortcuts => {
+                self.shortcuts = Some(String::new());
+                operation::focus(SHORTCUTS_INPUT)
+            }
+            C::Themes | C::ThreadLayout | C::Logout => Task::none(),
+        }
+    }
+
+    /// A short note in the focused pane (a slash command's reply, say).
+    pub fn notify(&mut self, text: String) -> Task<Message> {
+        self.notice = Some(text);
+        Task::none()
+    }
+
+    /// The newest message in the current channel.
+    fn latest_post(&self) -> Option<&Post> {
+        self.store.timelines.get(&self.pv().channel)?.entries.iter().rev().map(|e| &e.post).find(|p| !p.is_system())
+    }
+
+    /// Alt+↑/↓: the channel above or below in the sidebar.
+    fn step_channel(&mut self, step: isize) -> Task<Message> {
+        let (regular, direct) = self.store.sidebar(&self.team);
+        let ids: Vec<String> = regular.iter().chain(&direct).map(|c| c.id.clone()).collect();
+        let Some(pos) = ids.iter().position(|id| *id == self.pv().channel) else { return Task::none() };
+        let next = (pos as isize + step).rem_euclid(ids.len() as isize) as usize;
+        self.select_channel(ids[next].clone())
+    }
+
+    /// The composer's text changed: show, update or hide the slash menu, and
+    /// ask the server for its completions.
+    fn update_slash(&mut self, thread: bool, input: &str) -> Task<Message> {
+        if !input.starts_with('/') || input.starts_with("//") || input.contains('\n') {
+            self.slash = None;
+            return Task::none();
+        }
+        let mut items: Vec<SlashItem> = commands::complete_slash(input)
+            .into_iter()
+            .map(|(complete, hint, title)| SlashItem { complete, hint: hint.into(), description: title.into() })
+            .collect();
+        if self.slash_server.0 == input {
+            for item in &self.slash_server.1 {
+                if !items.iter().any(|i| i.complete == item.complete) {
+                    items.push(item.clone());
+                }
+            }
+        }
+        let selected = self.slash.as_ref().filter(|m| m.thread == thread).map_or(0, |m| m.selected).min(items.len().saturating_sub(1));
+        self.slash = Some(SlashMenu { thread, input: input.to_string(), items, selected });
+        if self.slash_server.0 == input {
+            return Task::none();
+        }
+        let (client, team, channel, input) = (self.client.clone(), self.team.clone(), self.pv().channel.clone(), input.to_string());
+        Task::perform(
+            async move {
+                let r = client.command_suggestions(&team, &channel, &input).await.map_err(err);
+                (input, r)
+            },
+            |(input, r)| Message::SlashSuggestions(input, r),
+        )
+    }
+
+    /// Replace the slash command being typed with `complete`.
+    fn complete_slash(&mut self, complete: &str) -> Task<Message> {
+        let Some(menu) = &self.slash else { return Task::none() };
+        let thread = menu.thread;
+        let text = format!("/{complete} ");
+        let (key, id) = if thread {
+            let Some(root) = self.pv().thread.clone() else { return Task::none() };
+            (thread_key(&root), self.pv().thread_composer())
+        } else {
+            (self.pv().channel.clone(), self.pv().composer())
+        };
+        self.drafts.insert(key, text.clone());
+        let more = self.update_slash(thread, &text);
+        Task::batch([more, operation::focus(id.clone()), operation::move_cursor_to_end(id)])
+    }
+
+    /// Enter in a composer whose text starts with a slash. `Some` when it was
+    /// a command (run here, or sent to the server); `None` sends it as a message.
+    fn slash_send(&mut self, thread: bool) -> Option<Task<Message>> {
+        let (key, root) = if thread {
+            let root = self.pv().thread.clone()?;
+            (thread_key(&root), root)
+        } else {
+            (self.pv().channel.clone(), String::new())
+        };
+        let text = self.drafts.get(&key)?.trim().to_string();
+        if !text.starts_with('/') {
+            return None;
+        }
+        if let Some(rest) = text.strip_prefix("//") {
+            // `//` sends a message that starts with a slash.
+            self.drafts.insert(key, format!("/{rest}"));
+            return None;
+        }
+        // Enter on a half-typed name picks the highlighted completion.
+        if let Some(menu) = &self.slash
+            && !text.contains(' ')
+            && let Some(item) = menu.items.get(menu.selected)
+            && item.complete != text[1..]
+        {
+            let complete = item.complete.clone();
+            return Some(self.complete_slash(&complete));
+        }
+        self.slash = None;
+        self.notice = None;
+        self.drafts.remove(&key);
+        if let Some((command, arg)) = commands::parse_slash(&text) {
+            return Some(Task::done(Message::Run(command, arg)));
+        }
+        self.command_sent = Some((key, text.clone()));
+        let (client, team, channel) = (self.client.clone(), self.team.clone(), self.store.post(&root).map_or(self.pv().channel.clone(), |p| p.channel_id.clone()));
+        Some(Task::perform(async move { client.execute_command(&team, &channel, &root, &text).await.map_err(err) }, Message::CommandRan))
+    }
+
+    /// After the channel list is refreshed: open the channel a /join went to.
+    pub fn goto_pending(&mut self) -> Task<Message> {
+        let Some(name) = self.pending_goto.take() else { return Task::none() };
+        match self.store.channels.values().find(|c| c.name == name && (c.team_id == self.team || c.team_id.is_empty())) {
+            Some(c) => {
+                let id = c.id.clone();
+                self.select_channel(id)
+            }
+            None => Task::none(),
         }
     }
 
@@ -842,14 +1050,18 @@ impl Chat {
                 Task::none()
             }
             Message::Draft(d) => {
+                let slash = self.update_slash(false, &d);
                 self.drafts.insert(self.pv().channel.clone(), d);
-                Task::none()
+                slash
             }
             Message::Send if self.editing.as_ref().is_some_and(|e| e.key == self.pv().channel) => self.save_edit(),
             Message::SendReply if self.editing.as_ref().is_some_and(|e| Some(&e.key) == self.pv().thread.as_ref().map(|r| thread_key(r)).as_ref()) => {
                 self.save_edit()
             }
+            Message::Send if let Some(task) = self.slash_send(false) => task,
+            Message::SendReply if let Some(task) = self.slash_send(true) => task,
             Message::Send => {
+                self.notice = None;
                 self.last_in_thread = false;
                 let message = self.draft().trim().to_string();
                 let here = |a: &&media::Pending| a.channel_id == self.pv().channel;
@@ -1156,8 +1368,80 @@ impl Chat {
                 Task::none()
             }
             Message::ThreadDraft(d) => {
-                if let Some(root) = &self.pv().thread {
-                    self.drafts.insert(thread_key(root), d);
+                let Some(root) = self.pv().thread.clone() else { return Task::none() };
+                let slash = self.update_slash(true, &d);
+                self.drafts.insert(thread_key(&root), d);
+                slash
+            }
+            Message::SlashSuggestions(input, Ok(found)) => {
+                let items = found
+                    .into_iter()
+                    .map(|s| SlashItem { complete: s.complete, hint: s.hint, description: s.description })
+                    .collect();
+                self.slash_server = (input.clone(), items);
+                match &self.slash {
+                    Some(menu) if menu.input == input => {
+                        let thread = menu.thread;
+                        self.update_slash(thread, &input)
+                    }
+                    _ => Task::none(),
+                }
+            }
+            Message::SlashSuggestions(_, Err(e)) => {
+                tracing::debug!("no command suggestions: {e}");
+                Task::none()
+            }
+            Message::SlashComplete(complete) => self.complete_slash(&complete),
+            Message::CommandRan(Ok(resp)) => {
+                self.command_sent = None;
+                // Ephemeral replies also arrive over the socket, as a message.
+                if resp.response_type != "ephemeral" && !resp.text.trim().is_empty() {
+                    self.notice = Some(resp.text.trim().to_string());
+                }
+                // `/join x` answers with where to go: /team/channels/x.
+                if let Some((_, name)) = resp.goto_location.rsplit_once("/channels/") {
+                    let name = name.trim_end_matches('/').to_string();
+                    if self.store.channels.values().any(|c| c.name == name) {
+                        self.pending_goto = Some(name);
+                        return self.goto_pending();
+                    }
+                    self.pending_goto = Some(name);
+                    return bootstrap(self.session.clone());
+                }
+                Task::none()
+            }
+            Message::CommandRan(Err(e)) => {
+                if let Some((key, text)) = self.command_sent.take() {
+                    self.drafts.entry(key).or_insert(text);
+                }
+                self.error = Some(e);
+                Task::none()
+            }
+            Message::ShortcutsQuery(q) => {
+                self.shortcuts = Some(q);
+                Task::none()
+            }
+            Message::CloseShortcuts => {
+                self.shortcuts = None;
+                operation::focus(self.pv().composer())
+            }
+            Message::Escape if self.shortcuts.is_some() => self.update(Message::CloseShortcuts),
+            Message::Escape if self.slash.is_some() => {
+                self.slash = None;
+                Task::none()
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Named(named @ (Named::ArrowUp | Named::ArrowDown | Named::Tab)), modifiers, .. })
+                if self.slash.as_ref().is_some_and(|m| !m.items.is_empty()) && !modifiers.alt() && !modifiers.command() =>
+            {
+                let Some(menu) = &mut self.slash else { return Task::none() };
+                let n = menu.items.len();
+                match named {
+                    Named::Tab => {
+                        let complete = menu.items[menu.selected].complete.clone();
+                        return self.complete_slash(&complete);
+                    }
+                    Named::ArrowUp => menu.selected = (menu.selected + n - 1) % n,
+                    _ => menu.selected = (menu.selected + 1) % n,
                 }
                 Task::none()
             }
@@ -1420,7 +1704,7 @@ impl Chat {
                 sw.selected = 0;
                 sw.generation += 1;
                 sw.refresh(&self.store);
-                if sw.query.trim().is_empty() {
+                if sw.query.trim().is_empty() || sw.query.starts_with('>') {
                     return Task::none();
                 }
                 // Wait for a pause in typing before asking the server.
@@ -1456,6 +1740,7 @@ impl Chat {
                     None => sw.current(),
                 };
                 match item.cloned() {
+                    Some(Item::Command(command)) => Task::batch([operation::focus(self.pv().composer()), Task::done(Message::Run(command, String::new()))]),
                     Some(Item::Channel(id)) => {
                         if let Some(team) = self.store.channels.get(&id).map(|c| c.team_id.clone())
                             && !team.is_empty()
@@ -1526,27 +1811,6 @@ impl Chat {
                 self.error = Some(format!("Couldn't leave: {e}"));
                 Task::none()
             }
-            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
-                if modifiers.command() && !modifiers.shift() && k.as_str() == "f" =>
-            {
-                self.update(Message::OpenSearch)
-            }
-            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
-                if modifiers.command() && modifiers.shift() && k.eq_ignore_ascii_case("m") =>
-            {
-                self.update(Message::OpenMentions)
-            }
-            // Mattermost's upload shortcut.
-            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
-                if modifiers.command() && k.as_str() == "u" =>
-            {
-                self.update(Message::PickFiles)
-            }
-            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
-                if modifiers.command() && k.as_str() == "k" =>
-            {
-                self.update(if self.switcher.is_some() { Message::CloseSwitcher } else { Message::OpenSwitcher })
-            }
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(named), .. }) if self.switcher.is_some() => {
                 match named {
                     Named::ArrowUp => self.switcher.as_mut().map(|s| s.step(-1)),
@@ -1559,18 +1823,6 @@ impl Chat {
                 // Offsets count up from the bottom (anchor_bottom), so PageUp is positive.
                 let dy = if named == Named::PageUp { 500.0 } else { -500.0 };
                 operation::scroll_by(self.pv().timeline(), iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: dy })
-            }
-            // Mattermost's Ctrl+Shift+\\: react to the latest message.
-            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
-                if modifiers.command() && modifiers.shift() && matches!(k.as_str(), "\\" | "|") =>
-            {
-                let last = self.store.timelines.get(&self.pv().channel).and_then(|t| {
-                    t.entries.iter().rev().map(|e| &e.post).find(|p| !p.is_system()).map(|p| p.id.clone())
-                });
-                match last {
-                    Some(id) => self.update(Message::OpenEmoji(id)),
-                    None => Task::none(),
-                }
             }
             // Up in an empty composer edits your last message, as in Mattermost.
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::ArrowUp), modifiers, .. })
@@ -1589,21 +1841,6 @@ impl Chat {
                 let last = timeline.and_then(|t| t.entries.iter().rev().map(|e| &e.post).find(|p| p.user_id == *me && !p.is_system()));
                 match last.map(|p| p.id.clone()) {
                     Some(id) => self.start_edit(&id),
-                    None => Task::none(),
-                }
-            }
-            // Mattermost's shortcut: reply to the latest message in the channel.
-            Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::ArrowUp), modifiers, .. })
-                if modifiers.shift() && !modifiers.alt() =>
-            {
-                let last = self.store.timelines.get(&self.pv().channel).and_then(|t| {
-                    t.entries.iter().rev().map(|e| &e.post).find(|p| !p.is_system())
-                });
-                match last {
-                    Some(p) => {
-                        let root = if p.is_reply() { p.root_id.clone() } else { p.id.clone() };
-                        self.update(Message::OpenThread(root))
-                    }
                     None => Task::none(),
                 }
             }
@@ -1649,51 +1886,6 @@ impl Chat {
                     && self.editing.is_none() =>
             {
                 self.vim_key(k.as_str())
-            }
-            // Ctrl+D splits right, Ctrl+Shift+D down (like terminal splits); Ctrl+W closes.
-            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
-                if modifiers.command() && !modifiers.alt() && k.eq_ignore_ascii_case("d") =>
-            {
-                let axis = if modifiers.shift() { pane_grid::Axis::Horizontal } else { pane_grid::Axis::Vertical };
-                self.update(Message::SplitPane(axis))
-            }
-            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
-                if modifiers.command() && !modifiers.shift() && k.as_str() == "i" =>
-            {
-                self.update(Message::OpenInbox)
-            }
-            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
-                if modifiers.command() && modifiers.shift() && k.eq_ignore_ascii_case("l") =>
-            {
-                self.update(Message::ToggleDensity)
-            }
-            Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
-                if modifiers.command() && !modifiers.shift() && k.as_str() == "w" =>
-            {
-                self.update(Message::ClosePane)
-            }
-            // Ctrl+Alt+arrows move between panes.
-            Message::Key(keyboard::Event::KeyPressed { key: Key::Named(named), modifiers, .. }) if modifiers.command() && modifiers.alt() => {
-                let direction = match named {
-                    Named::ArrowLeft => pane_grid::Direction::Left,
-                    Named::ArrowRight => pane_grid::Direction::Right,
-                    Named::ArrowUp => pane_grid::Direction::Up,
-                    Named::ArrowDown => pane_grid::Direction::Down,
-                    _ => return Task::none(),
-                };
-                self.update(Message::FocusAdjacent(direction))
-            }
-            Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) if modifiers.alt() => {
-                let step: isize = match key {
-                    Key::Named(Named::ArrowUp) => -1,
-                    Key::Named(Named::ArrowDown) => 1,
-                    _ => return Task::none(),
-                };
-                let (regular, direct) = self.store.sidebar(&self.team);
-                let ids: Vec<String> = regular.iter().chain(&direct).map(|c| c.id.clone()).collect();
-                let Some(pos) = ids.iter().position(|id| *id == self.pv().channel) else { return Task::none() };
-                let next = (pos as isize + step).rem_euclid(ids.len() as isize) as usize;
-                self.select_channel(ids[next].clone())
             }
             _ => Task::none(),
         }
@@ -1755,6 +1947,11 @@ impl Chat {
                 // Bottom-anchored lists stay on the newest post by themselves, and
                 // someone reading further up isn't yanked down.
                 Task::batch([self.load_missing_users(), feed])
+            }
+            M::Event(Event::Ephemeral(post)) => {
+                // Shown where it was asked for, and only until the history reloads.
+                self.store.sent(*post);
+                Task::none()
             }
             M::Event(Event::PostEdited(post)) => {
                 self.store.edited(*post);
