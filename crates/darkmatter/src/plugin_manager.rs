@@ -209,12 +209,14 @@ pub fn update(
         Msg::Select(i) => {
             m.selected = i;
             m.confirm_remove = None;
+            m.status = None;
             Task::none()
         }
         Msg::Step(by) => {
             if !m.results.is_empty() {
                 m.selected = (m.selected as isize + by).rem_euclid(m.results.len() as isize) as usize;
                 m.confirm_remove = None;
+                m.status = None;
             }
             m.reveal()
         }
@@ -344,6 +346,13 @@ pub fn update(
             }
             m.confirm_remove = None;
             let Some(p) = find(plugins, &name) else { return (Task::none(), false) };
+            // Its settings go too, unless a built-in one by that name remains.
+            let built_in_too = plugins::built_in_dir().is_some_and(|d| d.join(&name).is_dir());
+            if !built_in_too {
+                config.plugins.off.retain(|n| *n != name);
+                config.plugins.settings.remove(&name);
+                save(config);
+            }
             m.busy = true;
             blocking(move || plugins::remove(&p).map(|()| (None, format!("Removed {name}"))))
         }
@@ -527,7 +536,8 @@ impl PluginManager {
                 .size(13)
                 .style(c.input());
             let mut line = row![text(&def.label).size(13).color(c.fg).width(150), input].spacing(8).align_y(iced::Center);
-            if edit.is_some() {
+            // An emptied secret field changes nothing, so it still offers Forget.
+            if edit.is_some_and(|v| !(def.secret && v.is_empty())) {
                 line = line.push(small(c, "Save", Some(Message::Plugins(Msg::Save(name.clone())))));
             } else if def.secret && is_set {
                 line = line.push(small(c, "Forget", Some(Message::Plugins(Msg::Clear(name.clone(), def.name.clone())))));
