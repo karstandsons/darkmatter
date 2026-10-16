@@ -17,6 +17,8 @@ optdepends=(
   'gnome-keyring: keep the login in a keyring (or any Secret Service)'
   'xdg-desktop-portal: file picker for attachments'
   'libnotify: mention notifications'
+  'python: the built-in plugins (meme, gif, kaomoji, quote)'
+  'imagemagick: the meme plugin'
 )
 conflicts=('darkmatter-bin' 'darkmatter-git')
 source=("darkmatter-$pkgver-$CARCH-linux.tar.gz")
@@ -29,5 +31,8 @@ package() {
   install -Dm644 darkmatter.desktop "$pkgdir/usr/share/applications/darkmatter.desktop"
   install -Dm644 darkmatter.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/darkmatter.svg"
   install -Dm644 README.md "$pkgdir/usr/share/doc/darkmatter/README.md"
+  install -d "$pkgdir/usr/share/darkmatter"
+  cp -r plugins "$pkgdir/usr/share/darkmatter/plugins"
+  chmod -R u=rwX,go=rX "$pkgdir/usr/share/darkmatter/plugins"
   install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname/"
 }

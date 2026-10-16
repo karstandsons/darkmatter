@@ -2,6 +2,7 @@ name = "meme"
 description = "Caption a meme template (imgflip's top 100) with ImageMagick"
 version = "0.1.0"
 run = ["python3", "meme.py"]
+requires = ["python3", "magick|convert"]
 
 [[insert]]
 name = "meme"

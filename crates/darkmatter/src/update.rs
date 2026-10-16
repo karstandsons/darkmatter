@@ -183,22 +183,67 @@ fn sha256_hex(bytes: &[u8]) -> String {
     sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The files install.sh put down, from the tarball: (name in the tarball, bytes).
-fn unpack(tarball: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+/// A file from the tarball's `plugins/` folder: (path inside it, bytes, mode).
+type PluginFile = (PathBuf, Vec<u8>, u32);
+/// A file install.sh put down: (name in the tarball, bytes).
+type TopFile = (String, Vec<u8>);
+
+/// The files install.sh put down, from the tarball: (name in the tarball,
+/// bytes), and the built-in plugins.
+fn unpack(tarball: &[u8]) -> Result<(Vec<TopFile>, Vec<PluginFile>), String> {
     use std::io::Read;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tarball));
-    let mut files = Vec::new();
+    let (mut files, mut plugins) = (Vec::new(), Vec::new());
     for entry in archive.entries().map_err(|e| e.to_string())? {
         let mut entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path().map_err(|e| e.to_string())?.into_owned();
         let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
-        if path.components().count() == 2 && ["darkmatter", "darkmatter.desktop", "darkmatter.svg"].contains(&name.as_str()) {
+        let parts: Vec<_> = path.components().collect();
+        let regular = entry.header().entry_type().is_file();
+        if parts.len() == 2 && ["darkmatter", "darkmatter.desktop", "darkmatter.svg"].contains(&name.as_str()) {
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
             files.push((name, bytes));
+        } else if regular && parts.len() > 2 && parts[1].as_os_str() == "plugins" {
+            // Only plain names below plugins/ (no `..`).
+            let rel: PathBuf = parts[2..].iter().collect();
+            if parts[2..].iter().all(|c| matches!(c, std::path::Component::Normal(_))) {
+                let mode = entry.header().mode().unwrap_or(0o644) & 0o755;
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+                plugins.push((rel, bytes, mode));
+            }
         }
     }
-    Ok(files)
+    Ok((files, plugins))
+}
+
+/// Put the new built-in plugins in `dest`, replacing the old ones whole.
+fn replace_plugins(dest: &Path, files: &[PluginFile]) -> Result<(), String> {
+    let parent = dest.parent().ok_or("no parent folder")?;
+    let fail = |e: std::io::Error| format!("couldn't write {}: {e}", dest.display());
+    std::fs::create_dir_all(parent).map_err(fail)?;
+    let (new, old) = (parent.join(".plugins.new"), parent.join(".plugins.old"));
+    let _ = std::fs::remove_dir_all(&new);
+    let _ = std::fs::remove_dir_all(&old);
+    for (rel, bytes, mode) in files {
+        let path = new.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap_or(&new)).map_err(fail)?;
+        std::fs::write(&path, bytes).map_err(fail)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(*mode)).map_err(fail)?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+    }
+    if dest.exists() {
+        std::fs::rename(dest, &old).map_err(fail)?;
+    }
+    std::fs::rename(&new, dest).map_err(fail)?;
+    let _ = std::fs::remove_dir_all(&old);
+    Ok(())
 }
 
 /// Write `bytes` next to `dest` and rename it into place, so nothing ever
@@ -244,7 +289,7 @@ async fn install_tarball(release: &Available, exe: &Path) -> Result<(), String> 
     let exe = exe.to_path_buf();
     let version = release.version.clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let files = unpack(&tarball)?;
+        let (files, plugins) = unpack(&tarball)?;
         let file = |n: &str| files.iter().find(|(name, _)| name == n).map(|(_, b)| b.as_slice());
         let bin = file("darkmatter").ok_or("the tarball has no darkmatter binary")?;
         // Try the new binary before it replaces this one.
@@ -266,6 +311,13 @@ async fn install_tarball(release: &Available, exe: &Path) -> Result<(), String> 
                 if let (Some(bytes), true) = (file(n), dest.exists()) {
                     replace(&dest, bytes, 0o644)?;
                 }
+            }
+            // The built-in plugins, if install.sh put the launcher entry down
+            // (0.3.0's didn't have plugins yet).
+            let launcher = prefix.join("share/applications/darkmatter.desktop");
+            let dest = prefix.join("share/darkmatter/plugins");
+            if !plugins.is_empty() && (dest.exists() || launcher.exists()) {
+                replace_plugins(&dest, &plugins)?;
             }
         }
         Ok(())
@@ -385,7 +437,13 @@ mod tests {
         let name = tarball_name("0.2.0");
         let dir = format!("darkmatter-0.2.0-{}-linux", std::env::consts::ARCH);
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
-        for (file, body, mode) in [("darkmatter", new_bin, 0o755), ("darkmatter.desktop", "[Desktop Entry]\nName=New\n", 0o644), ("README.md", "hi", 0o644)] {
+        for (file, body, mode) in [
+            ("darkmatter", new_bin, 0o755),
+            ("darkmatter.desktop", "[Desktop Entry]\nName=New\n", 0o644),
+            ("README.md", "hi", 0o644),
+            ("plugins/kao/plugin.toml", "name = \"kao\"", 0o644),
+            ("plugins/kao/kao.py", "print()", 0o755),
+        ] {
             let mut header = tar::Header::new_gnu();
             header.set_size(body.len() as u64);
             header.set_mode(mode);
@@ -414,8 +472,18 @@ mod tests {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             replace(p, body.as_bytes(), 0o755).unwrap();
         }
+        let old_plugin = prefix.path().join("share/darkmatter/plugins/gone/plugin.toml");
+        std::fs::create_dir_all(old_plugin.parent().unwrap()).unwrap();
+        std::fs::write(&old_plugin, "old").unwrap();
         install(release.clone(), exe.clone()).await.unwrap();
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), new_bin);
+        let plugins = prefix.path().join("share/darkmatter/plugins");
+        assert_eq!(std::fs::read_to_string(plugins.join("kao/plugin.toml")).unwrap(), "name = \"kao\"");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(plugins.join("kao/kao.py")).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+        assert!(!old_plugin.exists(), "the built-in plugins are replaced whole");
         assert!(std::fs::read_to_string(&desktop).unwrap().contains("Name=New"));
         assert!(!prefix.path().join("share/icons").exists(), "only replaces what install.sh put down");
 

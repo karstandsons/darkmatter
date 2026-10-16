@@ -5,6 +5,14 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **Built-in plugins:** meme, GIF, kaomoji and Quote now ship with
+  Darkmatter and work out of the box (they need python3; meme also
+  ImageMagick). One that's missing what it needs is off, and the shortcuts
+  sheet and `darkmatter plugins` say why. Updates replace them.
+- **GIFs:** get a free Giphy key and send `/gif key <your key>` once.
+- **Plugin settings** in config.toml: `[plugins] off = [...]`, and
+  `[plugins.<name>]` for a plugin's own settings.
+
 ## [0.3.0] - 2026-10-16
 
 - **Plugins:** programs in `~/.config/darkmatter/plugins/` can add slash

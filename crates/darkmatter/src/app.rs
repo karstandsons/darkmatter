@@ -715,6 +715,7 @@ impl App {
         chat.check_updates = self.config.updates.check != Some(false);
         chat.compact = self.config.layout.compact();
         chat.sidebar = self.config.layout.sidebar != Some(false);
+        chat.plugins = std::sync::Arc::new(crate::plugins::load(&self.config.plugins));
         let task = Task::batch([task, chat.open_panes(), chat.update(Message::CheckUpdate)]);
         self.screen = Screen::Chat(Box::new(chat));
         task

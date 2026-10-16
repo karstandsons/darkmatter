@@ -172,10 +172,11 @@ inside that window (Hyprland's virtual-pointer protocol, no root), and refuses u
 
 ## Plugins
 
-Plugins add slash commands, + menu pickers (memes, GIFs…) and message actions.
-They're small programs in any language that talk JSON; their answers only fill
-your message box or attach files. See [docs/plugins.md](docs/plugins.md) and
-the examples in [`plugins/`](plugins).
+Plugins add slash commands, + menu pickers and message actions. Memes, GIFs
+(`/gif key <your free Giphy key>` once), kaomoji and Quote come built in. Your
+own are small programs in any language that talk JSON; their answers only fill
+your message box or attach files. See [docs/plugins.md](docs/plugins.md); the
+built-in ones in [`plugins/`](plugins) are good starting points.
 
 ## Tests
 

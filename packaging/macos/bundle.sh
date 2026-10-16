@@ -17,6 +17,9 @@ install -m755 "$bin" "$app/Contents/MacOS/darkmatter"
 sed "s/@VERSION@/$version/g" "$here/Info.plist" > "$app/Contents/Info.plist"
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/darkmatter.icns"
 cp "$here/../../LICENSE-MIT" "$here/../../LICENSE-APACHE" "$app/Contents/Resources/"
+# The built-in plugins (they need python3; meme also ImageMagick).
+cp -r "$here/../../plugins" "$app/Contents/Resources/plugins"
+find "$app/Contents/Resources/plugins" \( -name __pycache__ -o -name .gitignore \) -prune -exec rm -rf {} +
 # Apple Silicon refuses to run unsigned code; an ad-hoc signature is enough.
 codesign --force --deep --sign - "$app"
 mkdir -p "$out"

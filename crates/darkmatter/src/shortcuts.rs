@@ -91,6 +91,11 @@ pub fn view<'a>(query: &'a str, vim: bool, plugins: &'a crate::plugins::Plugins,
             list = list.extend(rows);
         }
     }
+    for (name, why) in &plugins.off {
+        if hit(&[name, why, "plugin"]) {
+            list = list.push(text(format!("Plugin {name} is off: {why}")).size(12).color(c.muted));
+        }
+    }
     for (dir, e) in &plugins.errors {
         let name = dir.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
         list = list.push(text(format!("Plugin {name} didn't load: {e}")).size(12).color(c.red));

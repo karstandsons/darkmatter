@@ -16,6 +16,7 @@ PREFIX=${PREFIX:-$HOME/.local}
 bin=$PREFIX/bin/darkmatter
 desktop=$PREFIX/share/applications/darkmatter.desktop
 icon=$PREFIX/share/icons/hicolor/scalable/apps/darkmatter.svg
+plugins=$PREFIX/share/darkmatter/plugins
 
 refresh() {
   command -v update-desktop-database >/dev/null && update-desktop-database -q "$PREFIX/share/applications" || true
@@ -24,6 +25,7 @@ refresh() {
 
 if [[ ${1:-} == --uninstall ]]; then
   rm -fv "$bin" "$desktop" "$icon"
+  rm -rf "$plugins"
   refresh
   echo "Kept: settings (~/.config/darkmatter), the saved layout (~/.local/state/darkmatter) and your login (in the keyring)."
   exit 0
@@ -31,19 +33,24 @@ fi
 
 if [[ -x $here/darkmatter ]]; then
   # A release tarball: everything is next to this script.
-  src_bin=$here/darkmatter src_desktop=$here/darkmatter.desktop src_icon=$here/darkmatter.svg
+  src_bin=$here/darkmatter src_desktop=$here/darkmatter.desktop src_icon=$here/darkmatter.svg src_plugins=$here/plugins
 else
   root=$(cd "$here/.." && pwd)
   if [[ ${1:-} != --no-build ]]; then
     cargo=$(command -v cargo || echo "$HOME/.cargo/bin/cargo")
     (cd "$root" && "$cargo" build --release --locked -p darkmatter)
   fi
-  src_bin=$root/target/release/darkmatter src_desktop=$here/darkmatter.desktop src_icon=$here/darkmatter.svg
+  src_bin=$root/target/release/darkmatter src_desktop=$here/darkmatter.desktop src_icon=$here/darkmatter.svg src_plugins=$root/plugins
 fi
 
 install -Dm755 "$src_bin" "$bin"
 install -Dm644 "$src_desktop" "$desktop"
 install -Dm644 "$src_icon" "$icon"
+# The built-in plugins (meme, gif, kaomoji, quote), replaced whole.
+rm -rf "$plugins"
+mkdir -p "$plugins"
+cp -r "$src_plugins/." "$plugins/"
+find "$plugins" \( -name __pycache__ -o -name .gitignore \) -prune -exec rm -rf {} +
 refresh
 echo "Installed $bin ($("$bin" --version))"
 case ":$PATH:" in

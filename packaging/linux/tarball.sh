@@ -2,7 +2,8 @@
 # Pack a built Linux binary into a release tarball:
 #   packaging/linux/tarball.sh <binary> <arch, e.g. x86_64> [out dir (default dist)]
 # Makes <out>/darkmatter-<version>-<arch>-linux.tar.gz holding the binary, the
-# launcher entry, the icon, install.sh, the README and the licenses.
+# launcher entry, the icon, the built-in plugins, install.sh, the README and
+# the licenses.
 set -euo pipefail
 bin=$1 arch=$2 out=${3:-dist}
 # A full path, so a bare name ("darkmatter") isn't looked up in PATH.
@@ -17,6 +18,8 @@ install -m755 "$bin" "$stage/$name/darkmatter"
 install -m755 "$root/packaging/install.sh" "$stage/$name/install.sh"
 install -m644 "$root/packaging/darkmatter.desktop" "$root/packaging/darkmatter.svg" \
   "$root/README.md" "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$stage/$name/"
+cp -r "$root/plugins" "$stage/$name/plugins"
+find "$stage/$name/plugins" \( -name __pycache__ -o -name '*.pyc' -o -name .gitignore \) -prune -exec rm -rf {} +
 mkdir -p "$out"
 tar -C "$stage" -czf "$out/$name.tar.gz" "$name"
 echo "$out/$name.tar.gz"

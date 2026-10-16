@@ -446,7 +446,7 @@ impl Chat {
             attach_thread: None,
             slash_server: Default::default(),
             command_sent: None,
-            plugins: std::sync::Arc::new(plugins::load()),
+            plugins: Default::default(),
             plugin_picker: None,
             editors: HashMap::new(),
             no_editor: text_editor::Content::new(),
@@ -805,6 +805,11 @@ impl Chat {
         self.drafts.remove(&key);
         if let Some((command, arg)) = commands::parse_slash(&text) {
             return Some(Task::done(Message::Run(command, arg)));
+        }
+        if let Some(why) = self.plugins.off_command(&text) {
+            self.drafts.insert(key, text);
+            self.error = Some(why);
+            return Some(Task::none());
         }
         if let Some((plugin, name, args)) = self.plugins.parse_slash(&text) {
             let mut target = self.plugin_target(plugin, thread)?;

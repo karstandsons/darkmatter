@@ -1,7 +1,8 @@
 name = "gif"
-description = "Search Giphy and attach a GIF (needs your own Giphy API key)"
+description = "Search Giphy and attach a GIF (with your own free Giphy API key)"
 version = "0.1.0"
 run = ["python3", "gif.py"]
+requires = ["python3"]
 
 [[insert]]
 name = "gif"
@@ -11,5 +12,5 @@ placeholder = "Search Giphy…"
 
 [[command]]
 name = "gif"
-args = "<search>"
+args = "<search> | key <your Giphy API key>"
 description = "Attach the top GIF for a search"

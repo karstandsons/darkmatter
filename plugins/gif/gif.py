@@ -1,31 +1,45 @@
 #!/usr/bin/env python3
 """Darkmatter GIF plugin: search Giphy, attach the GIF you pick.
 
-Needs a Giphy API key (free at developers.giphy.com): put it in
-GIPHY_API_KEY, or in `key.txt` next to this file.
+Needs a Giphy API key (free at developers.giphy.com). Give it once with
+`/gif key <your key>` (kept in Darkmatter's data folder), or set `api_key`
+under `[plugins.gif]` in config.toml, or GIPHY_API_KEY.
 """
 import concurrent.futures
 import json
 import os
 import shutil
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.environ.get("DARKMATTER_OUTPUT_DIR") or os.path.expanduser("~/.cache/darkmatter/plugins/gif")
+DATA = os.environ.get("DARKMATTER_DATA_DIR") or os.path.expanduser("~/.local/share/darkmatter/plugins/gif")
+KEY_FILE = os.path.join(DATA, "api_key")
+SIGN_UP = "https://developers.giphy.com/dashboard/?create=true"
 THUMBS = os.path.join(OUT, "thumbs")
 SHOWN = 16
 
 
+CONFIG = {}
+
+
 def key():
-    k = os.environ.get("GIPHY_API_KEY", "").strip()
-    if not k and os.path.exists(os.path.join(HERE, "key.txt")):
-        with open(os.path.join(HERE, "key.txt")) as f:
+    k = str(CONFIG.get("api_key", "")).strip() or os.environ.get("GIPHY_API_KEY", "").strip()
+    if not k and os.path.exists(KEY_FILE):
+        with open(KEY_FILE) as f:
             k = f.read().strip()
     if not k:
-        raise RuntimeError(f"needs a Giphy API key: set GIPHY_API_KEY or put it in {os.path.join(HERE, 'key.txt')}")
+        raise RuntimeError(f"needs a Giphy API key: get a free one at {SIGN_UP}, then send /gif key <your key>")
     return k
+
+
+def save_key(k):
+    os.makedirs(DATA, exist_ok=True)
+    fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(k.strip() + "\n")
 
 
 def get(url, path=None):
@@ -73,6 +87,7 @@ def answer(**fields):
 def main():
     os.makedirs(THUMBS, exist_ok=True)
     request = json.loads(sys.stdin.readline())
+    CONFIG.update(request.get("config") or {})
     kind = request["type"]
     try:
         if kind == "search":
@@ -89,6 +104,22 @@ def main():
             answer(items=[{"title": g.get("title") or g["id"], "thumb": t, "value": g["id"]} for g, t in zip(gifs, thumbs)])
         elif kind == "pick":
             answer(attach=download(request["value"]))
+        elif kind == "command" and request["args"].split(" ", 1)[0] == "key":
+            k = request["args"][4:].strip()
+            if not k:
+                answer(error=f"send /gif key <your key> (free at {SIGN_UP})")
+                return
+            # Check it works before keeping it.
+            CONFIG["api_key"] = k
+            try:
+                search("hello", 1)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    answer(error="Giphy didn't accept that key; nothing was saved")
+                    return
+                raise
+            save_key(k)
+            answer(notice="Saved your Giphy key. Try the + menu's GIF picker.")
         elif kind == "command":
             gifs = search(request["args"], 1)
             if not gifs:

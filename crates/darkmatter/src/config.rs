@@ -12,6 +12,18 @@ pub struct Config {
     pub layout: LayoutConfig,
     pub keys: KeysConfig,
     pub updates: UpdatesConfig,
+    pub plugins: PluginsConfig,
+}
+
+/// `[plugins]`: `off = ["gif"]` switches plugins off; `[plugins.<name>]`
+/// holds a plugin's own settings, which it gets with each request.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct PluginsConfig {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub off: Vec<String>,
+    #[serde(flatten)]
+    pub settings: std::collections::BTreeMap<String, toml::Table>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

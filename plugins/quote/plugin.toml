@@ -2,6 +2,7 @@ name = "quote"
 description = "Quote a message in your reply"
 version = "0.1.0"
 run = ["python3", "quote.py"]
+requires = ["python3"]
 
 [[action]]
 name = "quote"

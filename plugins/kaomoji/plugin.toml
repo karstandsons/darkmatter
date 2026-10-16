@@ -2,6 +2,7 @@ name = "kaomoji"
 description = "Pick a kaomoji ¯\\_(ツ)_/¯"
 version = "0.1.0"
 run = ["python3", "kaomoji.py"]
+requires = ["python3"]
 
 [[insert]]
 name = "kaomoji"
