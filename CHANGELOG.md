@@ -5,6 +5,15 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **Plugins:** programs in `~/.config/darkmatter/plugins/` can add slash
+  commands, pickers in the **+** menu and icons on a message's hover bar.
+  Their answers fill your message box or attach files; you still press send,
+  and they never get your login. See [docs/plugins.md](docs/plugins.md).
+  `darkmatter plugins` lists them and `darkmatter plugins add` installs one.
+- **Example plugins** in `plugins/`: a meme maker (`/meme drake | tabs |
+  spaces`, with ImageMagick), Giphy search (with your own API key),
+  kaomoji, and Quote.
+
 ## [0.2.0] - 2026-10-15
 
 - **Update from the app:** the "new version" notice has an **Update** button,

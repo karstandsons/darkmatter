@@ -15,6 +15,8 @@ use crate::session::Session;
 use crate::emoji_picker::{self, EmojiPicker};
 use crate::media;
 use crate::pane::{Jump, PaneView};
+use crate::plugin_picker::{self, PluginPicker};
+use crate::plugins::{self, Plugins};
 use crate::store::Store;
 use crate::switcher::{self, Item, Switcher};
 
@@ -69,6 +71,18 @@ pub struct SlashItem {
     pub insert: String,
     pub hint: String,
     pub description: String,
+}
+
+/// Where a plugin's answer goes: a composer, by its draft key.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginTarget {
+    pub plugin: usize,
+    pub key: String,
+    pub channel: String,
+    /// The reply box.
+    pub thread: bool,
+    /// Put back in the composer if the plugin fails (a slash command's text).
+    pub restore: Option<String>,
 }
 
 /// The word at the end of `input` that a menu completes: (kind, where it
@@ -177,6 +191,10 @@ pub struct Chat {
     slash_server: (String, Vec<SlashItem>),
     /// A server command's text, put back if it fails: (draft key, text).
     command_sent: Option<(String, String)>,
+    /// Installed plugins (`~/.config/darkmatter/plugins`).
+    pub plugins: std::sync::Arc<Plugins>,
+    /// A plugin's picker, opened from the + menu.
+    pub plugin_picker: Option<PluginPicker>,
     /// A channel to open once the channel list is refreshed (after /join).
     pending_goto: Option<String>,
 }
@@ -423,6 +441,8 @@ impl Chat {
             attach_thread: None,
             slash_server: Default::default(),
             command_sent: None,
+            plugins: std::sync::Arc::new(plugins::load()),
+            plugin_picker: None,
             pending_goto: None,
         };
         let mut chat = chat;
@@ -668,6 +688,14 @@ impl Chat {
                 })
                 .collect(),
         };
+        if kind == Completing::Command {
+            items.extend(self.plugins.complete_slash(input).into_iter().map(|(name, args, what)| SlashItem {
+                label: format!("/{name}"),
+                insert: format!("/{name} "),
+                hint: args,
+                description: what,
+            }));
+        }
         let cached = self.slash_server.0 == word;
         if cached {
             for item in &self.slash_server.1 {
@@ -771,9 +799,114 @@ impl Chat {
         if let Some((command, arg)) = commands::parse_slash(&text) {
             return Some(Task::done(Message::Run(command, arg)));
         }
+        if let Some((plugin, name, args)) = self.plugins.parse_slash(&text) {
+            let mut target = self.plugin_target(plugin, thread)?;
+            target.restore = Some(text);
+            let context = self.plugin_context(&target);
+            return Some(self.call_plugin(target, plugins::Request::Command { name, args, context }));
+        }
         self.command_sent = Some((key, text.clone()));
         let (client, team, channel) = (self.client.clone(), self.team.clone(), self.store.post(&root).map_or(self.pv().channel.clone(), |p| p.channel_id.clone()));
         Some(Task::perform(async move { client.execute_command(&team, &channel, &root, &text).await.map_err(err) }, Message::CommandRan))
+    }
+
+    /// Upload files for the composer with draft key `key`, in `channel`.
+    fn attach_to(&mut self, key: &str, channel: &str, paths: Vec<std::path::PathBuf>) -> Task<Message> {
+        let tasks: Vec<_> = paths
+            .into_iter()
+            .filter(|p| p.is_file())
+            .map(|path| {
+                self.next_local_id += 1;
+                let local_id = self.next_local_id;
+                self.attachments.push(media::Pending {
+                    local_id,
+                    key: key.to_string(),
+                    name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    state: media::Upload::Uploading,
+                });
+                Task::perform(media::upload(self.client.clone(), channel.to_string(), path), move |r| Message::Uploaded(local_id, r))
+            })
+            .collect();
+        Task::batch(tasks)
+    }
+
+    /// Where a plugin's answer for this pane's composer goes.
+    fn plugin_target(&self, plugin: usize, thread: bool) -> Option<PluginTarget> {
+        let key = self.composer_key(thread)?;
+        let channel = match self.pv().thread.as_ref().filter(|_| thread) {
+            Some(root) => self.store.post(root)?.channel_id.clone(),
+            None => self.pv().channel.clone(),
+        };
+        Some(PluginTarget { plugin, key, channel, thread, restore: None })
+    }
+
+    /// What a plugin is told about where you are. Never the login.
+    fn plugin_context(&self, target: &PluginTarget) -> plugins::Context {
+        let team = self.store.teams.iter().find(|t| t.id == self.team);
+        let channel = self.store.channels.get(&target.channel);
+        plugins::Context {
+            team: team
+                .map(|t| plugins::Named { id: t.id.clone(), name: t.name.clone(), display_name: t.display_name.clone() })
+                .unwrap_or_default(),
+            channel: channel
+                .map(|ch| plugins::Named { id: ch.id.clone(), name: ch.name.clone(), display_name: self.store.channel_label(ch) })
+                .unwrap_or_default(),
+            thread: target.key.strip_prefix("thread:").map(str::to_string),
+            me: self.store.me.username.clone(),
+            draft: self.drafts.get(&target.key).cloned().unwrap_or_default(),
+        }
+    }
+
+    fn call_plugin(&self, target: PluginTarget, request: plugins::Request) -> Task<Message> {
+        let Some(plugin) = self.plugins.list.get(target.plugin).cloned() else { return Task::none() };
+        Task::perform(async move { plugin.call(&request).await }, move |r| Message::PluginReplied(target, r))
+    }
+
+    /// Ask the open picker's plugin for what matches its search box.
+    fn picker_search(&mut self) -> Task<Message> {
+        let Some(p) = &mut self.plugin_picker else { return Task::none() };
+        p.seq += 1;
+        let (seq, plugin, name, query, target) = (p.seq, p.plugin, p.name.clone(), p.query.clone(), p.target.clone());
+        let context = self.plugin_context(&target);
+        let Some(plugin) = self.plugins.list.get(plugin).cloned() else { return Task::none() };
+        let request = plugins::Request::Search { name, query, context };
+        Task::perform(async move { plugin.call(&request).await }, move |r| Message::PluginItems(seq, r))
+    }
+
+    /// Put a plugin's answer in its composer: text, attachments, notes.
+    fn apply_plugin(&mut self, target: PluginTarget, replies: Vec<plugins::Reply>) -> Task<Message> {
+        let name = self.plugins.list.get(target.plugin).map_or("plugin", |p| p.manifest.name.as_str()).to_string();
+        let mut files = Vec::new();
+        let mut failed = false;
+        for r in replies {
+            if let Some(e) = r.error {
+                self.error = Some(format!("{name}: {e}"));
+                failed = true;
+            }
+            if let Some(n) = r.notice {
+                self.notice = Some(n);
+            }
+            if let Some(t) = r.replace {
+                self.drafts.insert(target.key.clone(), t);
+            }
+            if let Some(t) = r.insert {
+                let draft = self.drafts.entry(target.key.clone()).or_default();
+                if !draft.is_empty() && !draft.ends_with(char::is_whitespace) && !t.starts_with(char::is_whitespace) {
+                    draft.push(' ');
+                }
+                draft.push_str(&t);
+            }
+            if let Some(path) = r.attach {
+                files.push(path);
+            }
+        }
+        if failed && let Some(text) = &target.restore {
+            self.drafts.entry(target.key.clone()).or_insert_with(|| text.clone());
+        }
+        let attach = if files.is_empty() { Task::none() } else { self.attach_to(&target.key, &target.channel, files) };
+        // Back to the box the answer went into, if this pane still shows it.
+        let focus = if self.composer_key(target.thread).as_ref() == Some(&target.key) { self.focus_composer(target.thread) } else { Task::none() };
+        Task::batch([attach, focus])
     }
 
     /// Server completions for `word` arrived: show them if it's still being typed.
@@ -1644,24 +1777,7 @@ impl Chat {
                 if channel.is_empty() {
                     return Task::none();
                 }
-                let tasks: Vec<_> = paths
-                    .into_iter()
-                    .filter(|p| p.is_file())
-                    .map(|path| {
-                        self.next_local_id += 1;
-                        let local_id = self.next_local_id;
-                        self.attachments.push(media::Pending {
-                            local_id,
-                            key: key.clone(),
-                            name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                            state: media::Upload::Uploading,
-                        });
-                        Task::perform(media::upload(self.client.clone(), channel.clone(), path), move |r| {
-                            Message::Uploaded(local_id, r)
-                        })
-                    })
-                    .collect();
-                Task::batch(tasks)
+                self.attach_to(&key, &channel, paths)
             }
             Message::Uploaded(local_id, result) => {
                 if let Some(a) = self.attachments.iter_mut().find(|a| a.local_id == local_id) {
@@ -1676,6 +1792,106 @@ impl Chat {
                 self.attachments.retain(|a| a.local_id != local_id);
                 Task::none()
             }
+            Message::PluginReplied(target, result) => {
+                // A pick that answers with more items stays open (a category, say).
+                if let Some(p) = &mut self.plugin_picker
+                    && p.busy
+                {
+                    let more: Vec<plugins::Item> = result.iter().flatten().flat_map(|r| r.items.clone().unwrap_or_default()).collect();
+                    if more.is_empty() {
+                        self.plugin_picker = None;
+                    } else {
+                        p.busy = false;
+                        p.items = Some(Ok(more));
+                        p.selected = 0;
+                    }
+                }
+                match result {
+                    Ok(replies) => self.apply_plugin(target, replies),
+                    Err(e) => {
+                        if let Some(text) = &target.restore {
+                            self.drafts.entry(target.key.clone()).or_insert_with(|| text.clone());
+                        }
+                        self.error = Some(e);
+                        Task::none()
+                    }
+                }
+            }
+            Message::OpenPluginPicker(plugin, name, thread) => {
+                self.plus = None;
+                let Some(target) = self.plugin_target(plugin, thread) else { return Task::none() };
+                let Some(def) = self.plugins.list.get(plugin).and_then(|p| p.manifest.inserts.iter().find(|i| i.name == name)) else {
+                    return Task::none();
+                };
+                self.plugin_picker = Some(PluginPicker {
+                    plugin,
+                    name,
+                    label: def.label.clone(),
+                    placeholder: def.placeholder.clone(),
+                    target,
+                    query: String::new(),
+                    items: None,
+                    selected: 0,
+                    seq: 0,
+                    busy: false,
+                });
+                Task::batch([self.picker_search(), operation::focus(plugin_picker::INPUT)])
+            }
+            Message::PluginQuery(q) => {
+                let Some(p) = &mut self.plugin_picker else { return Task::none() };
+                p.query = q;
+                self.picker_search()
+            }
+            Message::PluginItems(seq, result) => {
+                let Some(p) = &mut self.plugin_picker else { return Task::none() };
+                if p.seq != seq || p.busy {
+                    return Task::none();
+                }
+                p.items = Some(result.and_then(|replies| {
+                    let error = replies.iter().find_map(|r| r.error.clone());
+                    let items: Vec<plugins::Item> = replies.into_iter().flat_map(|r| r.items.unwrap_or_default()).collect();
+                    match error {
+                        Some(e) if items.is_empty() => Err(e),
+                        _ => Ok(items),
+                    }
+                }));
+                p.selected = 0;
+                Task::none()
+            }
+            Message::PluginPick(index) => {
+                let Some(p) = &mut self.plugin_picker else { return Task::none() };
+                if p.busy {
+                    return Task::none();
+                }
+                if let Some(i) = index {
+                    p.selected = i;
+                }
+                let Some(value) = p.current().map(|i| i.value.clone()) else { return Task::none() };
+                p.busy = true;
+                let (target, name) = (p.target.clone(), p.name.clone());
+                let context = self.plugin_context(&target);
+                self.call_plugin(target, plugins::Request::Pick { name, value, context })
+            }
+            Message::ClosePluginPicker => match self.plugin_picker.take() {
+                Some(p) => self.focus_composer(p.target.thread),
+                None => Task::none(),
+            },
+            Message::PluginAction(plugin, name, post_id) => {
+                let Some(post) = self.store.post(&post_id).cloned() else { return Task::none() };
+                // The answer goes in the message box of the message's channel.
+                let target = PluginTarget { plugin, key: post.channel_id.clone(), channel: post.channel_id.clone(), thread: false, restore: None };
+                let user = self.store.users.get(&post.user_id).map_or(String::new(), |u| u.username.clone());
+                let info = plugins::PostInfo { id: post.id.clone(), message: post.message.clone(), user, create_at: post.create_at };
+                let context = self.plugin_context(&target);
+                self.call_plugin(target, plugins::Request::Action { name, post: info, context })
+            }
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Named(named), .. }) if self.plugin_picker.is_some() => {
+                if let Some(p) = &mut self.plugin_picker {
+                    p.step(named);
+                }
+                Task::none()
+            }
+            Message::Escape if self.plugin_picker.is_some() => self.update(Message::ClosePluginPicker),
             Message::OpenEmoji(post_id) => {
                 let picker = EmojiPicker::open(post_id, &self.recent_emoji, &self.store.custom_emoji);
                 let images = self.media.fetch(&self.client, picker.media_keys());
@@ -2082,6 +2298,7 @@ impl Chat {
                     && !modifiers.alt()
                     && self.switcher.is_none()
                     && self.emoji_picker.is_none()
+                    && self.plugin_picker.is_none()
                     && self.editing.is_none() =>
             {
                 self.vim_key(k.as_str())

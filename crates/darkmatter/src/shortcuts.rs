@@ -20,7 +20,7 @@ fn key_chip<'a>(label: String, c: Colors) -> Element<'a, Message> {
         .into()
 }
 
-pub fn view<'a>(query: &'a str, vim: bool, c: Colors) -> Element<'a, Message> {
+pub fn view<'a>(query: &'a str, vim: bool, plugins: &'a crate::plugins::Plugins, c: Colors) -> Element<'a, Message> {
     let q = query.trim().to_lowercase();
     let hit = |parts: &[&str]| q.is_empty() || parts.iter().any(|p| p.to_lowercase().contains(&q));
     let line = |title: &'a str, keys: Vec<String>, slash: String| -> Element<'a, Message> {
@@ -62,6 +62,38 @@ pub fn view<'a>(query: &'a str, vim: bool, c: Colors) -> Element<'a, Message> {
             list = list.push(container(text(title).size(12).font(bold()).color(c.muted)).padding(iced::Padding { top: 10.0, ..iced::Padding::ZERO }));
             list = list.extend(rows);
         }
+    }
+
+    // Each plugin's commands, + menu pickers and message actions.
+    for p in &plugins.list {
+        let m = &p.manifest;
+        let mut rows: Vec<Element<'a, Message>> = Vec::new();
+        for cmd in &m.commands {
+            let slash = if cmd.args.is_empty() { format!("/{}", cmd.name) } else { format!("/{} {}", cmd.name, cmd.args) };
+            let title = if cmd.description.is_empty() { cmd.name.as_str() } else { cmd.description.as_str() };
+            if hit(&[title, &slash, &m.name, "plugin"]) {
+                rows.push(line(title, Vec::new(), slash));
+            }
+        }
+        for i in &m.inserts {
+            if hit(&[&i.label, &m.name, "plugin"]) {
+                rows.push(line(&i.label, vec![format!("+ {}", i.glyph)], String::new()));
+            }
+        }
+        for a in &m.actions {
+            if hit(&[&a.label, &m.name, "plugin"]) {
+                rows.push(line(&a.label, vec![format!("hover {}", a.glyph)], String::new()));
+            }
+        }
+        if !rows.is_empty() {
+            let title = format!("Plugin: {}", m.name);
+            list = list.push(container(text(title).size(12).font(bold()).color(c.muted)).padding(iced::Padding { top: 10.0, ..iced::Padding::ZERO }));
+            list = list.extend(rows);
+        }
+    }
+    for (dir, e) in &plugins.errors {
+        let name = dir.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+        list = list.push(text(format!("Plugin {name} didn't load: {e}")).size(12).color(c.red));
     }
 
     let input = text_input("Filter shortcuts…", query).id(SHORTCUTS_INPUT).on_input(Message::ShortcutsQuery).padding(10).size(15).style(c.input());

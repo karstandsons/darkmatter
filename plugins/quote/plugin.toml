@@ -1,0 +1,9 @@
+name = "quote"
+description = "Quote a message in your reply"
+version = "0.1.0"
+run = ["python3", "quote.py"]
+
+[[action]]
+name = "quote"
+label = "Quote"
+glyph = "❝"

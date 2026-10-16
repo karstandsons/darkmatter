@@ -173,6 +173,18 @@ pub enum Message {
     InsertEmoji(bool),
     /// Add text to the end of a composer and put the cursor there.
     InsertText(bool, String),
+    /// A plugin answered: (where it goes, its answer).
+    PluginReplied(crate::chat::PluginTarget, Result<Vec<crate::plugins::Reply>, String>),
+    /// Open a plugin's picker: (plugin, insert name, the reply box?).
+    OpenPluginPicker(usize, String, bool),
+    PluginQuery(String),
+    /// A picker search's answer: (which search, answer).
+    PluginItems(u64, Result<Vec<crate::plugins::Reply>, String>),
+    /// Choose a picker item (None: the highlighted one).
+    PluginPick(Option<usize>),
+    ClosePluginPicker,
+    /// A message's plugin action: (plugin, action, post id).
+    PluginAction(usize, String, String),
     /// Ctrl+V: attach the clipboard's image, if it holds one and no text.
     PasteImage,
     Pasted(Result<Option<std::path::PathBuf>, String>),

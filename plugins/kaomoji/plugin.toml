@@ -1,0 +1,15 @@
+name = "kaomoji"
+description = "Pick a kaomoji ¯\\_(ツ)_/¯"
+version = "0.1.0"
+run = ["python3", "kaomoji.py"]
+
+[[insert]]
+name = "kaomoji"
+label = "Kaomoji"
+glyph = "ツ"
+placeholder = "Search kaomoji (shrug, table, happy…)"
+
+[[command]]
+name = "kao"
+args = "<name>"
+description = "Insert a kaomoji by name"

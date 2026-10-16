@@ -8,6 +8,8 @@ mod layout;
 mod media;
 mod pane;
 mod panels;
+mod plugin_picker;
+mod plugins;
 mod session;
 mod shortcuts;
 mod store;
@@ -39,6 +41,10 @@ fn main() -> iced::Result {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("darkmatter {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "plugins" || a == "plugin") {
+        std::process::exit(plugins::cli(&args[1..]));
     }
     // RUST_LOG=darkmatter=debug logs every UI message (except the noisy ones).
     tracing_subscriber::fmt()

@@ -170,6 +170,13 @@ keyring login to the new name.
 inside that window (Hyprland's virtual-pointer protocol, no root), and refuses unless it's focused.
 `dev/seed.sh --threads` / `--bulk N` fill the dev server with busy threads or a long channel.
 
+## Plugins
+
+Plugins add slash commands, + menu pickers (memes, GIFs…) and message actions.
+They're small programs in any language that talk JSON; their answers only fill
+your message box or attach files. See [docs/plugins.md](docs/plugins.md) and
+the examples in [`plugins/`](plugins).
+
 ## Tests
 
 ```sh

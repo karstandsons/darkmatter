@@ -1,0 +1,15 @@
+name = "meme"
+description = "Caption a meme template (imgflip's top 100) with ImageMagick"
+version = "0.1.0"
+run = ["python3", "meme.py"]
+
+[[insert]]
+name = "meme"
+label = "Meme"
+glyph = "🖼"
+placeholder = "template | top text | bottom text"
+
+[[command]]
+name = "meme"
+args = "<template> | <top> | <bottom>"
+description = "Make a meme"

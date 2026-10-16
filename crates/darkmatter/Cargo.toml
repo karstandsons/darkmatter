@@ -14,7 +14,7 @@ mm-api = { path = "../mm-api" }
 omarchy-theme = { path = "../omarchy-theme" }
 # No `web-colors`: it gamma-encodes theme colors twice, so #13141c rendered as #4b4d5c.
 iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "crisp", "thread-pool", "linux-theme-detection", "x11", "wayland", "tokio", "markdown", "image", "advanced"] }
-tokio = { workspace = true, features = ["fs", "process"] }
+tokio = { workspace = true, features = ["fs", "process", "io-util", "time"] }
 serde.workspace = true
 tracing.workspace = true
 toml = "1"
@@ -35,9 +35,10 @@ notify-rust = "4"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # Pasting an image from the clipboard (Wayland's data-control, X11, macOS).
+# Plugins talk JSON; `plugins add` stages in a temp folder.
+serde_json.workspace = true
+tempfile = "3"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
 
 [dev-dependencies]
 wiremock = "0.6"
-serde_json.workspace = true
-tempfile = "3"

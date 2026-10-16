@@ -79,7 +79,8 @@ impl Chat {
         // state under it (a focus set as the switcher closes would be lost).
         let overlay = match (&self.shortcuts, &self.switcher, &self.emoji_picker) {
             _ if self.menu => Some(self.menu_view(c)),
-            (Some(q), ..) => Some(crate::shortcuts::view(q, self.vim_keys, c)),
+            _ if let Some(picker) = &self.plugin_picker => Some(picker.view(c)),
+            (Some(q), ..) => Some(crate::shortcuts::view(q, self.vim_keys, &self.plugins, c)),
             (None, Some(sw), _) => Some(sw.view(&self.store, c)),
             (None, None, Some(picker)) => Some(picker.view(c, &self.media)),
             (None, None, None) => None,
@@ -217,7 +218,7 @@ impl Chat {
         };
         let files = if thread { Message::PickReplyFiles } else { Message::PickFiles };
         let paste = if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+V" };
-        let list = column![
+        let mut list = column![
             item("☺", "Emoji", None, Message::InsertEmoji(thread)),
             item("📎", "Photo or file", crate::commands::key_label(crate::commands::Command::Attach).filter(|_| !thread), files),
             item("🖼", "Paste an image", Some(paste.to_string()), Message::PasteImage),
@@ -225,6 +226,22 @@ impl Chat {
             item("/", "Run a command", None, Message::InsertText(thread, "/".into())),
         ]
         .spacing(1);
+        // Plugins' pickers (memes, GIFs…).
+        for (i, (plugin, def)) in self.plugins.inserts().enumerate() {
+            if i == 0 {
+                list = list.push(rule::horizontal(1));
+            }
+            let line = row![text(&def.glyph).size(14).width(22), text(&def.label).size(13).color(c.fg), space::horizontal()]
+                .spacing(6)
+                .align_y(iced::Center);
+            list = list.push(
+                button(line)
+                    .width(Length::Fill)
+                    .padding([5, 10])
+                    .on_press(Message::OpenPluginPicker(plugin, def.name.clone(), thread))
+                    .style(c.row_button(false)),
+            );
+        }
         Some(container(list).padding(4).width(300).style(c.panel(c.surface)).into())
     }
 
@@ -850,6 +867,17 @@ impl Chat {
             });
         } else if kind != Kind::Thread {
             actions = actions.push(icon("●", "Mark unread from here", Message::MarkUnread(post.id.clone())));
+        }
+        // Plugins' actions (a few; the hover bar should stay short).
+        for (plugin, def) in self.plugins.actions().take(3) {
+            actions = actions.push(tooltip(
+                button(text(&def.glyph).size(13))
+                    .padding([1, 6])
+                    .on_press(Message::PluginAction(plugin, def.name.clone(), post.id.clone()))
+                    .style(c.chip(false)),
+                container(text(&def.label).size(11)).padding([2, 6]).style(c.panel(c.surface)),
+                tooltip::Position::Top,
+            ));
         }
         let ghost = iced::Color::TRANSPARENT;
         // An invisible copy of the first line of text pushes the icons to
