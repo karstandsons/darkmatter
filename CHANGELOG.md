@@ -5,6 +5,8 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-16
+
 - **Plugins:** programs in `~/.config/darkmatter/plugins/` can add slash
   commands, pickers in the **+** menu and icons on a message's hover bar.
   Their answers fill your message box or attach files; you still press send,
