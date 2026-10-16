@@ -5,6 +5,8 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-15
+
 - **Update from the app:** the "new version" notice has an **Update** button,
   then **Restart now**. A copy installed with `install.sh` downloads the
   release, checks it against its SHA256SUMS, and replaces itself. With
