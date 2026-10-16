@@ -28,6 +28,14 @@ CONFIG = {}
 
 def key():
     k = str(CONFIG.get("api_key", "")).strip() or os.environ.get("GIPHY_API_KEY", "").strip()
+    # Darkmatter 0.3.1 kept the key in a file of its own; move it over.
+    old = os.path.join(DATA, "api_key")
+    if not k and os.path.exists(old):
+        with open(old) as f:
+            k = f.read().strip()
+        if k:
+            save_key(k)
+        os.remove(old)
     if not k:
         raise RuntimeError(f"needs a Giphy API key: get a free one at {SIGN_UP}, then add it in Plugins (Ctrl+Shift+P) or send /gif key <your key>")
     return k
@@ -132,6 +140,11 @@ def main():
                 answer(error=f"no GIFs for {request['args']!r}")
                 return
             answer(attach=download(gifs[0]["id"]))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            answer(error="Giphy didn't accept your API key: check it in Plugins (Ctrl+Shift+P)")
+        else:
+            answer(error=f"Giphy: {e}")
     except Exception as e:
         answer(error=str(e))
 
