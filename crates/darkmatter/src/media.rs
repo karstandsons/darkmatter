@@ -103,7 +103,8 @@ pub fn human_size(bytes: i64) -> String {
 /// A file attached to the composer, uploaded as soon as it's added.
 pub struct Pending {
     pub local_id: u64,
-    pub channel_id: String,
+    /// The composer it's for: its draft key (the channel, or `thread:<root>`).
+    pub key: String,
     pub name: String,
     pub state: Upload,
 }
@@ -139,6 +140,30 @@ pub async fn open_file(client: Client, file_id: String, name: String) -> Result<
     }
     open::that_detached(&path).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The clipboard's image, saved as a PNG to attach, when the clipboard holds
+/// an image and no text (text pastes into the message box as usual).
+pub async fn paste_image() -> Result<Option<std::path::PathBuf>, String> {
+    tokio::task::spawn_blocking(|| {
+        let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+        if clipboard.get_text().is_ok_and(|t| !t.trim().is_empty()) {
+            return Ok(None);
+        }
+        let img = match clipboard.get_image() {
+            Ok(img) => img,
+            Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+        let rgba = ::image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned()).ok_or("the clipboard image is malformed")?;
+        let dir = dirs::cache_dir().ok_or("no cache directory")?.join("darkmatter").join("pasted");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("pasted-{}.png", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+        rgba.save_with_format(&path, ::image::ImageFormat::Png).map_err(|e| e.to_string())?;
+        Ok(Some(path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]

@@ -16,6 +16,8 @@ const QUICK: &[&str] = &["+1", "heart", "joy", "tada", "eyes", "white_check_mark
 
 pub struct EmojiPicker {
     pub post_id: String,
+    /// Inserting into a composer (`Some(thread)`) rather than reacting.
+    pub insert: Option<bool>,
     pub query: String,
     pub selected: usize,
     /// (Mattermost emoji name, what to draw)
@@ -73,7 +75,7 @@ pub fn search(query: &str, recent: &[String], custom: &HashMap<String, String>) 
 
 impl EmojiPicker {
     pub fn open(post_id: String, recent: &[String], custom: &HashMap<String, String>) -> Self {
-        EmojiPicker { post_id, query: String::new(), selected: 0, results: search("", recent, custom) }
+        EmojiPicker { post_id, insert: None, query: String::new(), selected: 0, results: search("", recent, custom) }
     }
 
     pub fn set_query(&mut self, q: String, recent: &[String], custom: &HashMap<String, String>) {

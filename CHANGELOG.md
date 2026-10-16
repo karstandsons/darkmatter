@@ -21,6 +21,10 @@ The release workflow uses each version's section here as its release notes.
 - **Message actions** (react, reply, edit, delete, mark unread) are icons
   with tooltips, shown on hover right after the name and time, or after the
   text on continued lines and compact rows, instead of at the pane's far edge.
+- **+ by every message box**, including replies: emoji (inserted into the
+  text), photos and files, pasting an image, mentions and commands.
+- **Attachments in replies**, and **Ctrl+V pastes an image** from the
+  clipboard as an attachment.
 - Your own status dot follows `/away`, `/dnd` and `/online`.
 
 - **Update from the app:** the "new version" notice has an **Update** button,

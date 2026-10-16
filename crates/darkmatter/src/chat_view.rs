@@ -188,7 +188,44 @@ impl Chat {
     /// when closed). Adding or swapping a widget before the composer would
     /// cost it the focus.
     fn slash_slot<'a>(&'a self, thread: bool, pv: &PaneView, c: Colors) -> Element<'a, Message> {
-        container(self.slash_view(thread, pv, c).unwrap_or_else(|| space().height(0).into())).into()
+        let popup = self.slash_view(thread, pv, c).or_else(|| self.plus_view(thread, pv, c));
+        container(popup.unwrap_or_else(|| space().height(0).into())).into()
+    }
+
+    /// The + by a composer: emoji, files and more.
+    fn plus_button(&self, thread: bool, c: Colors) -> Element<'_, Message> {
+        let open = self.plus == Some(thread);
+        let (size, pad) = if thread || self.compact { (15, [5, 10]) } else { (17, [9, 13]) };
+        button(text("+").size(size).color(if open { c.accent } else { c.fg }))
+            .padding(pad)
+            .on_press(Message::TogglePlus(thread))
+            .style(c.chip(open))
+            .into()
+    }
+
+    /// What the + offers, above the composer.
+    fn plus_view<'a>(&'a self, thread: bool, pv: &PaneView, c: Colors) -> Option<Element<'a, Message>> {
+        if self.plus != Some(thread) || pv.n != self.focused().n {
+            return None;
+        }
+        let item = |glyph: &'static str, label: &'static str, key: Option<String>, msg: Message| -> Element<'a, Message> {
+            let mut line = row![text(glyph).size(14).width(22), text(label).size(13).color(c.fg), space::horizontal()].spacing(6).align_y(iced::Center);
+            if let Some(key) = key {
+                line = line.push(text(key).size(11).color(c.muted));
+            }
+            button(line).width(Length::Fill).padding([5, 10]).on_press(msg).style(c.row_button(false)).into()
+        };
+        let files = if thread { Message::PickReplyFiles } else { Message::PickFiles };
+        let paste = if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+V" };
+        let list = column![
+            item("☺", "Emoji", None, Message::InsertEmoji(thread)),
+            item("📎", "Photo or file", crate::commands::key_label(crate::commands::Command::Attach).filter(|_| !thread), files),
+            item("🖼", "Paste an image", Some(paste.to_string()), Message::PasteImage),
+            item("@", "Mention someone", None, Message::InsertText(thread, "@".into())),
+            item("/", "Run a command", None, Message::InsertText(thread, "/".into())),
+        ]
+        .spacing(1);
+        Some(container(list).padding(4).width(300).style(c.panel(c.surface)).into())
     }
 
     /// Completions above a composer while a slash command is typed.
@@ -452,11 +489,7 @@ impl Chat {
         let error = self.error.as_ref().filter(|_| here).map(|e| container(text(e).size(12).color(c.red)).padding([4, 20]).into());
         let note = self.notice.as_ref().filter(|_| here).map(|n| container(text(n).size(12).color(c.muted)).padding([4, 20]).into());
         let col = column![rule::horizontal(1), timeline, slot(older), slot(error), slot(note)];
-        let attach = button(text("📎").size(16))
-            .padding([10, 12])
-            .on_press(Message::PickFiles)
-            .style(c.chip(false));
-        let composer = row![attach, composer].spacing(8).align_y(iced::Center);
+        let composer = row![self.plus_button(false, c), composer].spacing(8).align_y(iced::Center);
         let typing = self.editing_note(&pv.channel, c).unwrap_or_else(|| self.typing_line(&pv.channel, "", c));
         let mut footer = column![typing].spacing(6);
         footer = footer.push(self.slash_slot(false, pv, c));
@@ -502,7 +535,15 @@ impl Chat {
                 container(header).padding(self.header_pad()),
                 rule::horizontal(1),
                 body,
-                container(Column::new().push(typing).push(self.slash_slot(true, self.focused(), c)).push(composer).spacing(4)).padding(self.footer_pad()),
+                container(
+                    Column::new()
+                        .push(typing)
+                        .push(self.slash_slot(true, self.focused(), c))
+                        .push(container(Column::new().extend(self.attachment_chips(&thread_key, c))))
+                        .push(row![self.plus_button(true, c), composer].spacing(6).align_y(iced::Center))
+                        .spacing(4)
+                )
+                .padding(self.footer_pad()),
             ]
             .width(Length::Fill),
         )
@@ -512,11 +553,12 @@ impl Chat {
         .into()
     }
 
-    fn attachment_chips(&self, channel: &str, c: Colors) -> Option<Element<'_, Message>> {
+    /// Files attached to a composer (by its draft key), as removable chips.
+    fn attachment_chips(&self, key: &str, c: Colors) -> Option<Element<'_, Message>> {
         let chips: Vec<Element<'_, Message>> = self
             .attachments
             .iter()
-            .filter(|a| a.channel_id == channel)
+            .filter(|a| a.key == key)
             .map(|a| {
                 let (status, color) = match &a.state {
                     media::Upload::Uploading => ("uploading…".to_string(), c.muted),
@@ -682,8 +724,10 @@ impl Chat {
             let key = format!("thread:{root_id}");
             let note = self.editing_note(&key, c).unwrap_or_else(|| self.typing_line(channel_id, root_id, c));
             let menu = self.slash_slot(true, pv, c);
+            let chips = container(Column::new().extend(self.attachment_chips(&key, c)));
+            let composer = row![self.plus_button(true, c), composer].spacing(6).align_y(iced::Center);
             col = col.push(
-                container(Column::new().push(note).push(menu).push(composer).spacing(4))
+                container(Column::new().push(note).push(menu).push(chips).push(composer).spacing(4))
                     .padding(iced::Padding { top: 6.0, bottom: 4.0, ..iced::Padding::ZERO }),
             );
         } else {

@@ -34,6 +34,8 @@ tar = "0.4"
 notify-rust = "4"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# Pasting an image from the clipboard (Wayland's data-control, X11, macOS).
+arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
 
 [dev-dependencies]
 wiremock = "0.6"

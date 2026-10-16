@@ -162,7 +162,18 @@ pub enum Message {
     OpenFile(String, String),
     Opened(Result<(), String>),
     PickFiles,
+    /// Attach files to the thread's reply box.
+    PickReplyFiles,
     Attach(Vec<std::path::PathBuf>),
+    /// The + menu by a composer (true: the thread's reply box).
+    TogglePlus(bool),
+    /// Open the emoji picker to insert into a composer (true: the reply box).
+    InsertEmoji(bool),
+    /// Add text to the end of a composer and put the cursor there.
+    InsertText(bool, String),
+    /// Ctrl+V: attach the clipboard's image, if it holds one and no text.
+    PasteImage,
+    Pasted(Result<Option<std::path::PathBuf>, String>),
     Uploaded(u64, Result<String, String>),
     RemoveAttachment(u64),
     OpenEmoji(String),
@@ -698,6 +709,12 @@ impl App {
                     ..
                 }) => Some(Message::Escape),
                 iced::Event::Window(iced::window::Event::FileDropped(path)) => Some(Message::Attach(vec![path])),
+                // Seen even when the message box takes the key (it pastes text).
+                iced::Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Character(k), modifiers, .. })
+                    if modifiers.command() && !modifiers.shift() && k.as_str() == "v" =>
+                {
+                    Some(Message::PasteImage)
+                }
                 _ => None,
             }),
         ];

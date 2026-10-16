@@ -134,6 +134,10 @@ pub struct Chat {
     pub sidebar: bool,
     /// The ☰ menu is open.
     pub menu: bool,
+    /// The + menu by a composer is open (true: the thread's reply box).
+    pub plus: Option<bool>,
+    /// The composer files being picked are for (true: the reply box).
+    attach_thread: Option<bool>,
     /// Server completions, by the input they're for.
     slash_server: (String, Vec<SlashItem>),
     /// A server command's text, put back if it fails: (draft key, text).
@@ -376,6 +380,8 @@ impl Chat {
             compact: false,
             sidebar: true,
             menu: false,
+            plus: None,
+            attach_thread: None,
             slash_server: Default::default(),
             command_sent: None,
             pending_goto: None,
@@ -558,6 +564,17 @@ impl Chat {
             // The app's: they change its config.
             C::Themes | C::ThreadLayout | C::Logout | C::ToggleDensity | C::Compact | C::Cozy | C::ToggleSidebar | C::About => Task::none(),
         }
+    }
+
+    /// The draft key of the pane's message box, or of its thread's reply box.
+    fn composer_key(&self, thread: bool) -> Option<String> {
+        if thread { self.pv().thread.as_deref().map(thread_key) } else { Some(self.pv().channel.clone()).filter(|c| !c.is_empty()) }
+    }
+
+    /// Put the cursor at the end of a composer.
+    fn focus_composer(&self, thread: bool) -> Task<Message> {
+        let id = if thread { self.pv().thread_composer() } else { self.pv().composer() };
+        Task::batch([operation::focus(id.clone()), operation::move_cursor_to_end(id)])
     }
 
     /// A short note in the focused pane (a slash command's reply, say).
@@ -1067,7 +1084,7 @@ impl Chat {
                 self.notice = None;
                 self.last_in_thread = false;
                 let message = self.draft().trim().to_string();
-                let here = |a: &&media::Pending| a.channel_id == self.pv().channel;
+                let here = |a: &&media::Pending| a.key == self.pv().channel;
                 if self.attachments.iter().filter(here).any(|a| matches!(a.state, media::Upload::Uploading)) {
                     self.error = Some("Wait for uploads to finish".into());
                     return Task::none();
@@ -1089,7 +1106,7 @@ impl Chat {
                 self.sending = Some((self.pv().channel.clone(), text));
                 self.error = None;
                 let channel = self.pv().channel.clone();
-                self.attachments.retain(|a| a.channel_id != channel);
+                self.attachments.retain(|a| a.key != channel);
                 let post = NewPost {
                     channel_id: self.pv().channel.clone(),
                     message,
@@ -1455,18 +1472,33 @@ impl Chat {
                 let Some(channel_id) = self.store.post(&root).map(|p| p.channel_id.clone()) else {
                     return Task::none();
                 };
-                if message.is_empty() {
+                let key = thread_key(&root);
+                let here = |a: &&media::Pending| a.key == key;
+                if self.attachments.iter().filter(here).any(|a| matches!(a.state, media::Upload::Uploading)) {
+                    self.error = Some("Wait for uploads to finish".into());
                     return Task::none();
                 }
-                let key = thread_key(&root);
+                let file_ids: Vec<String> = self
+                    .attachments
+                    .iter()
+                    .filter(here)
+                    .filter_map(|a| match &a.state {
+                        media::Upload::Done(id) => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if message.is_empty() && file_ids.is_empty() {
+                    return Task::none();
+                }
+                self.attachments.retain(|a| a.key != key);
                 let text = self.drafts.remove(&key).unwrap_or_default();
                 self.sending = Some((key, text));
                 let post = NewPost {
                     channel_id,
                     message,
+                    file_ids,
                     root_id: root,
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
-                    ..Default::default()
                 };
                 let client = self.client.clone();
                 Task::perform(async move { client.create_post(&post).await.map_err(err) }, Message::Sent)
@@ -1482,6 +1514,7 @@ impl Chat {
                 self.error = Some(format!("Couldn't open file: {e}"));
                 Task::none()
             }
+            Message::PickFiles if self.plus.take().is_some() => self.update(Message::PickFiles),
             Message::PickFiles => Task::perform(
                 async {
                     let files = rfd::AsyncFileDialog::new().set_title("Attach files").pick_files().await;
@@ -1489,8 +1522,18 @@ impl Chat {
                 },
                 Message::Attach,
             ),
+            Message::PickReplyFiles => {
+                self.attach_thread = Some(true);
+                self.update(Message::PickFiles)
+            }
             Message::Attach(paths) => {
-                if self.pv().channel.is_empty() {
+                // Dropped files go where you last typed.
+                let thread = self.attach_thread.take().unwrap_or(self.last_in_thread) && self.pv().thread.is_some();
+                let (key, channel) = match self.pv().thread.clone().filter(|_| thread) {
+                    Some(root) => (thread_key(&root), self.store.post(&root).map_or(String::new(), |p| p.channel_id.clone())),
+                    None => (self.pv().channel.clone(), self.pv().channel.clone()),
+                };
+                if channel.is_empty() {
                     return Task::none();
                 }
                 let tasks: Vec<_> = paths
@@ -1501,11 +1544,11 @@ impl Chat {
                         let local_id = self.next_local_id;
                         self.attachments.push(media::Pending {
                             local_id,
-                            channel_id: self.pv().channel.clone(),
+                            key: key.clone(),
                             name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
                             state: media::Upload::Uploading,
                         });
-                        Task::perform(media::upload(self.client.clone(), self.pv().channel.clone(), path), move |r| {
+                        Task::perform(media::upload(self.client.clone(), channel.clone(), path), move |r| {
                             Message::Uploaded(local_id, r)
                         })
                     })
@@ -1532,7 +1575,48 @@ impl Chat {
                 Task::batch([images, operation::focus(emoji_picker::INPUT)])
             }
             Message::CloseEmoji => {
-                self.emoji_picker = None;
+                let insert = self.emoji_picker.take().and_then(|p| p.insert);
+                match insert {
+                    Some(thread) => self.focus_composer(thread),
+                    None => Task::none(),
+                }
+            }
+            Message::InsertEmoji(thread) => {
+                self.plus = None;
+                let mut picker = EmojiPicker::open(String::new(), &self.recent_emoji, &self.store.custom_emoji);
+                picker.insert = Some(thread);
+                let images = self.media.fetch(&self.client, picker.media_keys());
+                self.emoji_picker = Some(picker);
+                Task::batch([images, operation::focus(emoji_picker::INPUT)])
+            }
+            Message::InsertText(thread, add) => {
+                self.plus = None;
+                let Some(key) = self.composer_key(thread) else { return Task::none() };
+                let draft = self.drafts.entry(key).or_default();
+                if !draft.is_empty() && !draft.ends_with(' ') && !add.starts_with(' ') {
+                    draft.push(' ');
+                }
+                draft.push_str(&add);
+                let text = draft.clone();
+                let menu = self.update_slash(thread, &text);
+                Task::batch([menu, self.focus_composer(thread)])
+            }
+            Message::TogglePlus(thread) => {
+                self.plus = if self.plus == Some(thread) { None } else { Some(thread) };
+                Task::none()
+            }
+            Message::Escape if self.plus.is_some() => {
+                self.plus = None;
+                Task::none()
+            }
+            Message::PasteImage => {
+                self.plus = None;
+                Task::perform(media::paste_image(), Message::Pasted)
+            }
+            Message::Pasted(Ok(Some(path))) => self.update(Message::Attach(vec![path])),
+            Message::Pasted(Ok(None)) => Task::none(),
+            Message::Pasted(Err(e)) => {
+                tracing::debug!("no image to paste: {e}");
                 Task::none()
             }
             Message::EmojiQuery(q) => {
@@ -1546,6 +1630,9 @@ impl Chat {
                 self.recent_emoji.retain(|n| *n != name);
                 self.recent_emoji.insert(0, name.clone());
                 self.recent_emoji.truncate(16);
+                if let Some(thread) = picker.insert {
+                    return self.update(Message::InsertText(thread, format!(":{name}: ")));
+                }
                 let mine = self.store.post(&picker.post_id).is_some_and(|p| {
                     p.metadata.reactions.iter().any(|r| r.user_id == self.store.me.id && r.emoji_name == name)
                 });
@@ -2133,6 +2220,41 @@ mod tests {
         let _ = chat.handle(Message::Send);
         assert!(chat.attachments.is_empty());
         assert!(chat.error.is_none());
+    }
+
+    #[test]
+    fn reply_attachments_go_with_the_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.png");
+        std::fs::write(&file, "x").unwrap();
+        let mut chat = chat();
+        with_post(&mut chat, "root", "bob", 1);
+        chat.pv_mut().thread = Some("root".into());
+
+        // Picked for the reply box: kept apart from the channel's message box.
+        chat.attach_thread = Some(true);
+        let _ = chat.handle(Message::Attach(vec![file.clone()]));
+        assert_eq!(chat.attachments[0].key, "thread:root");
+        let _ = chat.handle(Message::Attach(vec![file]));
+        assert_eq!(chat.attachments[1].key, "c1", "the next pick is for the message box again");
+
+        let id = chat.attachments[0].local_id;
+        let _ = chat.handle(Message::Uploaded(id, Ok("f1".into())));
+        // A reply with only a file is allowed; the channel's file stays.
+        let _ = chat.handle(Message::SendReply);
+        assert_eq!(chat.attachments.len(), 1);
+        assert_eq!(chat.attachments[0].key, "c1");
+    }
+
+    #[test]
+    fn emoji_from_the_plus_menu_goes_into_the_text() {
+        let mut chat = chat();
+        chat.drafts.insert("c1".into(), "ship it".into());
+        let _ = chat.handle(Message::InsertEmoji(false));
+        let _ = chat.handle(Message::EmojiQuery("rocket".into()));
+        let _ = chat.handle(Message::EmojiPick(None));
+        assert_eq!(chat.draft(), "ship it :rocket: ");
+        assert!(chat.emoji_picker.is_none());
     }
 
     #[test]
