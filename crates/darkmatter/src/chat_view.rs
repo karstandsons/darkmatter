@@ -1,7 +1,7 @@
 //! Chat screen views.
 
 use iced::widget::{
-    Column, button, center, mouse_area, opaque, column, container, hover, image, markdown, pane_grid, row, rule, scrollable, space, stack,
+    Column, button, center, mouse_area, opaque, tooltip, column, container, hover, image, markdown, pane_grid, row, rule, scrollable, space, stack,
     text, text_input,
 };
 use iced::{Element, Length, Theme};
@@ -777,28 +777,60 @@ impl Chat {
                 .into()
         };
 
-        // Actions appear in the top-right corner on hover.
-        let chip = |label: &'static str, msg: Message| button(text(label).size(12)).padding([2, 8]).on_press(msg).style(c.chip(false));
-        let mut actions = row![chip("☺+", Message::OpenEmoji(post.id.clone()))].spacing(4);
+        // Actions show on hover, next to the name and time: on a message's
+        // first line, right after them (the overlay repeats them invisibly to
+        // line up); in compact rows, over the time and name; on a continued
+        // message, just above its first line.
+        let icon = |glyph: &'static str, tip: &'static str, msg: Message| -> Element<'a, Message> {
+            tooltip(
+                button(text(glyph).size(13)).padding([1, 6]).on_press(msg).style(c.chip(false)),
+                container(text(tip).size(11)).padding([2, 6]).style(c.panel(c.surface)),
+                tooltip::Position::Top,
+            )
+            .into()
+        };
+        let mut actions = row![icon("☺", "React", Message::OpenEmoji(post.id.clone()))].spacing(3).align_y(iced::Center);
         if kind == Kind::Inbox {
-            actions = actions.push(chip("Open", Message::InboxOpen(post.channel_id.clone(), thread_root.clone(), post.id.clone())));
+            actions = actions.push(icon("↗", "Open in its channel", Message::InboxOpen(post.channel_id.clone(), thread_root.clone(), post.id.clone())));
         }
         if kind != Kind::Thread {
-            actions = actions.push(chip("↩ Reply", Message::OpenThread(thread_root.clone())));
+            actions = actions.push(icon("↩", "Reply", Message::OpenThread(thread_root.clone())));
         }
         if post.user_id == self.store.me.id {
-            actions = actions.push(chip("Edit", Message::EditPost(post.id.clone())));
+            actions = actions.push(icon("✎", "Edit", Message::EditPost(post.id.clone())));
             let confirming = self.confirm_delete.as_deref() == Some(post.id.as_str());
-            actions = actions.push(
-                button(text(if confirming { "Delete?" } else { "Delete" }).size(12).color(if confirming { c.red } else { c.fg }))
-                    .padding([2, 8])
-                    .on_press(Message::DeletePost(post.id.clone()))
-                    .style(c.chip(confirming)),
-            );
+            actions = actions.push(if confirming {
+                button(text("Delete?").size(12).color(c.red)).padding([1, 6]).on_press(Message::DeletePost(post.id.clone())).style(c.chip(true)).into()
+            } else {
+                icon("🗑", "Delete", Message::DeletePost(post.id.clone()))
+            });
         } else if kind != Kind::Thread {
-            actions = actions.push(chip("Unread", Message::MarkUnread(post.id.clone())));
+            actions = actions.push(icon("●", "Mark unread from here", Message::MarkUnread(post.id.clone())));
         }
-        let post_el = hover(content, container(actions).width(Length::Fill).align_x(iced::alignment::Horizontal::Right));
+        let ghost = iced::Color::TRANSPARENT;
+        // An invisible copy of the first line of text pushes the icons to
+        // just after it (or to the pane's edge, if the line is that long).
+        let after_text = |left: f32, actions: iced::widget::Row<'a, Message>| -> Element<'a, Message> {
+            let first = post.message.lines().next().unwrap_or("").trim_end();
+            let line = row![text(first).size(14).color(ghost).wrapping(iced::widget::text::Wrapping::None), actions].spacing(12).align_y(iced::Center);
+            container(line).padding(iced::Padding { left, top: if self.compact { 1.0 } else { 0.0 }, ..iced::Padding::ZERO }).width(Length::Fill).clip(true).into()
+        };
+        let overlay: Element<'a, Message> = if self.compact {
+            // Compact rows: time, name, then the text (a row spaced by 10).
+            after_text(TIME_COLUMN + NAME_COLUMN + 20.0, actions)
+        } else if continued {
+            after_text(GUTTER, actions)
+        } else {
+            let name_again = row![
+                text(self.store.display_name(post)).font(bold()).size(14).color(ghost),
+                text(fmt::time_of_day(post.create_at)).size(11).color(ghost),
+                actions,
+            ]
+            .spacing(8)
+            .align_y(iced::Center);
+            container(row![space().width(GUTTER), name_again]).padding(iced::Padding { top: 6.0, ..iced::Padding::ZERO }).into()
+        };
+        let post_el = hover(content, overlay);
         let highlighted = pv.highlight.as_ref().is_some_and(|(id, _)| *id == post.id);
         let selected = pv.selected.as_deref() == Some(post.id.as_str());
         let target = pv.jump_target.as_deref() == Some(post.id.as_str());
