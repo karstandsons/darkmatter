@@ -85,6 +85,9 @@ as you type (Tab or Enter completes). Darkmatter's own: `/jump [name]`,
 `/logout`. Anything else goes to the server, so Mattermost's own (`/join`,
 `/msg`, `/away`, `/dnd`, `/shrug`…) and server plugins' commands work too.
 Start a message with `//` to send one that begins with a slash.
+Typing `@` suggests people and `:ro` suggests emoji, in the same popup. The
+**+** by each message box adds emoji, files, a pasted image (Ctrl+V works too),
+a mention or a command.
 
 | Key | Action |
 |---|---|

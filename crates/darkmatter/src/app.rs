@@ -150,8 +150,10 @@ pub enum Message {
     CloseShortcuts,
     /// Server completions for a slash command being typed: (the input, results).
     SlashSuggestions(String, Result<Vec<mm_api::models::CommandSuggestion>, String>),
-    /// Complete the composer's slash command with this text (without the slash).
+    /// Put this completion in place of the word being typed.
     SlashComplete(String),
+    /// People for an @mention being typed: (the word, results).
+    MentionSuggestions(String, Result<Vec<mm_api::models::User>, String>),
     /// The server ran a slash command.
     CommandRan(Result<mm_api::models::CommandResponse, String>),
     CloseThread,

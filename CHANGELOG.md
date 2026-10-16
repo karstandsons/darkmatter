@@ -25,6 +25,8 @@ The release workflow uses each version's section here as its release notes.
   text), photos and files, pasting an image, mentions and commands.
 - **Attachments in replies**, and **Ctrl+V pastes an image** from the
   clipboard as an attachment.
+- **@mention and :emoji: completion** as you type (Tab or Enter completes),
+  with people from the server and @here, @channel and @all.
 - Your own status dot follows `/away`, `/dnd` and `/online`.
 
 - **Update from the app:** the "new version" notice has an **Update** button,

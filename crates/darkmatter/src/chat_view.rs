@@ -238,14 +238,14 @@ impl Chat {
         let start = menu.selected.saturating_sub(SHOWN - 1);
         let rows = menu.items.iter().enumerate().skip(start).take(SHOWN).map(|(i, item)| {
             let line = row![
-                text(format!("/{}", item.complete)).size(13).font(bold()).color(c.fg_bright),
+                text(&item.label).size(13).font(bold()).color(c.fg_bright),
                 text(&item.hint).size(12).color(c.muted),
                 space::horizontal(),
                 text(&item.description).size(12).color(c.muted),
             ]
             .spacing(8)
             .align_y(iced::Center);
-            button(line).width(Length::Fill).padding([4, 10]).on_press(Message::SlashComplete(item.complete.clone())).style(c.row_button(i == menu.selected)).into()
+            button(line).width(Length::Fill).padding([4, 10]).on_press(Message::SlashComplete(item.insert.clone())).style(c.row_button(i == menu.selected)).into()
         });
         let hint = text("Tab or Enter completes · ↑↓ to move · Esc to close").size(11).color(c.muted);
         let list = Column::with_children(rows).push(container(hint).padding([2, 10])).spacing(1);

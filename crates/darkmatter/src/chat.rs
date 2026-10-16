@@ -39,22 +39,57 @@ pub enum UpdateState {
     Failed(String),
 }
 
-/// Completions for a slash command being typed in a composer.
-#[derive(Debug, Default)]
+/// Completions for what's being typed in a composer: a slash command, an
+/// @mention or a :emoji:.
+#[derive(Debug)]
 pub struct SlashMenu {
     /// The thread's reply box, not the pane's message box.
     pub thread: bool,
+    pub kind: Completing,
+    /// The composer's whole text.
     pub input: String,
+    /// Where the word being completed starts in `input`.
+    pub from: usize,
     pub items: Vec<SlashItem>,
     pub selected: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Completing {
+    Command,
+    Mention,
+    Emoji,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SlashItem {
-    /// The completed command, without the slash.
-    pub complete: String,
+    /// What the menu shows ("/split", "@bob", ":rocket:").
+    pub label: String,
+    /// What replaces the word being typed, with a trailing space.
+    pub insert: String,
     pub hint: String,
     pub description: String,
+}
+
+/// The word at the end of `input` that a menu completes: (kind, where it
+/// starts, the word). A slash command is the whole text.
+pub fn completing(input: &str) -> Option<(Completing, usize, &str)> {
+    if input.contains('\n') {
+        return None;
+    }
+    if input.starts_with('/') {
+        return (!input.starts_with("//")).then_some((Completing::Command, 0, input));
+    }
+    let from = input.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+    let word = &input[from..];
+    if word.starts_with('@') {
+        return Some((Completing::Mention, from, word));
+    }
+    // `:ro`, but not a finished `:rocket:` or a time like 10:30.
+    if word.starts_with(':') && word.len() >= 3 && !word[1..].contains(':') {
+        return Some((Completing::Emoji, from, word));
+    }
+    None
 }
 
 pub struct SearchPane {
@@ -151,6 +186,10 @@ pub struct Editing {
     /// Draft key of the composer doing the editing.
     pub key: String,
     saved_draft: Option<String>,
+}
+
+fn person_item(u: &mm_api::models::User) -> SlashItem {
+    SlashItem { label: format!("@{}", u.username), insert: format!("@{} ", u.username), hint: u.display_name(), description: String::new() }
 }
 
 fn thread_key(root: &str) -> String {
@@ -597,53 +636,106 @@ impl Chat {
         self.select_channel(ids[next].clone())
     }
 
-    /// The composer's text changed: show, update or hide the slash menu, and
-    /// ask the server for its completions.
+    /// The composer's text changed: show, update or hide the completion menu,
+    /// and ask the server for more (commands, people) when it has them.
     fn update_slash(&mut self, thread: bool, input: &str) -> Task<Message> {
-        if !input.starts_with('/') || input.starts_with("//") || input.contains('\n') {
+        let Some((kind, from, word)) = completing(input) else {
             self.slash = None;
             return Task::none();
-        }
-        let mut items: Vec<SlashItem> = commands::complete_slash(input)
-            .into_iter()
-            .map(|(complete, hint, title)| SlashItem { complete, hint: hint.into(), description: title.into() })
-            .collect();
-        if self.slash_server.0 == input {
+        };
+        let mut items: Vec<SlashItem> = match kind {
+            Completing::Command => commands::complete_slash(input)
+                .into_iter()
+                .map(|(complete, hint, title)| SlashItem {
+                    label: format!("/{complete}"),
+                    insert: format!("/{complete} "),
+                    hint: hint.into(),
+                    description: title.into(),
+                })
+                .collect(),
+            Completing::Mention => self.mention_items(&word[1..]),
+            Completing::Emoji => emoji_picker::search(&word[1..], &self.recent_emoji, &self.store.custom_emoji)
+                .into_iter()
+                .take(8)
+                .map(|(name, pick)| SlashItem {
+                    label: format!(":{name}:"),
+                    insert: format!(":{name}: "),
+                    hint: match pick {
+                        emoji_picker::Pick::Glyph(g) => g.to_string(),
+                        emoji_picker::Pick::Custom(_) => String::new(),
+                    },
+                    description: String::new(),
+                })
+                .collect(),
+        };
+        let cached = self.slash_server.0 == word;
+        if cached {
             for item in &self.slash_server.1 {
-                if !items.iter().any(|i| i.complete == item.complete) {
+                if !items.iter().any(|i| i.insert == item.insert) {
                     items.push(item.clone());
                 }
             }
         }
-        let selected = self.slash.as_ref().filter(|m| m.thread == thread).map_or(0, |m| m.selected).min(items.len().saturating_sub(1));
-        self.slash = Some(SlashMenu { thread, input: input.to_string(), items, selected });
-        if self.slash_server.0 == input {
-            return Task::none();
+        let selected = self.slash.as_ref().filter(|m| m.thread == thread && m.kind == kind).map_or(0, |m| m.selected).min(items.len().saturating_sub(1));
+        self.slash = Some(SlashMenu { thread, kind, input: input.to_string(), from, items, selected });
+        let (client, team, channel, word) = (self.client.clone(), self.team.clone(), self.pv().channel.clone(), word.to_string());
+        match kind {
+            _ if cached => Task::none(),
+            Completing::Command => Task::perform(
+                async move {
+                    let r = client.command_suggestions(&team, &channel, &word).await.map_err(err);
+                    (word, r)
+                },
+                |(word, r)| Message::SlashSuggestions(word, r),
+            ),
+            // People not loaded yet, from the server (after a character or two).
+            Completing::Mention if word.len() >= 2 => Task::perform(
+                async move {
+                    let r = client.autocomplete_users(&team, &word[1..]).await.map_err(err);
+                    (word, r)
+                },
+                |(word, r)| Message::MentionSuggestions(word, r),
+            ),
+            _ => Task::none(),
         }
-        let (client, team, channel, input) = (self.client.clone(), self.team.clone(), self.pv().channel.clone(), input.to_string());
-        Task::perform(
-            async move {
-                let r = client.command_suggestions(&team, &channel, &input).await.map_err(err);
-                (input, r)
-            },
-            |(input, r)| Message::SlashSuggestions(input, r),
-        )
     }
 
-    /// Replace the slash command being typed with `complete`.
-    fn complete_slash(&mut self, complete: &str) -> Task<Message> {
+    /// People whose username or name starts with `q`, plus @here/@channel/@all.
+    fn mention_items(&self, q: &str) -> Vec<SlashItem> {
+        let q = q.to_lowercase();
+        let mut people: Vec<&mm_api::models::User> = self
+            .store
+            .users
+            .values()
+            .filter(|u| u.delete_at == 0 && !u.is_bot)
+            .filter(|u| u.username.starts_with(&q) || u.display_name().to_lowercase().split_whitespace().any(|w| w.starts_with(&q)))
+            .collect();
+        people.sort_by(|a, b| a.username.cmp(&b.username));
+        let mut items: Vec<SlashItem> = people.into_iter().take(8).map(person_item).collect();
+        for (name, what) in [("here", "Online people in this channel"), ("channel", "Everyone in this channel"), ("all", "Everyone in this channel")] {
+            if name.starts_with(&q) {
+                items.push(SlashItem { label: format!("@{name}"), insert: format!("@{name} "), hint: String::new(), description: what.into() });
+            }
+        }
+        items
+    }
+
+    /// Put the highlighted completion in place of the word being typed.
+    fn complete_slash(&mut self, insert: &str) -> Task<Message> {
         let Some(menu) = &self.slash else { return Task::none() };
         let thread = menu.thread;
-        let text = format!("/{complete} ");
-        let (key, id) = if thread {
-            let Some(root) = self.pv().thread.clone() else { return Task::none() };
-            (thread_key(&root), self.pv().thread_composer())
-        } else {
-            (self.pv().channel.clone(), self.pv().composer())
-        };
+        let text = format!("{}{insert}", &menu.input[..menu.from]);
+        let Some(key) = self.composer_key(thread) else { return Task::none() };
         self.drafts.insert(key, text.clone());
         let more = self.update_slash(thread, &text);
-        Task::batch([more, operation::focus(id.clone()), operation::move_cursor_to_end(id)])
+        Task::batch([more, self.focus_composer(thread)])
+    }
+
+    /// Enter while @mention or :emoji: completions show: take the highlighted one.
+    fn complete_on_enter(&mut self, thread: bool) -> Option<Task<Message>> {
+        let menu = self.slash.as_ref().filter(|m| m.thread == thread && m.kind != Completing::Command)?;
+        let insert = menu.items.get(menu.selected)?.insert.clone();
+        Some(self.complete_slash(&insert))
     }
 
     /// Enter in a composer whose text starts with a slash. `Some` when it was
@@ -668,10 +760,10 @@ impl Chat {
         if let Some(menu) = &self.slash
             && !text.contains(' ')
             && let Some(item) = menu.items.get(menu.selected)
-            && item.complete != text[1..]
+            && item.insert.trim_end() != text
         {
-            let complete = item.complete.clone();
-            return Some(self.complete_slash(&complete));
+            let insert = item.insert.clone();
+            return Some(self.complete_slash(&insert));
         }
         self.slash = None;
         self.notice = None;
@@ -682,6 +774,18 @@ impl Chat {
         self.command_sent = Some((key, text.clone()));
         let (client, team, channel) = (self.client.clone(), self.team.clone(), self.store.post(&root).map_or(self.pv().channel.clone(), |p| p.channel_id.clone()));
         Some(Task::perform(async move { client.execute_command(&team, &channel, &root, &text).await.map_err(err) }, Message::CommandRan))
+    }
+
+    /// Server completions for `word` arrived: show them if it's still being typed.
+    fn server_completions(&mut self, word: String, items: Vec<SlashItem>) -> Task<Message> {
+        self.slash_server = (word.clone(), items);
+        match &self.slash {
+            Some(menu) if menu.input[menu.from..] == word => {
+                let (thread, input) = (menu.thread, menu.input.clone());
+                self.update_slash(thread, &input)
+            }
+            _ => Task::none(),
+        }
     }
 
     /// After the channel list is refreshed: open the channel a /join went to.
@@ -1078,6 +1182,8 @@ impl Chat {
             Message::SendReply if self.editing.as_ref().is_some_and(|e| Some(&e.key) == self.pv().thread.as_ref().map(|r| thread_key(r)).as_ref()) => {
                 self.save_edit()
             }
+            Message::Send if let Some(task) = self.complete_on_enter(false) => task,
+            Message::SendReply if let Some(task) = self.complete_on_enter(true) => task,
             Message::Send if let Some(task) = self.slash_send(false) => task,
             Message::SendReply if let Some(task) = self.slash_send(true) => task,
             Message::Send => {
@@ -1396,22 +1502,24 @@ impl Chat {
             Message::SlashSuggestions(input, Ok(found)) => {
                 let items = found
                     .into_iter()
-                    .map(|s| SlashItem { complete: s.complete, hint: s.hint, description: s.description })
+                    .map(|s| SlashItem { label: format!("/{}", s.complete), insert: format!("/{} ", s.complete), hint: s.hint, description: s.description })
                     .collect();
-                self.slash_server = (input.clone(), items);
-                match &self.slash {
-                    Some(menu) if menu.input == input => {
-                        let thread = menu.thread;
-                        self.update_slash(thread, &input)
-                    }
-                    _ => Task::none(),
-                }
+                self.server_completions(input, items)
+            }
+            Message::MentionSuggestions(word, Ok(users)) => {
+                let items = users.iter().filter(|u| u.delete_at == 0 && u.id != self.store.me.id).map(person_item).collect();
+                self.store.add_users(users);
+                self.server_completions(word, items)
+            }
+            Message::MentionSuggestions(_, Err(e)) => {
+                tracing::debug!("no mention suggestions: {e}");
+                Task::none()
             }
             Message::SlashSuggestions(_, Err(e)) => {
                 tracing::debug!("no command suggestions: {e}");
                 Task::none()
             }
-            Message::SlashComplete(complete) => self.complete_slash(&complete),
+            Message::SlashComplete(insert) => self.complete_slash(&insert),
             Message::CommandRan(Ok(resp)) => {
                 self.command_sent = None;
                 // Ephemeral replies also arrive over the socket, as a message.
@@ -1457,8 +1565,8 @@ impl Chat {
                 let n = menu.items.len();
                 match named {
                     Named::Tab => {
-                        let complete = menu.items[menu.selected].complete.clone();
-                        return self.complete_slash(&complete);
+                        let insert = menu.items[menu.selected].insert.clone();
+                        return self.complete_slash(&insert);
                     }
                     Named::ArrowUp => menu.selected = (menu.selected + n - 1) % n,
                     _ => menu.selected = (menu.selected + 1) % n,
@@ -2220,6 +2328,29 @@ mod tests {
         let _ = chat.handle(Message::Send);
         assert!(chat.attachments.is_empty());
         assert!(chat.error.is_none());
+    }
+
+    #[test]
+    fn finds_the_word_to_complete() {
+        assert_eq!(completing("/spl"), Some((Completing::Command, 0, "/spl")));
+        assert_eq!(completing("//not a command"), None);
+        assert_eq!(completing("hi @bo"), Some((Completing::Mention, 3, "@bo")));
+        assert_eq!(completing("nice :ro"), Some((Completing::Emoji, 5, ":ro")));
+        assert_eq!(completing("nice :rocket:"), None, "finished");
+        assert_eq!(completing("at 10:30"), None);
+        assert_eq!(completing("hi :r"), None, "too short to guess");
+        assert_eq!(completing("hi @bob "), None, "moved on");
+    }
+
+    #[test]
+    fn mentions_complete_in_place() {
+        let mut chat = chat();
+        chat.store.add_users(vec![User { id: "b".into(), username: "bob".into(), ..Default::default() }]);
+        let _ = chat.handle(Message::Draft("thanks @bo".into()));
+        assert_eq!(chat.slash.as_ref().map(|m| m.items[0].label.as_str()), Some("@bob"));
+        let _ = chat.handle(Message::Send);
+        assert_eq!(chat.draft(), "thanks @bob ", "Enter completes rather than sending");
+        assert!(chat.slash.is_none());
     }
 
     #[test]
