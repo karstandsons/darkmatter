@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use iced::Task;
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{Id, operation, pane_grid};
+use iced::widget::{Id, operation, pane_grid, text_editor};
 use mm_api::models::{NewPost, Post};
 use mm_api::{Client, PostsQuery, ws};
 
@@ -195,6 +195,11 @@ pub struct Chat {
     pub plugins: std::sync::Arc<Plugins>,
     /// A plugin's picker, opened from the + menu.
     pub plugin_picker: Option<PluginPicker>,
+    /// The message boxes' editor state, by draft key; `drafts` stays the
+    /// text's source of truth and is copied in after each update.
+    pub editors: HashMap<String, text_editor::Content>,
+    /// Shown for a box whose editor isn't made yet (never, in practice).
+    pub no_editor: text_editor::Content,
     /// A channel to open once the channel list is refreshed (after /join).
     pending_goto: Option<String>,
 }
@@ -443,6 +448,8 @@ impl Chat {
             command_sent: None,
             plugins: std::sync::Arc::new(plugins::load()),
             plugin_picker: None,
+            editors: HashMap::new(),
+            no_editor: text_editor::Content::new(),
             pending_goto: None,
         };
         let mut chat = chat;
@@ -1167,6 +1174,33 @@ impl Chat {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.route(message);
+        self.sync_editors();
+        task
+    }
+
+    /// Give each shown message box an editor holding its draft. A draft
+    /// changed by anything but typing (a completion, a plugin, sending)
+    /// replaces the editor's text, with the cursor at the end.
+    fn sync_editors(&mut self) {
+        let keys: HashSet<String> = self
+            .panes
+            .iter()
+            .flat_map(|(_, p)| [Some(p.channel.clone()).filter(|c| !c.is_empty()), p.thread.as_deref().map(thread_key)])
+            .flatten()
+            .collect();
+        self.editors.retain(|k, _| keys.contains(k));
+        for key in keys {
+            let want = self.drafts.get(&key).map_or("", String::as_str);
+            let content = self.editors.entry(key.clone()).or_default();
+            if content.text() != want {
+                *content = text_editor::Content::with_text(want);
+                content.perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+            }
+        }
+    }
+
+    fn route(&mut self, message: Message) -> Task<Message> {
         let pane = self.cur;
         let task = match message {
             // From a pane's widgets, or a result for it: handle it as that pane.
@@ -1305,6 +1339,17 @@ impl Chat {
             Message::History(_, Err(e)) | Message::Users(Err(e)) => {
                 self.error = Some(e);
                 Task::none()
+            }
+            Message::Edit(thread, action) => {
+                let Some(key) = self.composer_key(thread) else { return Task::none() };
+                let typed = action.is_edit();
+                let content = self.editors.entry(key).or_default();
+                content.perform(action);
+                if !typed {
+                    return Task::none();
+                }
+                let text = content.text();
+                self.update(if thread { Message::ThreadDraft(text) } else { Message::Draft(text) })
             }
             Message::Draft(d) => {
                 let slash = self.update_slash(false, &d);

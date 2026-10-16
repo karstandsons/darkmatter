@@ -159,6 +159,8 @@ pub enum Message {
     CloseThread,
     Thread(String, Result<PostList, String>),
     ThreadDraft(String),
+    /// Typing, a cursor move or a selection in a message box (true: the reply box).
+    Edit(bool, iced::widget::text_editor::Action),
     SendReply,
     Media(crate::media::Key, Result<Vec<u8>, String>),
     OpenFile(String, String),
@@ -537,6 +539,12 @@ impl App {
                 m => tracing::debug!("{m:?}"),
             }
         }
+        // Keys a message box passes on (shortcuts, menu keys) are the app's,
+        // like keys no widget took, not the pane's.
+        let message = match message {
+            Message::InPane(_, m) if matches!(*m, Message::Key(_)) => *m,
+            m => m,
+        };
         let message = match self.update_picker(message) {
             ControlFlow::Break(task) => return task,
             ControlFlow::Continue(message) => message,

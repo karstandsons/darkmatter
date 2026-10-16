@@ -16,7 +16,9 @@ pub fn server_url(input: &str) -> String {
 }
 
 /// Turn a Mattermost message into the markdown we render: emoji shortcodes,
-/// bare URLs as links and `@mentions` as `mention:` links. Code is left alone.
+/// bare URLs as links, `@mentions` as `mention:` links, and each newline a
+/// line break (as Mattermost shows them; plain markdown joins the lines).
+/// Code is left alone.
 pub fn prepare(message: &str) -> String {
     let mut out = String::with_capacity(message.len() + 16);
     for (i, block) in message.split("```").enumerate() {
@@ -34,9 +36,23 @@ pub fn prepare(message: &str) -> String {
             if j % 2 == 1 {
                 out.push_str(span);
             } else {
-                out.push_str(&linkify(&emojify(span)));
+                out.push_str(&hard_breaks(&linkify(&emojify(span))));
             }
         }
+    }
+    out
+}
+
+/// End each line that has text with two spaces, markdown's line break.
+fn hard_breaks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut prev = '\n';
+    for c in s.chars() {
+        if c == '\n' && prev != '\n' {
+            out.push_str("  ");
+        }
+        out.push(c);
+        prev = c;
     }
     out
 }
@@ -214,6 +230,8 @@ mod tests {
         assert_eq!(prepare("`@alice :wave:` @bob"), "`@alice :wave:` [@bob](mention:bob)");
         assert_eq!(prepare("```\n@a https://x\n```\n:wave:"), "```\n@a https://x\n```\n👋");
         assert_eq!(prepare("lone @ sign"), "lone @ sign");
+        assert_eq!(prepare("one\ntwo\n\nthree"), "one  \ntwo  \n\nthree", "newlines break lines");
+        assert_eq!(prepare("```\na\nb\n```"), "```\na\nb\n```", "not in code");
     }
 
     #[test]

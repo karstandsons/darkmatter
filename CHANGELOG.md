@@ -13,6 +13,9 @@ The release workflow uses each version's section here as its release notes.
 - **Example plugins** in `plugins/`: a meme maker (`/meme drake | tabs |
   spaces`, with ImageMagick), Giphy search (with your own API key),
   kaomoji, and Quote.
+- **Multi-line message box:** Shift+Enter starts a new line, and the box
+  grows with its text (then scrolls). Enter still sends.
+- Line breaks in messages now show as line breaks, as in Mattermost.
 
 ## [0.2.0] - 2026-10-15
 

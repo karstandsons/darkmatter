@@ -3,7 +3,7 @@
 
 use std::sync::OnceLock;
 
-use iced::widget::{button, container, markdown, text_input};
+use iced::widget::{button, container, markdown, text_editor, text_input};
 use iced::{Background, Border, Color, Font, Theme, border, font, theme};
 use omarchy_theme::Rgb;
 
@@ -171,6 +171,23 @@ impl Colors {
                 },
             },
             icon: self.muted,
+            placeholder: self.muted,
+            value: self.fg,
+            selection: self.selection,
+        }
+    }
+
+    pub fn editor(self) -> impl Fn(&Theme, text_editor::Status) -> text_editor::Style {
+        move |_, status| text_editor::Style {
+            background: Background::Color(self.surface),
+            border: Border {
+                radius: 6.0.into(),
+                width: 1.0,
+                color: match status {
+                    text_editor::Status::Focused { .. } => self.accent,
+                    _ => self.selection,
+                },
+            },
             placeholder: self.muted,
             value: self.fg,
             selection: self.selection,

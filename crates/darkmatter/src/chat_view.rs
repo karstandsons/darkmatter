@@ -2,7 +2,7 @@
 
 use iced::widget::{
     Column, button, center, mouse_area, opaque, tooltip, column, container, hover, image, markdown, pane_grid, row, rule, scrollable, space, stack,
-    text, text_input,
+    text, text_editor,
 };
 use iced::{Element, Length, Theme};
 use mm_api::models::{Channel, ChannelType, FileInfo, Post};
@@ -191,6 +191,24 @@ impl Chat {
     fn slash_slot<'a>(&'a self, thread: bool, pv: &PaneView, c: Colors) -> Element<'a, Message> {
         let popup = self.slash_view(thread, pv, c).or_else(|| self.plus_view(thread, pv, c));
         container(popup.unwrap_or_else(|| space().height(0).into())).into()
+    }
+
+    /// A message box: it grows with its text (then scrolls), Enter sends,
+    /// Shift+Enter starts a new line, and shortcuts and menu keys reach the app.
+    fn composer<'a>(&'a self, key: &str, id: iced::widget::Id, placeholder: String, thread: bool, padding: f32, c: Colors) -> Element<'a, Message> {
+        let content = self.editors.get(key).unwrap_or(&self.no_editor);
+        let menu = self.slash.as_ref().is_some_and(|m| m.thread == thread && !m.items.is_empty());
+        let empty = content.is_empty();
+        let submit = if thread { Message::SendReply } else { Message::Send };
+        text_editor(content)
+            .id(id)
+            .placeholder(placeholder)
+            .on_action(move |a| Message::Edit(thread, a))
+            .key_binding(move |kp| composer_binding(kp, menu, empty, &submit))
+            .padding(padding)
+            .max_height(240)
+            .style(c.editor())
+            .into()
     }
 
     /// The + by a composer: emoji, files and more.
@@ -479,12 +497,8 @@ impl Chat {
             _ => center(text("Loading…").color(c.muted)).into(),
         };
 
-        let composer = text_input(&format!("Message {}", self.store.channel_label(channel)), self.draft_in(pv))
-            .id(pv.composer())
-            .on_input(Message::Draft)
-            .on_submit(Message::Send)
-            .padding(if self.compact { 7 } else { 12 })
-            .style(c.input());
+        let placeholder = format!("Message {}", self.store.channel_label(channel));
+        let composer = self.composer(&pv.channel, pv.composer(), placeholder, false, if self.compact { 7.0 } else { 12.0 }, c);
 
         // Rows above the composer sit in fixed slots, empty when unused:
         // adding a widget before the composer would cost it the focus.
@@ -537,12 +551,7 @@ impl Chat {
             Some(t) if t.loaded => self.timeline(self.focused(), &t.entries, None, Kind::Thread, c, theme),
             _ => center(text("Loading…").color(c.muted)).into(),
         };
-        let composer = text_input("Reply…", self.thread_draft_in(self.focused()))
-            .id(self.focused().thread_composer())
-            .on_input(Message::ThreadDraft)
-            .on_submit(Message::SendReply)
-            .padding(if self.compact { 7 } else { 12 })
-            .style(c.input());
+        let composer = self.composer(&format!("thread:{root_id}"), self.focused().thread_composer(), "Reply…".into(), true, if self.compact { 7.0 } else { 12.0 }, c);
         let channel_id = self.store.post(root_id).map_or("", |p| p.channel_id.as_str());
         let thread_key = format!("thread:{root_id}");
         let typing = self.editing_note(&thread_key, c).unwrap_or_else(|| self.typing_line(channel_id, root_id, c));
@@ -731,12 +740,7 @@ impl Chat {
         }
         let mut col = column![replies];
         if pv.thread.as_deref() == Some(root_id) {
-            let composer = text_input("Reply…", self.thread_draft_in(pv))
-                .id(pv.thread_composer())
-                .on_input(Message::ThreadDraft)
-                .on_submit(Message::SendReply)
-                .padding(10)
-                .style(c.input());
+            let composer = self.composer(&format!("thread:{root_id}"), pv.thread_composer(), "Reply…".into(), true, 10.0, c);
             let channel_id = self.store.post(root_id).map_or("", |p| p.channel_id.as_str());
             let key = format!("thread:{root_id}");
             let note = self.editing_note(&key, c).unwrap_or_else(|| self.typing_line(channel_id, root_id, c));
@@ -1066,5 +1070,39 @@ impl Chat {
                 .into()
         });
         Some(iced::widget::Row::with_children(chips).spacing(6).into())
+    }
+}
+
+/// Keys in a message box. Enter sends and Shift+Enter breaks the line. Keys
+/// the app uses (shortcuts, Tab, ↑↓ in a completion menu, ↑ in an empty box
+/// to edit your last message, PageUp/Down) go to it as if no box had them.
+fn composer_binding(kp: text_editor::KeyPress, menu: bool, empty: bool, submit: &Message) -> Option<text_editor::Binding<Message>> {
+    use iced::keyboard::{Key, key::Named};
+    use text_editor::Binding;
+    if !matches!(kp.status, text_editor::Status::Focused { .. }) {
+        return None;
+    }
+    let m = kp.modifiers;
+    let to_app = |kp: &text_editor::KeyPress| {
+        Some(Binding::Custom(Message::Key(iced::keyboard::Event::KeyPressed {
+            key: kp.key.clone(),
+            modified_key: kp.modified_key.clone(),
+            physical_key: kp.physical_key,
+            location: iced::keyboard::Location::Standard,
+            modifiers: kp.modifiers,
+            text: kp.text.clone(),
+            repeat: false,
+        })))
+    };
+    match kp.key.as_ref() {
+        Key::Named(Named::Enter) if m.shift() => Some(Binding::Enter),
+        Key::Named(Named::Enter) if !m.alt() && !m.command() => Some(Binding::Custom(submit.clone())),
+        // The app's Esc handling closes menus and steps out of the box.
+        Key::Named(Named::Escape) => None,
+        Key::Named(Named::Tab | Named::PageUp | Named::PageDown) => to_app(&kp),
+        Key::Named(Named::ArrowUp | Named::ArrowDown) if menu && m.is_empty() => to_app(&kp),
+        Key::Named(Named::ArrowUp) if empty && m.is_empty() => to_app(&kp),
+        _ if crate::commands::for_key(&kp.key, m).is_some() => to_app(&kp),
+        _ => Binding::from_key_press(kp),
     }
 }
