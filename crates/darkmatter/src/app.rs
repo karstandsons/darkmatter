@@ -133,8 +133,8 @@ pub enum Message {
     SaveLayout,
     /// Put the cursor in the focused pane's message box.
     FocusComposer,
-    /// Switch the pane between comfortable and compact (one line per message).
-    ToggleDensity,
+    /// The ☰ menu.
+    ToggleMenu,
     /// Show the unified inbox pane (opening one beside the focused pane if needed).
     OpenInbox,
     /// From the inbox: (channel, thread root, post) to open in a channel pane;
@@ -254,6 +254,12 @@ impl App {
         app.apply_theme();
         let os_theme = iced::system::theme().map(Message::OsTheme);
         (app, Task::batch([task, os_theme]))
+    }
+
+    fn save_config(&self) {
+        if let Err(e) = self.config.save() {
+            tracing::warn!("couldn't save config: {e}");
+        }
     }
 
     fn choice(&self) -> ThemeChoice {
@@ -531,7 +537,22 @@ impl App {
             {
                 self.update(Message::Run(command, String::new()))
             }
-            Message::Run(command, arg) => self.run(command, arg),
+            Message::Run(command, arg) => {
+                use crate::commands::Command as C;
+                // A pick from the ☰ menu closes it (Leave asks first, so it stays)
+                // and puts the cursor back in the message box, unless the
+                // command opens a box of its own.
+                let mut refocus = false;
+                if let Screen::Chat(chat) = &mut self.screen
+                    && chat.menu
+                    && command != C::Leave
+                {
+                    chat.menu = false;
+                    refocus = !matches!(command, C::QuickSwitcher | C::Search | C::Shortcuts | C::Themes | C::Logout);
+                }
+                let task = self.run(command, arg);
+                if refocus { Task::batch([task, Task::done(Message::FocusComposer)]) } else { task }
+            }
             Message::ToggleThreadLayout => {
                 let inline = !self.config.layout.inline_threads();
                 self.config.layout.threads = Some(if inline { "inline" } else { "pane" }.into());
@@ -623,6 +644,29 @@ impl App {
             }
             C::Themes => self.update(if self.picker.is_some() { Message::CloseThemes } else { Message::OpenThemes }),
             C::ThreadLayout => self.update(Message::ToggleThreadLayout),
+            C::ToggleDensity | C::Compact | C::Cozy => {
+                let compact = match command {
+                    C::Compact => true,
+                    C::Cozy => false,
+                    _ => !self.config.layout.compact(),
+                };
+                self.config.layout.density = Some(if compact { "compact" } else { "comfortable" }.into());
+                self.save_config();
+                if let Screen::Chat(chat) = &mut self.screen {
+                    chat.compact = compact;
+                }
+                Task::none()
+            }
+            C::ToggleSidebar => {
+                let shown = self.config.layout.sidebar == Some(false);
+                self.config.layout.sidebar = (!shown).then_some(false);
+                self.save_config();
+                if let Screen::Chat(chat) = &mut self.screen {
+                    chat.sidebar = shown;
+                }
+                Task::none()
+            }
+            C::About => self.update(Message::Link(format!("https://github.com/karstandsons/darkmatter/releases/tag/v{}", env!("CARGO_PKG_VERSION")))),
             C::Logout => self.update(Message::Logout),
             _ => match &mut self.screen {
                 Screen::Chat(chat) => chat.run(command, arg),
@@ -636,7 +680,8 @@ impl App {
         chat.inline_threads = self.config.layout.inline_threads();
         chat.vim_keys = self.config.keys.vim != Some(false);
         chat.check_updates = self.config.updates.check != Some(false);
-        chat.set_default_density(self.config.layout.compact());
+        chat.compact = self.config.layout.compact();
+        chat.sidebar = self.config.layout.sidebar != Some(false);
         let task = Task::batch([task, chat.open_panes(), chat.update(Message::CheckUpdate)]);
         self.screen = Screen::Chat(Box::new(chat));
         task

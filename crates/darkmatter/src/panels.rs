@@ -23,7 +23,7 @@ impl Chat {
             button(text("✕").size(14).color(c.muted)).padding([2, 8]).on_press(Message::ClosePanel).style(c.row_button(false)),
         ]
         .align_y(iced::Center);
-        container(column![container(header).padding([12, 20]), rule::horizontal(1), body].width(Length::Fill))
+        container(column![container(header).padding(self.header_pad()), rule::horizontal(1), body].width(Length::Fill))
             .width(420)
             .height(Length::Fill)
             .style(c.panel(c.sidebar))
@@ -118,7 +118,7 @@ impl Chat {
         if n > 0 {
             line = line.push(space::horizontal()).push(container(text(n.to_string()).size(11).font(bold())).padding([1, 7]).style(c.badge()));
         }
-        button(line).width(Length::Fill).padding([5, 10]).on_press(Message::OpenInbox).style(c.row_button(self.focused().inbox)).into()
+        button(line).width(Length::Fill).padding(self.row_pad()).on_press(Message::OpenInbox).style(c.row_button(self.focused().inbox)).into()
     }
 
     /// "Threads" entry at the top of the sidebar.
@@ -134,7 +134,7 @@ impl Chat {
         }
         button(line)
             .width(Length::Fill)
-            .padding([5, 10])
+            .padding(self.row_pad())
             .on_press(Message::OpenThreads)
             .style(c.row_button(matches!(self.panel, Some(Panel::Threads)) && self.focused().thread.is_none()))
             .into()

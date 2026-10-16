@@ -110,7 +110,11 @@ comes back next time.
 | Ctrl+W | Close the pane |
 | Ctrl+Alt+arrows | Move between panes (or click one); drag a split to resize, a title bar to move |
 | Ctrl+I | Inbox: unread messages from every channel in one pane |
-| Ctrl+Shift+L | Compact (one line per message) or comfortable, per pane |
+| Ctrl+Shift+L | Compact (one line per message, tighter spacing everywhere) or comfortable |
+| Ctrl+B | Hide or show the channel sidebar |
+
+The **☰ menu** (top left) has the view settings, Go to, Leave channel,
+Themes, Keyboard shortcuts, About and Log out.
 
 **Vim keys**, when no text box has the cursor (Esc leaves the message box):
 `j`/`k` move between messages, `gg`/`G` first/last, `h`/`l` panes, `r` reply,
@@ -141,7 +145,8 @@ font = "JetBrainsMono Nerd Font"  # optional; defaults to the system monospace f
 
 [layout]
 threads = "inline"         # "inline" | "pane"
-density = "comfortable"    # default for new panes: "comfortable" | "compact"
+density = "comfortable"    # "comfortable" | "compact"
+sidebar = true             # the channel list (Ctrl+B)
 
 [keys]
 vim = true                 # vim-style keys when no text box has the cursor

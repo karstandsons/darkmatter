@@ -12,6 +12,12 @@ The release workflow uses each version's section here as its release notes.
 - **Keyboard shortcuts sheet** (Ctrl+/, `/shortcuts`, or `?`): every command
   with its keys and slash form, searchable.
 - **Commands in Ctrl+K:** type `>` and a command's name.
+- **☰ menu** with the view settings, Go to, Leave channel, Themes, Keyboard
+  shortcuts, About and Log out. The pane title bars and the sidebar footer
+  lose their buttons.
+- **Hide the sidebar** with Ctrl+B, `/sidebar` or the menu.
+- **Compact** now applies to the whole app (sidebar, title bars, composer and
+  messages) and is set once, from the menu, Ctrl+Shift+L, `/compact` or `/cozy`.
 - Your own status dot follows `/away`, `/dnd` and `/online`.
 
 - **Update from the app:** the "new version" notice has an **Update** button,

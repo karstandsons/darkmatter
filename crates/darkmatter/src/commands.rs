@@ -20,6 +20,7 @@ pub enum Command {
     FocusRight,
     FocusUp,
     FocusDown,
+    ToggleSidebar,
     ToggleDensity,
     Compact,
     Cozy,
@@ -27,8 +28,10 @@ pub enum Command {
     Attach,
     ReactLatest,
     ReplyLatest,
+    Leave,
     Themes,
     Shortcuts,
+    About,
     Logout,
 }
 
@@ -117,6 +120,7 @@ pub const ALL: &[Spec] = &[
     spec(C::FocusRight, "Pane to the right", Group::View, &[ctrl_alt("ArrowRight")], &[], ""),
     spec(C::FocusUp, "Pane above", Group::View, &[ctrl_alt("ArrowUp")], &[], ""),
     spec(C::FocusDown, "Pane below", Group::View, &[ctrl_alt("ArrowDown")], &[], ""),
+    spec(C::ToggleSidebar, "Show / hide the sidebar", Group::View, &[ctrl("b")], &["sidebar"], ""),
     spec(C::ToggleDensity, "Compact / cozy", Group::View, &[ctrl_shift("l")], &["density"], ""),
     spec(C::Compact, "Compact", Group::View, &[], &["compact"], ""),
     spec(C::Cozy, "Cozy", Group::View, &[], &["cozy"], ""),
@@ -124,8 +128,10 @@ pub const ALL: &[Spec] = &[
     spec(C::Attach, "Attach files", Group::Messages, &[ctrl("u")], &["upload"], ""),
     spec(C::ReactLatest, "React to the latest message", Group::Messages, &[ctrl_shift("\\")], &[], ""),
     spec(C::ReplyLatest, "Reply to the latest message", Group::Messages, &[shift("ArrowUp")], &[], ""),
+    spec(C::Leave, "Leave this channel", Group::Messages, &[], &[], ""),
     spec(C::Themes, "Themes", Group::Darkmatter, &[ctrl("t")], &["theme"], "[name]"),
     spec(C::Shortcuts, "Keyboard shortcuts", Group::Darkmatter, &[ctrl("/")], &["shortcuts", "keys"], ""),
+    spec(C::About, "About Darkmatter", Group::Darkmatter, &[], &["about"], ""),
     spec(C::Logout, "Log out", Group::Darkmatter, &[], &["logout"], ""),
 ];
 

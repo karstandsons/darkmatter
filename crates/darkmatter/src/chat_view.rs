@@ -1,7 +1,7 @@
 //! Chat screen views.
 
 use iced::widget::{
-    Column, button, center, column, container, hover, image, markdown, pane_grid, row, rule, scrollable, space, stack,
+    Column, button, center, mouse_area, opaque, column, container, hover, image, markdown, pane_grid, row, rule, scrollable, space, stack,
     text, text_input,
 };
 use iced::{Element, Length, Theme};
@@ -46,7 +46,7 @@ impl Chat {
         let many = self.panes.len() > 1;
         let grid = pane_grid::PaneGrid::new(&self.panes, |pane, pv, _| {
             let wrap = move |m| Message::InPane(pane, Box::new(m));
-            let mut title = pane_grid::TitleBar::new(self.pane_header(pv, c).map(wrap)).padding([12, 20]);
+            let mut title = pane_grid::TitleBar::new(self.pane_header(pv, c).map(wrap)).padding(self.header_pad());
             if let Some(controls) = self.pane_controls(pv, many, c) {
                 title = title.controls(pane_grid::Controls::new(controls.map(wrap))).always_show_controls();
             }
@@ -62,7 +62,14 @@ impl Chat {
         .on_click(Message::FocusPane)
         .on_drag(Message::PaneDragged)
         .on_resize(8, Message::PaneResized);
-        layout = layout.push(self.sidebar(c)).push(grid);
+        if self.sidebar {
+            layout = layout.push(self.sidebar(c));
+        } else {
+            // Just the ☰, so the menu (and Show sidebar) stays in reach.
+            let rail = container(self.menu_button(c)).padding([8, 4]).height(Length::Fill).style(c.panel(c.sidebar));
+            layout = layout.push(rail);
+        }
+        layout = layout.push(grid);
         if let Some(root) = self.pane_thread() {
             layout = layout.push(rule::vertical(1)).push(self.thread_pane(root, c, theme));
         } else if let Some(panel) = &self.panel {
@@ -71,6 +78,7 @@ impl Chat {
         // Always a stack, so opening or closing an overlay keeps the widget
         // state under it (a focus set as the switcher closes would be lost).
         let overlay = match (&self.shortcuts, &self.switcher, &self.emoji_picker) {
+            _ if self.menu => Some(self.menu_view(c)),
             (Some(q), ..) => Some(crate::shortcuts::view(q, self.vim_keys, c)),
             (None, Some(sw), _) => Some(sw.view(&self.store, c)),
             (None, None, Some(picker)) => Some(picker.view(c, &self.media)),
@@ -134,7 +142,7 @@ impl Chat {
             }
             button(line)
                 .width(Length::Fill)
-                .padding([5, 10])
+                .padding(self.row_pad())
                 .on_press(Message::SelectChannel(ch.id.clone()))
                 .style(c.row_button(ch.id == self.focused().channel))
                 .into()
@@ -152,28 +160,17 @@ impl Chat {
 
         // Your presence (/away, /dnd…); muted while the connection is down.
         let status_color = if self.online { self.presence_color(&self.store.me.id, c).unwrap_or(c.green) } else { c.muted };
-        let footer = row![
-            text("●").size(10).color(status_color),
-            text(format!("@{}", self.store.me.username)).size(13).color(c.fg),
-            space::horizontal(),
-            button(text("Themes").size(12).color(c.muted))
-                .padding([2, 6])
-                .on_press(Message::OpenThemes)
-                .style(c.row_button(false)),
-            button(text("Log out").size(12).color(c.muted))
-                .padding([2, 6])
-                .on_press(Message::Logout)
-                .style(c.row_button(false)),
-        ]
-        .spacing(8)
-        .align_y(iced::Center);
+        let footer = row![text("●").size(10).color(status_color), text(format!("@{}", self.store.me.username)).size(13).color(c.fg)]
+            .spacing(8)
+            .align_y(iced::Center);
 
+        let title = text(team.map_or("", |t| t.display_name.as_str())).size(if self.compact { 15 } else { 17 }).font(bold()).color(c.fg_bright);
         let mut col = column![
-            text(team.map_or("", |t| t.display_name.as_str())).size(17).font(bold()).color(c.fg_bright),
+            row![self.menu_button(c), title].spacing(6).align_y(iced::Center),
             scrollable(list.padding([0, 4])).height(Length::Fill),
         ]
-        .spacing(14)
-        .padding(12);
+        .spacing(if self.compact { 8 } else { 14 })
+        .padding(if self.compact { 8 } else { 12 });
         if self.client.is_read_only() {
             col = col.push(text("● read-only: nothing is sent to the server").size(11).color(c.yellow));
         }
@@ -275,32 +272,107 @@ impl Chat {
         header.into()
     }
 
-    /// Buttons at the right of a pane's title bar: Leave, and ✕ when there
-    /// are other panes.
-    fn pane_controls<'a>(&'a self, pv: &'a PaneView, many: bool, c: Colors) -> Option<Element<'a, Message>> {
-        let density = if pv.compact { "Cozy" } else { "Compact" };
-        let mut controls = row![
-            button(text(density).size(12).color(c.muted)).padding([2, 8]).on_press(Message::ToggleDensity).style(c.row_button(false))
+    /// The ✕ at the right of a pane's title bar, when there are other panes.
+    /// (Leave, density and the rest are in the ☰ menu.)
+    fn pane_controls<'a>(&'a self, _pv: &'a PaneView, many: bool, c: Colors) -> Option<Element<'a, Message>> {
+        many.then(|| button(text("✕").size(13).color(c.muted)).padding([2, 8]).on_press(Message::ClosePane).style(c.row_button(false)).into())
+    }
+
+    /// Sidebar rows, by density.
+    pub fn row_pad(&self) -> [u16; 2] {
+        if self.compact { [2, 10] } else { [5, 10] }
+    }
+
+    /// Pane and panel title bars, by density.
+    pub fn header_pad(&self) -> [u16; 2] {
+        if self.compact { [6, 16] } else { [12, 20] }
+    }
+
+    /// Around a composer, by density.
+    fn footer_pad(&self) -> iced::Padding {
+        if self.compact { iced::Padding { top: 0.0, right: 12.0, bottom: 8.0, left: 12.0 } } else { PANE_FOOTER }
+    }
+
+    /// The ☰ button that opens the menu.
+    fn menu_button(&self, c: Colors) -> Element<'_, Message> {
+        button(text("☰").size(16).color(if self.menu { c.accent } else { c.muted }))
+            .padding([2, 8])
+            .on_press(Message::ToggleMenu)
+            .style(c.row_button(self.menu))
+            .into()
+    }
+
+    /// The ☰ menu: view and go-to commands, the channel, and Darkmatter's own.
+    fn menu_view(&self, c: Colors) -> Element<'_, Message> {
+        use crate::commands::{Command as C, key_label};
+        let item = |label: String, command: C, on: Option<bool>| -> Element<'_, Message> {
+            let check = if on == Some(true) { "✓" } else { "" };
+            let mut line = row![text(check).size(12).color(c.accent).width(14), text(label).size(13).color(c.fg), space::horizontal()]
+                .spacing(4)
+                .align_y(iced::Center);
+            if let Some(key) = key_label(command) {
+                line = line.push(text(key).size(11).color(c.muted));
+            }
+            button(line).width(Length::Fill).padding([4, 8]).on_press(Message::Run(command, String::new())).style(c.row_button(false)).into()
+        };
+        let heading = |label: &'static str| -> Element<'_, Message> {
+            container(text(label).size(11).font(bold()).color(c.muted)).padding(iced::Padding { top: 6.0, left: 8.0, bottom: 2.0, right: 0.0 }).into()
+        };
+        let mut col = column![
+            heading("View"),
+            item("Sidebar".into(), C::ToggleSidebar, Some(self.sidebar)),
+            item("Compact".into(), C::ToggleDensity, Some(self.compact)),
+            item("Threads inline".into(), C::ThreadLayout, Some(self.inline_threads)),
+            item("Split right".into(), C::SplitRight, None),
+            item("Split down".into(), C::SplitDown, None),
         ]
-        .spacing(4)
-        .align_y(iced::Center);
-        let channel = self.store.channels.get(&pv.channel);
+        .spacing(1);
+        if self.panes.len() > 1 {
+            col = col.push(item("Close pane".into(), C::ClosePane, None));
+        }
+        col = col
+            .push(rule::horizontal(1))
+            .push(heading("Go"))
+            .push(item("Jump to…".into(), C::QuickSwitcher, None))
+            .push(item("Search".into(), C::Search, None))
+            .push(item("Mentions".into(), C::Mentions, None))
+            .push(item("Inbox".into(), C::Inbox, None))
+            .push(item("Threads".into(), C::Threads, None));
         // Town Square can't be left; DMs are closed, not left.
-        if let Some(channel) = channel.filter(|ch| matches!(ch.kind, ChannelType::Open | ChannelType::Private) && ch.name != "town-square") {
-            let confirming = self.confirm_delete.as_deref() == Some(channel.id.as_str());
-            controls = controls.push(
-                button(text(if confirming { "Leave? click again" } else { "Leave" }).size(12).color(if confirming { c.red } else { c.muted }))
-                    .padding([2, 8])
-                    .on_press(Message::LeaveChannel(channel.id.clone()))
+        let channel = self
+            .store
+            .channels
+            .get(&self.focused().channel)
+            .filter(|ch| matches!(ch.kind, ChannelType::Open | ChannelType::Private) && ch.name != "town-square");
+        if let Some(ch) = channel {
+            let confirming = self.confirm_delete.as_deref() == Some(ch.id.as_str());
+            let label = if confirming { "Leave? Click again".to_string() } else { format!("Leave {}", self.store.channel_label(ch)) };
+            col = col.push(rule::horizontal(1)).push(
+                button(row![space().width(18), text(label).size(13).color(if confirming { c.red } else { c.fg })])
+                    .width(Length::Fill)
+                    .padding([4, 8])
+                    .on_press(Message::Run(C::Leave, String::new()))
                     .style(c.row_button(false)),
             );
         }
-        if many {
-            controls = controls.push(
-                button(text("✕").size(13).color(c.muted)).padding([2, 8]).on_press(Message::ClosePane).style(c.row_button(false)),
-            );
-        }
-        Some(controls.into())
+        col = col
+            .push(rule::horizontal(1))
+            .push(heading("Darkmatter"))
+            .push(item("Themes".into(), C::Themes, None))
+            .push(item("Keyboard shortcuts".into(), C::Shortcuts, None))
+            .push(item(format!("About Darkmatter {}", env!("CARGO_PKG_VERSION")), C::About, None))
+            .push(rule::horizontal(1))
+            .push(item("Log out".into(), C::Logout, None));
+        let panel = container(col).padding(6).width(280).style(move |_: &Theme| container::Style {
+            background: Some(iced::Background::Color(c.sidebar)),
+            border: iced::Border { radius: 8.0.into(), width: 1.0, color: c.selection },
+            shadow: iced::Shadow { color: iced::Color { a: 0.4, ..iced::Color::BLACK }, offset: iced::Vector::new(0.0, 4.0), blur_radius: 16.0 },
+            ..Default::default()
+        });
+        // Under the ☰ (past the team rail, if there is one); a click elsewhere closes it.
+        let left = if self.store.teams.len() > 1 { 68.0 } else { 8.0 };
+        let placed = container(opaque(panel)).padding(iced::Padding { top: 44.0, left, ..iced::Padding::ZERO }).width(Length::Fill).height(Length::Fill);
+        opaque(mouse_area(placed).on_press(Message::ToggleMenu))
     }
 
     /// The unified inbox: unread messages from every channel, oldest first,
@@ -311,7 +383,7 @@ impl Chat {
             return center(text("You're all caught up").color(c.muted)).into();
         }
         let md = c.markdown(theme);
-        let mut col = Column::new().spacing(2).padding([12, 20]);
+        let mut col = Column::new().spacing(2).padding(self.header_pad());
         let mut prev: Option<&Post> = None;
         for entry in entries {
             let post = &entry.post;
@@ -357,7 +429,7 @@ impl Chat {
             .id(pv.composer())
             .on_input(Message::Draft)
             .on_submit(Message::Send)
-            .padding(12)
+            .padding(if self.compact { 7 } else { 12 })
             .style(c.input());
 
         // Rows above the composer sit in fixed slots, empty when unused:
@@ -389,7 +461,7 @@ impl Chat {
         let mut footer = column![typing].spacing(6);
         footer = footer.push(self.slash_slot(false, pv, c));
         footer = footer.push(slot(self.attachment_chips(&pv.channel, c)));
-        col.push(container(footer.push(composer)).padding(PANE_FOOTER))
+        col.push(container(footer.push(composer)).padding(self.footer_pad()))
             .width(Length::Fill)
             .into()
     }
@@ -419,7 +491,7 @@ impl Chat {
             .id(self.focused().thread_composer())
             .on_input(Message::ThreadDraft)
             .on_submit(Message::SendReply)
-            .padding(12)
+            .padding(if self.compact { 7 } else { 12 })
             .style(c.input());
         let channel_id = self.store.post(root_id).map_or("", |p| p.channel_id.as_str());
         let thread_key = format!("thread:{root_id}");
@@ -427,10 +499,10 @@ impl Chat {
 
         container(
             column![
-                container(header).padding([12, 20]),
+                container(header).padding(self.header_pad()),
                 rule::horizontal(1),
                 body,
-                container(Column::new().push(typing).push(self.slash_slot(true, self.focused(), c)).push(composer).spacing(4)).padding(PANE_FOOTER),
+                container(Column::new().push(typing).push(self.slash_slot(true, self.focused(), c)).push(composer).spacing(4)).padding(self.footer_pad()),
             ]
             .width(Length::Fill),
         )
@@ -502,7 +574,7 @@ impl Chat {
     ) -> Element<'a, Message> {
         let md_settings = c.markdown(theme);
         let now = chrono::Local::now();
-        let mut col = Column::new().spacing(2).padding([12, 20]);
+        let mut col = Column::new().spacing(2).padding(self.header_pad());
         // Fixed height whether or not there's text, so toggling "Loading…" doesn't shift content.
         if let Some(top) = top {
             col = col.push(container(text(top).size(12).color(c.muted)).center_x(Length::Fill).height(32).center_y(32));
@@ -675,7 +747,7 @@ impl Chat {
             body = body.push(button(text(label).size(12).color(c.accent)).padding([2, 0]).on_press(msg).style(c.link_button()));
         }
 
-        let content: Element<'_, Message> = if pv.compact {
+        let content: Element<'_, Message> = if self.compact {
             // One line: time, name (blank when it continues a run), message.
             let name: Element<'_, Message> = if continued {
                 space().width(NAME_COLUMN).into()

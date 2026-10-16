@@ -37,9 +37,12 @@ pub struct LayoutConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threads: Option<String>,
     /// "comfortable" (avatars, names above messages) or "compact" (one line
-    /// per message); the default for new panes.
+    /// per message, and tighter spacing everywhere).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub density: Option<String>,
+    /// The channel list; shown unless false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidebar: Option<bool>,
 }
 
 impl LayoutConfig {

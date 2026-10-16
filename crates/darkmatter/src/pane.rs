@@ -37,8 +37,6 @@ pub struct PaneView {
     /// the bottom, the (content height, offset from bottom) to keep the top still.
     pub viewport: Option<Viewport>,
     pub hold_top: Option<(f32, f32)>,
-    /// One line per message, no avatars.
-    pub compact: bool,
     /// The unified inbox (unread messages from every channel) instead of a channel.
     pub inbox: bool,
     /// The message picked with the vim keys (j/k), acted on by r, e, o, …
@@ -58,7 +56,6 @@ impl PaneView {
             jump_target: None,
             viewport: None,
             hold_top: None,
-            compact: false,
             inbox: false,
             selected: None,
         }

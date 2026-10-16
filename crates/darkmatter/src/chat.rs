@@ -128,6 +128,12 @@ pub struct Chat {
     /// The shortcuts sheet, with its filter.
     pub shortcuts: Option<String>,
     pub slash: Option<SlashMenu>,
+    /// One line per message and tighter spacing everywhere (`[layout] density`).
+    pub compact: bool,
+    /// The channel list is showing (Ctrl+B hides it).
+    pub sidebar: bool,
+    /// The ☰ menu is open.
+    pub menu: bool,
     /// Server completions, by the input they're for.
     slash_server: (String, Vec<SlashItem>),
     /// A server command's text, put back if it fails: (draft key, text).
@@ -367,6 +373,9 @@ impl Chat {
             notice: None,
             shortcuts: None,
             slash: None,
+            compact: false,
+            sidebar: true,
+            menu: false,
             slash_server: Default::default(),
             command_sent: None,
             pending_goto: None,
@@ -525,10 +534,13 @@ impl Chat {
             C::FocusRight => self.update(Message::FocusAdjacent(pane_grid::Direction::Right)),
             C::FocusUp => self.update(Message::FocusAdjacent(pane_grid::Direction::Up)),
             C::FocusDown => self.update(Message::FocusAdjacent(pane_grid::Direction::Down)),
-            C::ToggleDensity => self.update(Message::ToggleDensity),
-            C::Compact if !self.pv().compact => self.update(Message::ToggleDensity),
-            C::Cozy if self.pv().compact => self.update(Message::ToggleDensity),
-            C::Compact | C::Cozy => Task::none(),
+            C::Leave => match self.store.channels.get(&self.focused().channel) {
+                Some(ch) => {
+                    let id = ch.id.clone();
+                    self.update(Message::LeaveChannel(id))
+                }
+                None => Task::none(),
+            },
             C::Attach => self.update(Message::PickFiles),
             C::ReactLatest => match self.latest_post().map(|p| p.id.clone()) {
                 Some(id) => self.update(Message::OpenEmoji(id)),
@@ -543,7 +555,8 @@ impl Chat {
                 self.shortcuts = Some(String::new());
                 operation::focus(SHORTCUTS_INPUT)
             }
-            C::Themes | C::ThreadLayout | C::Logout => Task::none(),
+            // The app's: they change its config.
+            C::Themes | C::ThreadLayout | C::Logout | C::ToggleDensity | C::Compact | C::Cozy | C::ToggleSidebar | C::About => Task::none(),
         }
     }
 
@@ -680,16 +693,6 @@ impl Chat {
     /// Fetch the unread channels the inbox can't show yet.
     fn load_inbox(&self) -> Task<Message> {
         Task::batch(self.store.unread_unloaded(&self.team).into_iter().map(|c| self.load_history(c)).collect::<Vec<_>>())
-    }
-
-    /// Use the configured density for panes the saved layout didn't set
-    /// (only when there's no saved layout: a saved pane knows its own).
-    pub fn set_default_density(&mut self, compact: bool) {
-        if crate::layout::load(&self.session.server).is_none() {
-            for (_, p) in self.panes.iter_mut() {
-                p.compact = compact;
-            }
-        }
     }
 
     /// Open each pane's channel at startup; panes without one (first run, or a
@@ -1205,13 +1208,13 @@ impl Chat {
                 }
                 Task::none()
             }
-            Message::ToggleDensity => {
-                self.pv_mut().compact ^= true;
-                self.layout_dirty = true;
-                Task::none()
+            Message::ToggleMenu => {
+                self.menu ^= true;
+                if self.menu { Task::none() } else { operation::focus(self.pv().composer()) }
             }
+            Message::Escape if self.menu => self.update(Message::ToggleMenu),
             Message::SplitPane(axis) => {
-                let view = PaneView { compact: self.pv().compact, ..PaneView::new(self.next_pane, self.pv().channel.clone()) };
+                let view = PaneView::new(self.next_pane, self.pv().channel.clone());
                 let inbox = self.pv().inbox;
                 if self.split(axis, PaneView { inbox, ..view }).is_none() {
                     return Task::none();
@@ -1243,7 +1246,7 @@ impl Chat {
                         self.cur = pane;
                     }
                     None => {
-                        let view = PaneView { compact: self.pv().compact, ..PaneView::new(self.next_pane, String::new()) };
+                        let view = PaneView::new(self.next_pane, String::new());
                         if self.split(pane_grid::Axis::Vertical, view).is_none() {
                             return Task::none();
                         }
@@ -1791,6 +1794,7 @@ impl Chat {
                 Task::none()
             }
             Message::LeaveChannel(id) => {
+                self.menu = false;
                 self.confirm_delete = None;
                 let (client, me) = (self.client.clone(), self.store.me.id.clone());
                 Task::perform(
