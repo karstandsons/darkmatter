@@ -169,6 +169,8 @@ pub enum Message {
     SendReply,
     Media(crate::media::Key, Result<Vec<u8>, String>),
     OpenFile(String, String),
+    /// The image viewer.
+    Lightbox(crate::lightbox::Msg),
     Opened(Result<(), String>),
     PickFiles,
     /// Attach files to the thread's reply box.
@@ -581,6 +583,23 @@ impl App {
             Message::InPane(_, m) if matches!(*m, Message::Key(_)) => *m,
             m => m,
         };
+        // While an image is shown, keys are its: zoom, step, close.
+        if let Screen::Chat(chat) = &mut self.screen
+            && chat.lightbox.is_some()
+        {
+            use crate::lightbox::{Lightbox, Msg};
+            match &message {
+                Message::Escape => return chat.update(Message::Lightbox(Msg::Close)),
+                Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                    return match Lightbox::key(key, *modifiers) {
+                        Some(m) => chat.update(Message::Lightbox(m)),
+                        None => Task::none(),
+                    };
+                }
+                Message::Key(_) => return Task::none(),
+                _ => {}
+            }
+        }
         let message = match self.update_plugin_manager(message) {
             ControlFlow::Break(task) => return task,
             ControlFlow::Continue(message) => message,

@@ -78,6 +78,7 @@ impl Chat {
         // Always a stack, so opening or closing an overlay keeps the widget
         // state under it (a focus set as the switcher closes would be lost).
         let overlay = match (&self.shortcuts, &self.switcher, &self.emoji_picker) {
+            _ if let Some(lb) = &self.lightbox => Some(lb.view(&self.media)),
             _ if self.menu => Some(self.menu_view(c)),
             _ if let Some(picker) = &self.plugin_picker => Some(picker.view(c)),
             (Some(q), ..) => Some(crate::shortcuts::view(q, self.vim_keys, &self.plugins, c)),
@@ -802,7 +803,7 @@ impl Chat {
             body = body.push(text("(edited)").size(11).color(c.muted));
         }
         for f in &post.metadata.files {
-            body = body.push(self.attachment(f, c));
+            body = body.push(self.attachment(f, &post.id, c));
         }
         if let Some(reactions) = self.reactions(post, c) {
             body = body.push(reactions);
@@ -993,9 +994,10 @@ impl Chat {
         }
     }
 
-    fn attachment<'a>(&'a self, f: &'a FileInfo, c: Colors) -> Element<'a, Message> {
+    fn attachment<'a>(&'a self, f: &'a FileInfo, post_id: &str, c: Colors) -> Element<'a, Message> {
         let open = Message::OpenFile(f.id.clone(), f.name.clone());
-        if f.mime_type.starts_with("image/") && f.has_preview_image {
+        if crate::lightbox::is_image(f) {
+            let open = Message::Lightbox(crate::lightbox::Msg::Open(f.id.clone(), post_id.to_string()));
             let (w, h) = media::preview_size(f.width, f.height);
             let key = media::Key::Preview(f.id.clone());
             let inner: Element<'_, Message> = match self.media.get(&key) {

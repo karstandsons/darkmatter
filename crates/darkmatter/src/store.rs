@@ -235,6 +235,12 @@ impl Store {
         t.loaded = true;
     }
 
+    /// The images in the conversation showing `post_id`, oldest first.
+    pub fn images_beside(&self, post_id: &str) -> Vec<mm_api::models::FileInfo> {
+        let Some(t) = self.all_timelines().find(|t| t.entries.iter().any(|e| e.post.id == post_id)) else { return Vec::new() };
+        t.entries.iter().flat_map(|e| &e.post.metadata.files).filter(|f| crate::lightbox::is_image(f)).cloned().collect()
+    }
+
     pub fn post(&self, id: &str) -> Option<&Post> {
         self.all_timelines().flat_map(|t| &t.entries).map(|e| &e.post).find(|p| p.id == id)
     }

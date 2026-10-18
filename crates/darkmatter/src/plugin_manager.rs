@@ -572,13 +572,7 @@ impl PluginManager {
             let label = if confirming { "Click again to remove" } else { "Remove" };
             actions = actions.push(small(c, label, (!self.busy).then(|| Message::Plugins(Msg::Remove(name.clone())))));
         }
-        let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
-        let folder = p.dir.display().to_string();
-        let folder = match folder.strip_prefix(&home) {
-            Some(rest) if !home.is_empty() => format!("~{rest}"),
-            _ => folder,
-        };
-        actions = actions.push(space::horizontal()).push(text(folder).size(11).color(c.muted));
+        actions = actions.push(space::horizontal()).push(text(tilde(&p.dir)).size(11).color(c.muted));
         col.push(actions).into()
     }
 
@@ -623,4 +617,14 @@ fn adds(m: &Manifest) -> String {
 
 fn small(c: Colors, label: &str, msg: Option<Message>) -> Element<'_, Message> {
     button(text(label).size(12)).padding([6, 10]).on_press_maybe(msg).style(c.chip(false)).into()
+}
+
+/// A path with the home folder shown as `~`.
+pub fn tilde(path: &std::path::Path) -> String {
+    let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
+    let shown = path.display().to_string();
+    match shown.strip_prefix(&home) {
+        Some(rest) if !home.is_empty() => format!("~{rest}"),
+        _ => shown,
+    }
 }

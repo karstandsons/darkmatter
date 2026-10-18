@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod emoji_picker;
 mod layout;
+mod lightbox;
 mod media;
 mod pane;
 mod panels;
@@ -20,6 +21,7 @@ mod text;
 mod theme_picker;
 mod update;
 mod viewer;
+mod zoom;
 
 use app::App;
 

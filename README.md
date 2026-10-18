@@ -89,6 +89,11 @@ Typing `@` suggests people and `:ro` suggests emoji, in the same popup. The
 **+** by each message box adds emoji, files, a pasted image (Ctrl+V works too),
 a mention or a command.
 
+Click an image to see it large inside Darkmatter: scroll or `+`/`-` to zoom,
+drag to move around, double-click for real size, ← → for the other images in
+the conversation, Save… (Ctrl+S) for a copy, and ✕, Esc or a click beside it
+to close. Nothing is downloaded to disk unless you save it.
+
 | Key | Action |
 |---|---|
 | Ctrl+K | Quick switcher: channels, people (new DM), channels to join |

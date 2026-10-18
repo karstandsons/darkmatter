@@ -162,6 +162,8 @@ pub struct Chat {
     /// `last_viewed_at` of each channel when it was opened, for the "New messages" line.
     pub viewed_before: HashMap<String, i64>,
     pub emoji_picker: Option<EmojiPicker>,
+    /// The image viewer, over everything.
+    pub lightbox: Option<crate::lightbox::Lightbox>,
     recent_emoji: Vec<String>,
     /// The post being edited in a composer, and the draft it replaced.
     pub editing: Option<Editing>,
@@ -429,6 +431,7 @@ impl Chat {
             attachments: Vec::new(),
             viewed_before: HashMap::new(),
             emoji_picker: None,
+            lightbox: None,
             recent_emoji: Vec::new(),
             editing: None,
             confirm_delete: None,
@@ -526,6 +529,63 @@ impl Chat {
     fn selection(&self) -> Option<(String, String, String)> {
         let id = self.pv().selected.as_ref()?;
         self.nav_items(self.pv()).into_iter().find(|(p, ..)| p == id)
+    }
+
+    fn lightbox_update(&mut self, msg: crate::lightbox::Msg) -> Task<Message> {
+        use crate::lightbox::{self, Lightbox, Msg};
+        match msg {
+            Msg::Open(file, post) => {
+                let files = self.store.images_beside(&post);
+                let Some(index) = files.iter().position(|f| f.id == file) else { return Task::none() };
+                self.lightbox = Some(Lightbox::new(files, index));
+                self.menu = false;
+                self.plus = None;
+                self.fetch_full()
+            }
+            Msg::Close => {
+                self.lightbox = None;
+                self.media.forget_full();
+                operation::focus(self.pv().composer())
+            }
+            Msg::Step(by) => {
+                if self.lightbox.as_mut().is_some_and(|lb| lb.step(by)) { self.fetch_full() } else { Task::none() }
+            }
+            Msg::Area(size) => {
+                if let Some(lb) = &mut self.lightbox {
+                    lb.area = size;
+                }
+                Task::none()
+            }
+            Msg::Save => {
+                let Some(lb) = &self.lightbox else { return Task::none() };
+                let f = lb.current().clone();
+                let loaded = self.media.get(&media::Key::Full(f.id.clone())).cloned();
+                Task::perform(lightbox::save(self.client.clone(), f, loaded), |r| Message::Lightbox(Msg::Saved(r)))
+            }
+            Msg::Saved(result) => {
+                if let Some(lb) = &mut self.lightbox {
+                    lb.status = match result {
+                        Ok(Some(path)) => Some((false, format!("Saved to {}", crate::plugin_manager::tilde(&path)))),
+                        Ok(None) => None,
+                        Err(e) => Some((true, format!("Couldn't save: {e}"))),
+                    };
+                }
+                Task::none()
+            }
+            zoom => {
+                if let Some(lb) = &mut self.lightbox {
+                    lb.zoom(&zoom);
+                }
+                Task::none()
+            }
+        }
+    }
+
+    /// The shown image at full size, and the next one, so stepping is quick.
+    fn fetch_full(&mut self) -> Task<Message> {
+        let Some(lb) = &self.lightbox else { return Task::none() };
+        let keys: Vec<_> = lb.files.iter().skip(lb.index).take(2).map(|f| media::Key::Full(f.id.clone())).collect();
+        self.media.fetch(&self.client, keys)
     }
 
     /// A vim-style key, pressed with no text box focused.
@@ -1798,6 +1858,7 @@ impl Chat {
                 self.media.loaded(key, result);
                 Task::none()
             }
+            Message::Lightbox(m) => self.lightbox_update(m),
             Message::OpenFile(id, name) => {
                 Task::perform(media::open_file(self.client.clone(), id, name), Message::Opened)
             }

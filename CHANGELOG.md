@@ -5,6 +5,11 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **Image viewer:** clicking an image shows it large over the app instead of
+  downloading it and opening another program. Zoom with the wheel, `+`/`-`,
+  `0` (fit) and `1` (real size) or a double-click; drag to move; ← → step
+  through the conversation's other images; Save… (Ctrl+S) asks where to keep
+  a copy. Close with ✕, Esc, `q` or a click beside the image.
 - **Plugins window** (Ctrl+Shift+P, `/plugins`, ☰ → Plugins, or + →
   Plugins…): see every plugin and what it adds, switch them on and off, fill
   in settings like the GIF plugin's Giphy key, and install plugins from a git

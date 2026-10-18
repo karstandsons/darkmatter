@@ -13,6 +13,8 @@ pub enum Key {
     /// User id + picture timestamp, so a changed avatar is refetched.
     Avatar(String, i64),
     Preview(String),
+    /// An image at full size, for the image viewer.
+    Full(String),
     /// A custom emoji's image, by emoji id.
     Emoji(String),
 }
@@ -55,6 +57,7 @@ impl Cache {
                         let bytes = match &key {
                             Key::Avatar(id, _) => client.profile_image(id).await,
                             Key::Preview(id) => client.file_preview(id).await,
+                            Key::Full(id) => client.file(id).await,
                             Key::Emoji(id) => client.emoji_image(id).await,
                         };
                         (key, bytes.map_err(|e| e.to_string()))
@@ -63,6 +66,11 @@ impl Cache {
                 ));
         }
         Task::batch(tasks)
+    }
+
+    /// Drop the full-size images (the viewer closed).
+    pub fn forget_full(&mut self) {
+        self.items.retain(|k, _| !matches!(k, Key::Full(_)));
     }
 
     pub fn loaded(&mut self, key: Key, result: Result<Vec<u8>, String>) {
