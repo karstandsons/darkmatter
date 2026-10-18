@@ -97,6 +97,19 @@ impl Client {
         Ok(())
     }
 
+    /// The server's settings for apps (site name, feature switches, the
+    /// Giphy key its GIF picker uses…), as strings.
+    pub async fn client_config(&self) -> Result<std::collections::HashMap<String, String>, Error> {
+        let all: std::collections::HashMap<String, serde_json::Value> = self.get("config/client?format=old").await?;
+        Ok(all
+            .into_iter()
+            .map(|(k, v)| match v {
+                serde_json::Value::String(s) => (k, s),
+                other => (k, other.to_string()),
+            })
+            .collect())
+    }
+
     pub async fn me(&self) -> Result<User, Error> {
         self.get("users/me").await
     }

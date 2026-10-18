@@ -24,7 +24,7 @@ writing your own.
 | Plugin | Adds | Needs |
 |---|---|---|
 | [`meme`](../plugins/meme) | + Meme picker (`template \| top \| bottom`), `/meme drake \| tabs \| spaces` | python3, ImageMagick (`magick` or `convert`), internet for imgflip's templates |
-| [`gif`](../plugins/gif) | + GIF picker, `/gif <search>` | python3 and a free [Giphy API key](https://developers.giphy.com/dashboard/?create=true): paste it in Plugins (Ctrl+Shift+P), or send `/gif key <your key>` once |
+| [`gif`](../plugins/gif) | + GIF picker, `/gif <search>` | python3. On a Mattermost server with GIFs on, it uses the server's Giphy key. Otherwise a free [Giphy API key](https://developers.giphy.com/dashboard/?create=true): paste it in Plugins (Ctrl+Shift+P), or send `/gif key <your key>` once |
 | [`kaomoji`](../plugins/kaomoji) | + Kaomoji picker, `/kao <name>` | python3 |
 | [`quote`](../plugins/quote) | ❝ on the hover bar: quote the message in your reply | python3 |
 
@@ -42,7 +42,8 @@ plugin, built in or yours, with what it adds and whether it's on. There you
 can:
 
 - switch a plugin on or off;
-- fill in its settings, such as an API key;
+- fill in its settings, such as an API key (the plugin can check it works
+  when you press Save);
 - install one from a git URL or a folder: Darkmatter fetches it and shows
   what it adds and what it runs before you press Install;
 - update one you installed from git, or remove one of yours.
@@ -116,7 +117,15 @@ secret = true                    # hidden, and kept out of config.toml
 description = "Free at example.com"
 link = "https://example.com/keys"
 placeholder = "…"
+from_server = "GiphySdkKey"      # unset? use this value of the server's app settings…
+server_switch = "EnableGifPicker" # …unless this one is "false"
+check = true                     # Save sends a `check` request
 ```
+
+`from_server` names a value from the server's settings for apps (Mattermost's
+`/api/v4/config/client`, which every logged-in app can read), used when you
+haven't set the setting yourself. That's how the GIF plugin uses the server's
+Giphy key, so nobody needs their own.
 
 `run`'s first word runs from the plugin's folder if it names a file there (or
 contains a `/`), and from your `PATH` otherwise. Unknown keys are an error, so
@@ -136,12 +145,15 @@ Each request is one JSON object with a `type`:
 {"type": "search",  "name": "meme", "query": "drake", "context": {…}}
 {"type": "pick",    "name": "meme", "value": "<an item's value>", "context": {…}}
 {"type": "action",  "name": "quote", "post": {"id": "…", "message": "…", "user": "bob", "create_at": 1760000000000}, "context": {…}}
+{"type": "check", "context": {…}}
 ```
 
 - `command`: `/name args` was sent.
 - `search`: a picker opened (`query` is `""`) or its search box changed.
 - `pick`: an item in a picker was chosen.
 - `action`: a message's hover icon was clicked.
+- `check`: settings marked `check = true` were saved in the Plugins window.
+  Answer with a `notice` if they work or an `error` saying what's wrong.
 
 `context` says where you are:
 
@@ -158,7 +170,8 @@ Each request is one JSON object with a `type`:
 `thread` is the root post's id when the answer is for a thread's reply box.
 
 Every request also has `config`: the plugin's `[plugins.<name>]` settings
-from config.toml plus its secret settings (`{}` if none).
+from config.toml plus its secret settings, and for settings you haven't set,
+the server's values they ask for (`{}` if none).
 
 ## Answers
 

@@ -17,6 +17,13 @@ The release workflow uses each version's section here as its release notes.
   update or remove them. Changes apply right away.
 - Plugins can declare settings (`[[setting]]` in plugin.toml). Secret ones,
   like API keys, are kept out of config.toml, in a file only you can read.
+  A setting can fall back to a value the server shares (`from_server`), and
+  Save can ask the plugin whether it works (`check`).
+- **GIFs without a key of your own:** on a Mattermost server with its GIF
+  picker on, the GIF plugin uses the server's Giphy key. Your own key, if you
+  set one, still wins. Saving a key in Plugins checks it with Giphy.
+- Plugins window: ↑↓ in a settings field or the install box no longer switch
+  plugins.
 
 ## [0.3.1] - 2026-10-16
 

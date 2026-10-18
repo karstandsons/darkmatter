@@ -258,6 +258,8 @@ pub struct Bootstrap {
     pub channels: Vec<Channel>,
     pub members: Vec<mm_api::models::ChannelMember>,
     pub users: Vec<User>,
+    /// The server's settings for apps; plugins can use some (its Giphy key).
+    pub server_config: crate::plugins::ServerConfig,
 }
 
 pub(crate) fn err(e: mm_api::Error) -> String {
@@ -354,7 +356,7 @@ impl App {
             other => return ControlFlow::Continue(other),
         };
         let Screen::Chat(chat) = &mut self.screen else { return ControlFlow::Break(Task::none()) };
-        let (task, reloaded) = plugin_manager::update(&mut self.plugin_manager, &mut self.config, &mut chat.plugins, msg);
+        let (task, reloaded) = plugin_manager::update(&mut self.plugin_manager, &mut self.config, &mut chat.plugins, &chat.server_config, msg);
         if reloaded {
             // Its plugin numbers may have moved.
             chat.plugin_picker = None;
@@ -686,6 +688,7 @@ impl App {
                     chat.store.teams = b.teams;
                     chat.store.add_channels(b.channels, b.members);
                     chat.store.add_users(b.users);
+                    chat.server_config = b.server_config;
                     chat.goto_pending()
                 }
                 _ => self.start_chat(b),
@@ -847,7 +850,7 @@ impl App {
             body = body.push(p.view(&self.catalog, &choice, &self.theme.name, self.os_mode == omarchy_theme::Mode::Dark, self.omarchy, c));
         }
         if let (Some(m), Screen::Chat(chat)) = (&self.plugin_manager, &self.screen) {
-            body = body.push(m.view(&chat.plugins, &self.config, c));
+            body = body.push(m.view(&chat.plugins, &self.config, &chat.server_config, c));
         }
         container(body).width(Length::Fill).height(Length::Fill).style(c.panel(c.bg)).into()
     }
@@ -897,7 +900,12 @@ pub(crate) fn bootstrap(session: Session) -> Task<Message> {
             ids.sort();
             ids.dedup();
             let users = if ids.is_empty() { Vec::new() } else { client.users_by_ids(&ids).await.map_err(err)? };
-            Ok(Bootstrap { session, me, teams, channels, members, users })
+            // Not needed to chat, so a server that won't say isn't an error.
+            let server_config = client.client_config().await.unwrap_or_else(|e| {
+                tracing::warn!("couldn't read the server's client config: {e}");
+                Default::default()
+            });
+            Ok(Bootstrap { session, me, teams, channels, members, users, server_config })
         },
         Message::Bootstrapped,
     )

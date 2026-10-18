@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Darkmatter GIF plugin: search Giphy, attach the GIF you pick.
 
-Needs a Giphy API key (free at developers.giphy.com). Set it in the Plugins
+Needs a Giphy API key. On a Mattermost server with its GIF picker on,
+Darkmatter passes along the server's key, so there's nothing to set up.
+Otherwise get a free one at developers.giphy.com and set it in the Plugins
 window (Ctrl+Shift+P) or with `/gif key <your key>`; either way it's kept in
 secrets.json in Darkmatter's data folder for this plugin, and arrives in each
-request's config. GIPHY_API_KEY works too.
+request's config (your own key wins over the server's). GIPHY_API_KEY works too.
 """
 import concurrent.futures
 import json
@@ -37,7 +39,7 @@ def key():
             save_key(k)
         os.remove(old)
     if not k:
-        raise RuntimeError(f"needs a Giphy API key: get a free one at {SIGN_UP}, then add it in Plugins (Ctrl+Shift+P) or send /gif key <your key>")
+        raise RuntimeError(f"needs a Giphy API key (this server doesn't share one): get a free one at {SIGN_UP}, then add it in Plugins (Ctrl+Shift+P) or send /gif key <your key>")
     return k
 
 
@@ -118,6 +120,16 @@ def main():
             answer(items=[{"title": g.get("title") or g["id"], "thumb": t, "value": g["id"]} for g, t in zip(gifs, thumbs)])
         elif kind == "pick":
             answer(attach=download(request["value"]))
+        elif kind == "check":
+            # Settings were saved in the Plugins window.
+            try:
+                search("hello", 1)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    answer(error="Giphy didn't accept that key: paste it again, or Forget it")
+                    return
+                raise
+            answer(notice="Giphy accepted the key")
         elif kind == "command" and request["args"].split(" ", 1)[0] == "key":
             k = request["args"][4:].strip()
             if not k:

@@ -146,6 +146,23 @@ impl PluginManager {
     }
 }
 
+/// Send a plugin a `check` request; its notice or error becomes the status.
+fn check(plugin: Plugin, server: plugins::ServerConfig) -> Task<Message> {
+    let name = plugin.manifest.name.clone();
+    Task::perform(
+        async move {
+            let request = plugins::Request::Check { context: Default::default() };
+            let replies = plugin.call_with(&request, &server).await?;
+            if let Some(e) = replies.iter().find_map(|r| r.error.clone()) {
+                return Err(e);
+            }
+            let notice = replies.iter().find_map(|r| r.notice.clone());
+            Ok((Some(name.clone()), notice.unwrap_or_else(|| format!("Saved {name}'s settings"))))
+        },
+        |r| Message::Plugins(Msg::Done(r)),
+    )
+}
+
 /// Load the plugins again after a change.
 fn reload(plugins: &mut std::sync::Arc<Plugins>, config: &Config) {
     *plugins = std::sync::Arc::new(plugins::load(&config.plugins));
@@ -164,6 +181,7 @@ pub fn update(
     manager: &mut Option<PluginManager>,
     config: &mut Config,
     plugins: &mut std::sync::Arc<Plugins>,
+    server: &plugins::ServerConfig,
     msg: Msg,
 ) -> (Task<Message>, bool) {
     let find = |plugins: &Plugins, name: &str| -> Option<Plugin> {
@@ -289,11 +307,21 @@ pub fn update(
                 None if saved == 0 => (false, "Nothing to save".into()),
                 None => (false, format!("Saved {name}'s settings")),
             });
+            // Ask the plugin whether they work (a key Giphy turns down, say).
+            let checks = p.manifest.settings.iter().any(|d| d.check);
+            if let Some(p) = find(plugins, &name).filter(|_| checks && saved > 0 && errors.is_empty()) {
+                m.busy = true;
+                m.status = Some((false, "Saved · checking…".into()));
+                return (check(p, server.clone()), true);
+            }
             return (Task::none(), true);
         }
         Msg::Clear(name, key) => {
             m.edits.remove(&(name.clone(), key.clone()));
+            let server_has = find(plugins, &name)
+                .is_some_and(|p| p.manifest.settings.iter().any(|d| d.name == key && d.server_value(server).is_some()));
             m.status = Some(match plugins::write_secret(&name, &key, None) {
+                Ok(()) if server_has => (false, "Forgotten · using the server's again".into()),
                 Ok(()) => (false, "Forgotten".into()),
                 Err(e) => (true, e),
             });
@@ -391,7 +419,7 @@ pub fn update(
 }
 
 impl PluginManager {
-    pub fn view<'a>(&'a self, plugins: &'a Plugins, config: &'a Config, c: Colors) -> Element<'a, Message> {
+    pub fn view<'a>(&'a self, plugins: &'a Plugins, config: &'a Config, server: &plugins::ServerConfig, c: Colors) -> Element<'a, Message> {
         let all = entries(plugins);
         let on = plugins.list.len();
         let summary = match plugins.off.len() {
@@ -413,7 +441,7 @@ impl PluginManager {
         let detail: Element<'a, Message> = match &self.staged {
             Some((_, manifest)) => self.staged_view(manifest, plugins, c),
             None => match self.current().and_then(|n| all.into_iter().find(|e| e.name == n)) {
-                Some(e) => self.detail(e, config, c),
+                Some(e) => self.detail(e, config, server, c),
                 None => text("No plugins match").size(13).color(c.muted).into(),
             },
         };
@@ -491,7 +519,7 @@ impl PluginManager {
             .into()
     }
 
-    fn detail<'a>(&'a self, e: Entry<'a>, config: &'a Config, c: Colors) -> Element<'a, Message> {
+    fn detail<'a>(&'a self, e: Entry<'a>, config: &'a Config, server: &plugins::ServerConfig, c: Colors) -> Element<'a, Message> {
         let Some(p) = e.plugin else {
             let State::Broken(why) = e.state else { unreachable!("only broken rows lack a plugin") };
             return column![
@@ -534,6 +562,7 @@ impl PluginManager {
             let value = edit.cloned().or_else(|| if def.secret { None } else { saved_plain.clone() }).unwrap_or_default();
             let placeholder = match (def.secret, is_set) {
                 (true, true) => "Saved · type to replace".to_string(),
+                (_, false) if def.server_value(server).is_some() => "Using the server's · type yours to replace it".to_string(),
                 _ if !def.placeholder.is_empty() => def.placeholder.clone(),
                 _ => def.label.clone(),
             };
@@ -554,7 +583,7 @@ impl PluginManager {
                 line = line.push(small(c, "Forget", Some(Message::Plugins(Msg::Clear(name.clone(), def.name.clone())))));
             }
             col = col.push(line);
-            let mut help = row![].spacing(8);
+            let mut help = column![].spacing(2);
             if !def.description.is_empty() {
                 help = help.push(text(&def.description).size(11).color(c.muted));
             }

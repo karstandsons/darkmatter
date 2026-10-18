@@ -60,6 +60,29 @@ pub struct SettingDef {
     /// Where to get it (a sign-up page).
     #[serde(default)]
     pub link: String,
+    /// Used when you haven't set it: this value of the server's app
+    /// settings (Mattermost's `GiphySdkKey`, say)…
+    #[serde(default)]
+    pub from_server: String,
+    /// …if this server setting isn't "false" (`EnableGifPicker`).
+    #[serde(default)]
+    pub server_switch: String,
+    /// Saving it sends the plugin a `check` request, to say if it works.
+    #[serde(default)]
+    pub check: bool,
+}
+
+/// The server's settings for apps, by name (Mattermost's client config).
+pub type ServerConfig = std::collections::HashMap<String, String>;
+
+impl SettingDef {
+    /// The server's value for this setting, if it offers one.
+    pub fn server_value<'a>(&self, server: &'a ServerConfig) -> Option<&'a str> {
+        if self.from_server.is_empty() || (!self.server_switch.is_empty() && server.get(&self.server_switch).is_some_and(|v| v == "false")) {
+            return None;
+        }
+        server.get(&self.from_server).map(|v| v.trim()).filter(|v| !v.is_empty())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -349,6 +372,8 @@ pub enum Request {
     Pick { name: String, value: String, context: Context },
     /// A message's action icon was clicked.
     Action { name: String, post: PostInfo, context: Context },
+    /// Settings were saved: do they work? (For settings marked `check`.)
+    Check { context: Context },
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
@@ -430,7 +455,13 @@ impl Plugin {
     }
 
     /// Run the plugin for one request. File paths in the answers come back absolute.
+    #[cfg(test)]
     pub async fn call(&self, request: &Request) -> Result<Vec<Reply>, String> {
+        self.call_with(request, &ServerConfig::new()).await
+    }
+
+    /// `call`, with the server's values for settings you haven't set.
+    pub async fn call_with(&self, request: &Request, server: &ServerConfig) -> Result<Vec<Reply>, String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let name = &self.manifest.name;
         let out_dir = output_dir(name).ok_or("no cache directory")?;
@@ -456,7 +487,13 @@ impl Plugin {
         // The request, with this plugin's settings (secret ones read fresh,
         // since the plugin itself may have just saved one).
         let mut value = serde_json::to_value(request).map_err(|e| e.to_string())?;
-        let mut config = self.config.as_object().cloned().unwrap_or_default();
+        let mut config: serde_json::Map<String, serde_json::Value> = self
+            .manifest
+            .settings
+            .iter()
+            .filter_map(|d| Some((d.name.clone(), d.server_value(server)?.into())))
+            .collect();
+        config.extend(self.config.as_object().cloned().unwrap_or_default());
         config.extend(read_secrets(name));
         value["config"] = serde_json::Value::Object(config);
         let mut line = value.to_string();
@@ -824,5 +861,19 @@ glyph = "❝"
         let p = load_from(root.path());
         let request = Request::Command { name: "echo".into(), args: String::new(), context: Context::default() };
         assert_eq!(p.list[0].call(&request).await.unwrap_err(), "echo failed: no ImageMagick");
+    }
+
+    #[test]
+    fn a_setting_can_come_from_the_server() {
+        let def: SettingDef = toml::from_str("name = \"api_key\"\nlabel = \"Key\"\nfrom_server = \"GiphySdkKey\"\nserver_switch = \"EnableGifPicker\"").unwrap();
+        let server = |pairs: &[(&str, &str)]| -> ServerConfig { pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
+        assert_eq!(def.server_value(&server(&[("GiphySdkKey", "abc"), ("EnableGifPicker", "true")])), Some("abc"));
+        assert_eq!(def.server_value(&server(&[("GiphySdkKey", "abc")])), Some("abc"));
+        // The admin switched GIFs off, or there's no key.
+        assert_eq!(def.server_value(&server(&[("GiphySdkKey", "abc"), ("EnableGifPicker", "false")])), None);
+        assert_eq!(def.server_value(&server(&[("GiphySdkKey", " ")])), None);
+        // A setting that doesn't ask for one gets nothing.
+        let plain: SettingDef = toml::from_str("name = \"x\"\nlabel = \"X\"").unwrap();
+        assert_eq!(plain.server_value(&server(&[("GiphySdkKey", "abc")])), None);
     }
 }

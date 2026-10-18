@@ -193,6 +193,8 @@ pub struct Chat {
     slash_server: (String, Vec<SlashItem>),
     /// A server command's text, put back if it fails: (draft key, text).
     command_sent: Option<(String, String)>,
+    /// The server's settings for apps (some fill in plugin settings).
+    pub server_config: plugins::ServerConfig,
     /// Installed plugins (`~/.config/darkmatter/plugins`).
     pub plugins: std::sync::Arc<Plugins>,
     /// A plugin's picker, opened from the + menu.
@@ -449,6 +451,7 @@ impl Chat {
             attach_thread: None,
             slash_server: Default::default(),
             command_sent: None,
+            server_config: b.server_config,
             plugins: Default::default(),
             plugin_picker: None,
             editors: HashMap::new(),
@@ -931,7 +934,8 @@ impl Chat {
 
     fn call_plugin(&self, target: PluginTarget, request: plugins::Request) -> Task<Message> {
         let Some(plugin) = self.plugins.list.get(target.plugin).cloned() else { return Task::none() };
-        Task::perform(async move { plugin.call(&request).await }, move |r| Message::PluginReplied(target, r))
+        let server = self.server_config.clone();
+        Task::perform(async move { plugin.call_with(&request, &server).await }, move |r| Message::PluginReplied(target, r))
     }
 
     /// Ask the open picker's plugin for what matches its search box.
@@ -942,7 +946,8 @@ impl Chat {
         let context = self.plugin_context(&target);
         let Some(plugin) = self.plugins.list.get(plugin).cloned() else { return Task::none() };
         let request = plugins::Request::Search { name, query, context };
-        Task::perform(async move { plugin.call(&request).await }, move |r| Message::PluginItems(seq, r))
+        let server = self.server_config.clone();
+        Task::perform(async move { plugin.call_with(&request, &server).await }, move |r| Message::PluginItems(seq, r))
     }
 
     /// Put a plugin's answer in its composer: text, attachments, notes.
@@ -2627,6 +2632,7 @@ mod tests {
             channels: vec![Channel { id: "c1".into(), ..Default::default() }],
             members: vec![ChannelMember { channel_id: "c1".into(), ..Default::default() }],
             users: vec![],
+            server_config: Default::default(),
         };
         let (mut chat, _) = Chat::start(b).unwrap();
         chat.pv_mut().channel = "c1".into();

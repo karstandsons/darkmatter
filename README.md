@@ -106,6 +106,7 @@ to close. Nothing is downloaded to disk unless you save it.
 | PageUp / PageDown | Scroll; older history loads as you reach the top |
 | Ctrl+U | Attach files (drag-and-drop works too) |
 | Ctrl+T | Theme picker |
+| Ctrl+Shift+P | Plugins window |
 | Ctrl+Shift+T | Threads inline or in a side pane |
 | Esc | Close switcher, then thread pane; then step out of the message box (vim keys) |
 
@@ -122,7 +123,7 @@ comes back next time.
 | Ctrl+B | Hide or show the channel sidebar |
 
 The **☰ menu** (top left) has the view settings, Go to, Leave channel,
-Themes, Keyboard shortcuts, About and Log out.
+Themes, Plugins, Keyboard shortcuts, About and Log out.
 
 **Vim keys**, when no text box has the cursor (Esc leaves the message box):
 `j`/`k` move between messages, `gg`/`G` first/last, `h`/`l` panes, `r` reply,
@@ -178,9 +179,13 @@ inside that window (Hyprland's virtual-pointer protocol, no root), and refuses u
 ## Plugins
 
 Plugins add slash commands, + menu pickers and message actions. Memes, GIFs
-(`/gif key <your free Giphy key>` once), kaomoji and Quote come built in. Your
+(using the server's Giphy key, or a free one of your own), kaomoji and Quote
+come built in. Your
 own are small programs in any language that talk JSON; their answers only fill
-your message box or attach files. See [docs/plugins.md](docs/plugins.md); the
+your message box or attach files. The **Plugins** window (Ctrl+Shift+P,
+`/plugins`, or ☰ → Plugins) lists them, switches them on and off, holds their
+settings such as API keys, and installs new ones from a git URL or a folder.
+See [docs/plugins.md](docs/plugins.md); the
 built-in ones in [`plugins/`](plugins) are good starting points.
 
 ## Tests
