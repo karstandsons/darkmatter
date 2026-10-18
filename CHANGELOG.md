@@ -5,6 +5,8 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-18
+
 - **Image viewer:** clicking an image shows it large over the app instead of
   downloading it and opening another program. Zoom with the wheel, `+`/`-`,
   `0` (fit) and `1` (real size) or a double-click; drag to move; ← → step
