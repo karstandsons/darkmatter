@@ -26,6 +26,9 @@ pub enum Msg {
     Select(usize),
     /// ↑↓ in the list.
     Step(isize),
+    /// ↑↓ pressed, with the text box that has the cursor: they move in the
+    /// list only from the filter or when no box has it.
+    Arrow(isize, Option<iced::widget::Id>),
     /// Switch a plugin on or off.
     Toggle(String),
     /// A setting being typed: (plugin, setting, value).
@@ -191,6 +194,12 @@ pub fn update(
         }
         return (Task::none(), false);
     };
+    let msg = match msg {
+        // Typing in a setting or the install box: ↑↓ stay there.
+        Msg::Arrow(_, Some(id)) if id != iced::widget::Id::new(FILTER) => return (Task::none(), false),
+        Msg::Arrow(by, _) => Msg::Step(by),
+        other => other,
+    };
     let task = match msg {
         Msg::Open => unreachable!("handled above"),
         Msg::Close => {
@@ -212,6 +221,7 @@ pub fn update(
             m.status = None;
             Task::none()
         }
+        Msg::Arrow(..) => unreachable!("turned into Step above"),
         Msg::Step(by) => {
             if !m.results.is_empty() {
                 m.selected = (m.selected as isize + by).rem_euclid(m.results.len() as isize) as usize;
@@ -529,6 +539,7 @@ impl PluginManager {
             };
             let (pn, dn) = (name.clone(), def.name.clone());
             let input = text_input(&placeholder, &value)
+                .id(iced::widget::Id::from(format!("plugin-setting-{}", def.name)))
                 .on_input(move |v| Message::Plugins(Msg::Setting(pn.clone(), dn.clone(), v)))
                 .on_submit(Message::Plugins(Msg::Save(name.clone())))
                 .secure(def.secret)
@@ -627,4 +638,25 @@ pub fn tilde(path: &std::path::Path) -> String {
         Some(rest) if !home.is_empty() => format!("~{rest}"),
         _ => shown,
     }
+}
+
+/// ↑↓, sent with whichever text box has the cursor (or none).
+pub fn arrow(by: isize) -> Task<Message> {
+    use iced::advanced::widget::operation::{Focusable, Operation, Outcome};
+    use iced::widget::Id;
+    struct Focused(Option<Id>);
+    impl Operation<Option<Id>> for Focused {
+        fn focusable(&mut self, id: Option<&Id>, _bounds: iced::Rectangle, state: &mut dyn Focusable) {
+            if state.is_focused() {
+                self.0 = id.cloned();
+            }
+        }
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Option<Id>>)) {
+            operate(self);
+        }
+        fn finish(&self) -> Outcome<Option<Id>> {
+            Outcome::Some(self.0.clone())
+        }
+    }
+    iced::advanced::widget::operate(Focused(None)).map(move |id| Message::Plugins(Msg::Arrow(by, id)))
 }

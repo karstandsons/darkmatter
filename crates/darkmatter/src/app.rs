@@ -340,8 +340,8 @@ impl App {
             Message::Plugins(m) => m,
             Message::Escape if open => Msg::Close,
             Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) if open => match key {
-                Key::Named(Named::ArrowUp) => Msg::Step(-1),
-                Key::Named(Named::ArrowDown) => Msg::Step(1),
+                Key::Named(Named::ArrowUp) => return ControlFlow::Break(plugin_manager::arrow(-1)),
+                Key::Named(Named::ArrowDown) => return ControlFlow::Break(plugin_manager::arrow(1)),
                 Key::Named(Named::Tab) => {
                     let to = if modifiers.shift() { plugin_manager::FILTER } else { plugin_manager::URL };
                     return ControlFlow::Break(operation::focus(to));
