@@ -9,13 +9,15 @@
 
 An Omarchy-themed Mattermost client in Rust, with tiled panes, a unified
 inbox and vim keys. It works with any Mattermost server. A compatible Rust
-server, **axiond**, is to follow.
+server, **axiond**, is in early development
+([crates/axiond](crates/axiond/README.md)).
 
 | Crate | What |
 |---|---|
 | `crates/omarchy-theme` | Loads the active Omarchy palette and font, and watches for `omarchy theme set` |
 | `crates/darkmatter` | The iced desktop app (`darkmatter` binary) |
 | `crates/mm-api` | Typed Mattermost API v4 REST client and WebSocket event stream (auto reconnect and resume) |
+| `crates/axiond` | The server (`axiond` binary), early: login, channels, DMs, messages, threads, live events |
 
 `reference/` (gitignored) holds shallow clones of `mattermost/mattermost` and
 `mattermost/desktop`. The OpenAPI spec is in `reference/mattermost/api/v4/source/`.
@@ -201,7 +203,8 @@ Darkmatter is open source, under either of
 - [MIT](LICENSE-MIT)
 - [Apache-2.0](LICENSE-APACHE)
 
-at your option. Copyright Karst & Sons. The names "Darkmatter" and "axiond"
+at your option. The server, axiond, is under the
+[AGPL-3.0-or-later](crates/axiond/LICENSE). Copyright Karst & Sons. The names "Darkmatter" and "axiond"
 aren't covered by the license: see [TRADEMARKS.md](TRADEMARKS.md).
 Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
 

@@ -7,6 +7,8 @@ Karst & Sons, who decide what goes in and where the project heads.
   on the approach before you spend time on it.
 - **Licensing:** what you contribute is licensed like the rest of the project,
   under MIT or Apache-2.0 (Apache-2.0 section 5), and you keep your copyright.
+  The exception is the server, `crates/axiond`: contributions there are under
+  AGPL-3.0-or-later, like the rest of it.
   Please only send code you wrote or have the right to share.
 - **Before a pull request:** `cargo clippy --workspace --all-targets -- -D warnings`
   and `cargo test --workspace` must pass (CI checks both, on Linux and macOS).

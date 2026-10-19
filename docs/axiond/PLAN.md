@@ -263,12 +263,19 @@ Sizes are rough and assume the current pace: one person plus Claude.
 
 | Milestone | Scope | Size |
 |---|---|---|
-| **M0: skeleton** | `crates/axiond` and the shared-crate split. SQLite schema and migrations. Login (argon2id), `users/me`, teams, channels, posts and the websocket with `hello`/`posted`. Darkmatter can log in, read and post. Dockerfile. | 1–2 weeks |
+| **M0: skeleton** (done 2026-10-19) | `crates/axiond` and the shared-crate split. SQLite schema and migrations. Login (argon2id), `users/me`, teams, channels, posts and the websocket with `hello`/`posted`. Darkmatter can log in, read and post. Dockerfile. | 1–2 weeks |
 | **M1: Darkmatter feature parity** | All of Appendix A: threads, reactions, files and thumbnails, emoji, search (FTS5), unreads and `view`, set-unread, typing and status, DMs, user autocomplete, slash commands with built-ins, ephemeral messages. TLS and ACME, rate limits, sessions page, TOTP, backups, first-run setup, admin basics (invite, deactivate, roles). Multi-arch image, `axiond-v*` releases. **Friends can use it.** | 4–6 weeks |
 | **M2: migration and team switch** | Mattermost and Slack importers, incoming and outgoing webhooks, bot accounts, the audit log, passkeys, Postgres support. **The team moves over.** | 3–4 weeks |
 | **M3: E2EE** | `dm-crypto` on openmls, key packages and the delivery service, E2EE DMs and private channels, encrypted files, device list and verification, client search index, recovery key and backup, threat model doc. An external review of the crypto layer before calling it stable. | 6–10 weeks |
 | **M4: mobile and push** | `darkmatter-core` extracted with UniFFI, iOS and Android apps (native UI), push relay, UnifiedPush, background sync. | 3–6 months |
 | **M5: extensions** | WASM server plugins, calls (WebRTC), sealed sender and padding, maybe federation. | Ongoing |
+
+**M0 as built** (see `crates/axiond/README.md`):
+- Darkmatter logs in, reads, posts, replies, edits and deletes. Unreads, mentions, DMs, joining and leaving work, and live events resume after a drop.
+- Plus a CLI (`setup`, `user add`, `user password`, `channel add`, `ping`) and a `FROM scratch` Docker image.
+- Two changes from the plan:
+  - **Queries are checked at runtime, not compile time.** `sqlx::query!` needs a live database or a committed `.sqlx` cache at build time. The integration tests drive every query through Darkmatter's own client (`tests/darkmatter_client.rs`), and that catches the same mistakes.
+  - **The shared-crate split is partial.** `mm-api`'s HTTP client is now a default feature, so axiond uses only its models. `dm-crypto` and `dm-plugin` get created when M3 and the server plugins need them.
 
 **Order note:** E2EE (M3) comes after the team switch (M2) so the switch isn't blocked on crypto. The **wire format and API reserve space for E2EE from M0**: `props.dm_e2ee`, device IDs on sessions, and an `encrypted` flag on channels. That way M3 doesn't need a migration of the data model.
 
@@ -277,7 +284,7 @@ Sizes are rough and assume the current pace: one person plus Claude.
 1. **E2EE defaults:** is "always on for DMs and private channels, opt-in for public channels" right? Or do you want E2EE everywhere, accepting no server search or server bots in those channels?
 2. **History on new devices:** is the optional encrypted server backup with a recovery key OK? The alternative is device-to-device transfer only, which is more private but easier to lose.
 3. **Push relay:** are you OK with Karst & Sons running a small public relay for the store apps, given it sees only device tokens and pings?
-4. **License:** AGPL-3.0-or-later for axiond? CLA or DCO? Will you ever want to sell commercial licenses or a hosted version?
+4. **License:** ~~AGPL-3.0-or-later for axiond?~~ Decided 2026-10-19: AGPL-3.0-or-later. Still open: CLA or DCO? Will you ever want to sell commercial licenses or a hosted version?
 5. **Mattermost edition:** which edition and version is the team's server on? That decides whether bulk export works or we use the REST importer.
 6. **Slack:** what plan is the workspace on? Do private channels and DMs need to come across?
 7. **Scale:** how many users does the largest install need, both the team and the biggest friends' server? That decides when Postgres matters.

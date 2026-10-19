@@ -1,0 +1,145 @@
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue};
+use mm_api::models::{Status, Team, User, UserThreads};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::auth::{self, Me};
+use crate::db::{self, TeamRow, USER_COLUMNS, UserRow};
+use crate::error::{Error, Result};
+use crate::App;
+
+#[derive(Deserialize)]
+pub struct Login {
+    login_id: String,
+    password: String,
+    /// The app's device, kept for end-to-end encryption later.
+    #[serde(default)]
+    device_id: String,
+}
+
+/// `POST users/login`: the user, with the session token in the `Token` header.
+pub async fn login(State(app): State<App>, Json(body): Json<Login>) -> Result<(HeaderMap, Json<User>)> {
+    let login = body.login_id.trim();
+    if let Some(wait) = app.guard.locked(login) {
+        let minutes = wait.as_secs().div_ceil(60);
+        return Err(Error::too_many(format!(
+            "Too many wrong passwords for this account. Try again in {minutes} minute{}.",
+            if minutes == 1 { "" } else { "s" }
+        )));
+    }
+    let found: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, password_hash FROM users WHERE (username = lower(?1) OR lower(email) = lower(?1)) AND delete_at = 0",
+    )
+    .bind(login)
+    .fetch_optional(&app.db)
+    .await?;
+    let (id, hash) = found.unzip();
+    let password = body.password;
+    // argon2 is deliberately slow: keep it off the async threads.
+    let ok = tokio::task::spawn_blocking(move || auth::verify_password(hash.as_deref(), &password))
+        .await
+        .map_err(|_| Error::internal())?;
+    let Some(id) = id.filter(|_| ok) else {
+        app.guard.failed(login);
+        return Err(Error {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            id: "api.user.login.invalid_credentials_email_username",
+            message: "Enter a valid email or username and/or password.".into(),
+        });
+    };
+    app.guard.succeeded(login);
+    let token = auth::create_session(&app, &id, body.device_id.trim()).await?;
+    let mut headers = HeaderMap::new();
+    headers.insert("Token", HeaderValue::from_str(&token).map_err(|_| Error::internal())?);
+    Ok((headers, Json(db::user(&app.db, &id, &id).await?)))
+}
+
+pub async fn logout(State(app): State<App>, me: Me) -> Result<Json<Value>> {
+    sqlx::query("DELETE FROM sessions WHERE id = ?").bind(&me.session_id).execute(&app.db).await?;
+    app.hub.end_session(&me.session_id);
+    super::ok()
+}
+
+pub async fn me(State(app): State<App>, me: Me) -> Result<Json<User>> {
+    Ok(Json(db::user(&app.db, &me.user_id, &me.user_id).await?))
+}
+
+pub async fn by_ids(State(app): State<App>, me: Me, Json(ids): Json<Vec<String>>) -> Result<Json<Vec<User>>> {
+    if ids.len() > 1000 {
+        return Err(Error::bad_request("Too many users at once."));
+    }
+    let mut users = Vec::with_capacity(ids.len());
+    let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?");
+    for id in ids {
+        if let Some(row) = sqlx::query_as::<_, UserRow>(&sql).bind(&id).fetch_optional(&app.db).await? {
+            users.push(row.into_user(&me.user_id));
+        }
+    }
+    Ok(Json(users))
+}
+
+/// Online while the user has an app connected; there's no away or busy yet.
+pub async fn statuses(State(app): State<App>, _: Me, Json(ids): Json<Vec<String>>) -> Result<Json<Vec<Status>>> {
+    Ok(Json(
+        ids.into_iter()
+            .take(1000)
+            .map(|user_id| {
+                let status = if app.hub.online(&user_id) { "online" } else { "offline" };
+                Status { status: status.into(), user_id, ..Default::default() }
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct Autocomplete {
+    in_team: String,
+    #[serde(default)]
+    name: String,
+    limit: Option<i64>,
+}
+
+/// People in a team whose username or name starts with `name`.
+pub async fn autocomplete(State(app): State<App>, me: Me, Query(q): Query<Autocomplete>) -> Result<Json<Value>> {
+    if !db::in_team(&app.db, &q.in_team, &me.user_id).await? {
+        return Err(Error::forbidden());
+    }
+    let prefix = format!("{}%", q.name.trim_start_matches('@').replace(['%', '_', '\\'], ""));
+    let sql = format!(
+        "SELECT {USER_COLUMNS} FROM users u WHERE u.delete_at = 0 \
+         AND u.id IN (SELECT user_id FROM team_members WHERE team_id = ?1) \
+         AND (u.username LIKE ?2 OR u.first_name LIKE ?2 OR u.last_name LIKE ?2 OR u.nickname LIKE ?2) \
+         ORDER BY u.username LIMIT ?3"
+    );
+    let rows: Vec<UserRow> = sqlx::query_as(&sql)
+        .bind(&q.in_team)
+        .bind(&prefix)
+        .bind(q.limit.unwrap_or(25).clamp(1, 100))
+        .fetch_all(&app.db)
+        .await?;
+    let users: Vec<User> = rows.into_iter().map(|r| r.into_user(&me.user_id)).collect();
+    Ok(Json(json!({ "users": users, "out_of_channel": [] })))
+}
+
+/// No profile pictures yet; apps show initials.
+pub async fn image(_: Me, Path(_id): Path<String>) -> Error {
+    Error::not_found("Picture")
+}
+
+pub async fn my_teams(State(app): State<App>, me: Me) -> Result<Json<Vec<Team>>> {
+    let rows: Vec<TeamRow> = sqlx::query_as(
+        "SELECT t.id, t.create_at, t.update_at, t.delete_at, t.name, t.display_name, t.description, t.type \
+         FROM teams t JOIN team_members m ON m.team_id = t.id WHERE m.user_id = ? AND t.delete_at = 0 ORDER BY t.display_name",
+    )
+    .bind(&me.user_id)
+    .fetch_all(&app.db)
+    .await?;
+    Ok(Json(rows.into_iter().map(Into::into).collect()))
+}
+
+/// Followed threads come later; an empty list keeps the Threads view working.
+pub async fn threads(_: Me, Path(_team): Path<String>) -> Json<UserThreads> {
+    Json(UserThreads::default())
+}

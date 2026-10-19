@@ -1,0 +1,31 @@
+[package]
+name = "axiond"
+description = "The Darkmatter chat server"
+edition.workspace = true
+version = "0.1.0"
+# The server is copyleft; the shared crates and Darkmatter stay MIT OR Apache-2.0.
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+# Only the models: the same types Darkmatter reads, so the two can't drift.
+mm-api = { path = "../mm-api", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net", "signal", "fs", "io-std", "io-util"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "derive", "macros"] }
+argon2 = "0.5"
+sha2 = "0.11"
+rand = "0.9"
+clap = { version = "4", features = ["derive", "env"] }
+rpassword = "7"
+toml = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+anyhow = "1"
+
+[dev-dependencies]
+mm-api = { path = "../mm-api" }
+tempfile = "3"
