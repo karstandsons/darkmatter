@@ -1,7 +1,7 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The `AppError` body Mattermost returns with every non-2xx response.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ApiError {
     pub id: String,
@@ -11,6 +11,7 @@ pub struct ApiError {
     pub status_code: u16,
 }
 
+#[cfg(feature = "client")]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("server error {}: {} ({})", .0.status_code, .0.message, .0.id)]
@@ -36,6 +37,7 @@ pub enum Error {
     NoToken,
 }
 
+#[cfg(feature = "client")]
 impl Error {
     /// True for errors that mean the session is gone and the user must log in again.
     pub fn is_unauthorized(&self) -> bool {
