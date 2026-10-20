@@ -125,7 +125,10 @@ We do **not** write our own crypto. The `dm-crypto` crate (below) is a thin laye
 
 We won't pay for an outside audit. Confidence has to come from the libraries we choose, from community review, and from our own testing. That means:
 - **Keep our own crypto code as small as possible.** `dm-crypto` only wires openmls to storage and the wire format. No custom primitives, no custom protocol steps. If something needs crypto that MLS doesn't provide, use a reviewed construction from a reviewed crate (RustCrypto, libcrux) and write down why.
-- **Prefer reviewed components.** As of 2026-10-19 we found no published independent audit of openmls itself. NCC Group's public review of XMTP's libxmtp, which is built on openmls, is indirect evidence ([report](https://nccgroup.com/dk/research-blog/public-report-xmtp-mls-implementation-review)). Before M2 starts, check openmls's and mls-rs's current audit status again and record it here. If one has a real audit and the other doesn't, that decides the library.
+- **Prefer reviewed components.** **Checked again at the start of M2 (2026-10-20), and it decides the library: openmls.**
+  - SRLabs audited openmls for the Sovereign Tech Agency (October 2025 to March 2026; [report](https://blog.openmls.tech/SRL-OpenMLS_security_assurance_assessment.pdf), [summary](https://blog.phnx.im/openmls-independent-security-audit/)). It found eight issues, one High (improper MAC authentication). Seven were fixed in 0.7.3 and 0.8.1; the eighth, Low, was still open in May 2026. We use 0.9.1 (October 2026), which has the fixes.
+  - Least Authority's audit of MDK (White Noise, built on openmls, March 2026) and NCC Group's review of XMTP's libxmtp ([report](https://nccgroup.com/dk/research-blog/public-report-xmtp-mls-implementation-review)) are further, indirect evidence.
+  - mls-rs says in its README that it hasn't had a third-party audit; an audit roadmap issue was still open in August 2026.
 - **Test hard ourselves:**
   - openmls's RFC 9420 test vectors and interop tests in CI;
   - property tests over group operations (add, remove, update, out-of-order delivery, a device offline for weeks);
@@ -407,6 +410,43 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
 - **Any provider, any domain:** the kit doesn't assume either. The README covers Debian/Ubuntu and Fedora/Rocky/Alma (the commands were tried in each), provider firewalls, and IPv4/IPv6. `preflight.sh` checks a server before the first start: Docker, `.env`, the data folder, port 443, memory, the domain's DNS, and reaching Let's Encrypt. axiond builds on a 1 GB, 1 vCPU machine (8 minutes).
 - **Not checked yet:** Let's Encrypt itself with a real domain, and the release workflow's first run (arm64 under emulation). The two of you running it on a VPS is the real test of M1.
 
+**M2 steps** (started 2026-10-20). Each step is committed when it's tested; the design is [E2EE.md](E2EE.md).
+1. **`dm-crypto`:** the crate on openmls 0.9.1. It covers:
+   - identity keys and device certificates;
+   - creating and joining groups, sending and reading messages;
+   - the plaintext format, authenticated data and padding.
+
+   Tested in-process with several simulated devices. It builds for iOS and Android in CI from the start.
+2. **axiond as delivery service:**
+   - identity keys, device certificates and key packages;
+   - the handshake log, checked with `PublicGroup`;
+   - GroupInfo and Welcomes, with the server as external sender for Removes;
+   - the websocket events.
+3. **Darkmatter's local database:** SQLCipher, with the key in the keychain. It holds the MLS state, decrypted messages and known identity keys, and the outbox moves into it. First-run setup makes the identity key and offers the recovery key.
+4. **Encrypted DMs, end to end:**
+   - opening a DM creates its group;
+   - sending and receiving;
+   - the "🔒 Encrypted message" fallback for other clients;
+   - axiond refusing plaintext in encrypted channels.
+5. **Private channels and membership:** adds, removes (server-proposed), external commits for public encrypted channels, regular leaf updates, a member list taken from the group.
+6. **Encrypted files**, with thumbnails made on the client.
+7. **Edits, reactions** (encrypted events) **and mentions** (`dm_mentions`).
+8. **Local search** over decrypted messages, merged with the server's results.
+9. **Devices:**
+   - linking a new device by QR or code;
+   - the devices page and revocation;
+   - safety numbers, verification marks;
+   - blocking sending when a verified key changes.
+10. **Recovery:** the recovery key and passphrase backups of the identity key.
+11. **Proving it:**
+    - property tests over group operations;
+    - the malicious-server harness;
+    - fuzzing the parsers;
+    - `THREAT_MODEL.md`;
+    - the "beta" label.
+
+    Passkeys for login come last.
+
 **Order note:** the **wire format and API reserve space for E2EE from M0**: `props.dm_e2ee`, device IDs on sessions, and an `encrypted` flag on channels. That way M2 doesn't need a migration of the data model.
 
 ## Open questions
@@ -421,7 +461,7 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
 8. **SSO:** does anyone need OIDC (Google, GitLab, Authentik…), or are passwords plus passkeys enough?
 9. **Calls:** decided 2026-10-19 that calls are a core feature; the research answered the library choices. Still open: the largest group that needs video (20 is feasible on 2 vCPU), and whether encrypted voice calls should ship before video.
 10. **Which phone first** in M4, Android or iPhone?
-11. **Encryption library:** openmls or mls-rs, decided by their audit status at the start of M2.
+11. **Encryption library (decided 2026-10-20):** openmls 0.9, the one with an independent audit (see [Review without a paid audit](#review-without-a-paid-audit-decided-2026-10-19)).
 12. **Review without a paid audit (decided):** no paid audit; we rely on reviewed libraries, our own testing and community review.
 
 ---

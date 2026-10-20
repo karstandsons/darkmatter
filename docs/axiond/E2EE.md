@@ -20,7 +20,7 @@ Contents:
 15. [API](#15-api)
 16. [Testing](#16-testing)
 17. [What M1 builds because of this](#17-what-m1-builds-because-of-this)
-18. [Open questions](#18-open-questions)
+18. [Decisions](#18-decisions)
 
 ---
 
@@ -41,7 +41,7 @@ Contents:
 
 | Purpose | Choice | Notes |
 |---|---|---|
-| Group key agreement | **MLS** via **openmls 0.9** (MIT) | Library choice confirmed against audit status at the start of M2 (PLAN.md, open question 11). mls-rs is the fallback. |
+| Group key agreement | **MLS** via **openmls 0.9** (MIT) | Confirmed at the start of M2: openmls has had an independent audit (SRLabs, 2026) and mls-rs hasn't. |
 | Crypto provider | `openmls_libcrux_crypto` (formally verified primitives), else `openmls_rust_crypto` | Pick the one openmls recommends at M2. |
 | Ciphersuite | `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (0x0001) | The one every MLS implementation must support. A post-quantum suite (an X-Wing KEM) is added once openmls ships it as stable; groups record their suite, so old and new groups can coexist. |
 | User identity key | Ed25519 (`ed25519-dalek`) | Signs device certificates ([§3](#3-identities-and-devices)). |
@@ -71,7 +71,7 @@ Two layers, like Matrix's cross-signing and Signal's linked devices:
 
 So the server can't add a device of its own making: it has no user identity key to sign one with.
 
-**Changes to a user's identity key** only happen when someone loses every device and has no backup. Clients show a warning in every conversation with that user. **In a conversation where the user was verified, sending is blocked** until the change is accepted. (Signal only warns; the stricter rule fits our priorities. See open question 1.)
+**Changes to a user's identity key** only happen when someone loses every device and has no backup. Clients show a warning in every conversation with that user. **In a conversation where the user was verified, sending is blocked** until the change is accepted. (Signal only warns; the stricter rule fits our priorities. Decided, [§18](#18-decisions).)
 
 **Removing a device** (from the devices page, or because a session is revoked): the user's other device publishes a revocation signed by the identity key, the server stops delivering to the device, and the device is removed from every group ([§4](#4-groups)).
 
@@ -164,7 +164,7 @@ The server sees only blob sizes. It never makes thumbnails for these files, and 
 
 The server can't read a message, so it can't find @mentions in it. The sender's client does, and lists the mentioned user IDs in `props.dm_mentions` (`@channel`, `@all` and `@here` become a flag). The server uses that for mention counts and notifications.
 
-- **The trade-off:** the server learns who was mentioned, but not what was said. In DMs every message counts as a mention anyway. This is in the metadata list in [§1](#1-goals-and-limits). (Open question 2.)
+- **The trade-off:** the server learns who was mentioned, but not what was said. In DMs every message counts as a mention anyway. This is in the metadata list in [§1](#1-goals-and-limits). (Decided, [§18](#18-decisions).)
 - A client can't lie its way into someone else's mention count beyond what any channel member could do by mentioning them.
 - **Unread counts** work as today: they count posts, not content.
 - **Push notifications** on phones (M4) carry no content: the phone wakes, fetches the post by ID, decrypts it and shows the text itself.
@@ -263,9 +263,10 @@ Built now, so M2 doesn't redo it:
 - **Darkmatter's local database** (SQLCipher, keychain key) arrives with the offline outbox, so M2 adds MLS tables rather than a new storage layer.
 - **`GET e2ee/config`** answers with `{"enabled": false}`, so Darkmatter's server detection is in place.
 
-## 18. Open questions
+## 18. Decisions
 
-1. **Identity key changes in verified conversations:** block sending until accepted (proposed), or warn only, as Signal does?
-2. **Mentions:** OK for the server to learn who was mentioned in encrypted channels (proposed), or should clients work out their own mentions and the server notify everyone on every message?
-3. **History backup:** worth building in M2, or start with "new devices see messages from when they join" and add it later?
-4. **Recovery key vs passphrase:** offer both (proposed), or recovery key only?
+Decided with the project's admins on 2026-10-20:
+1. **Identity key changes in verified conversations:** sending is blocked until the new key is accepted ([§3](#3-identities-and-devices)).
+2. **Mentions:** the sender lists who was mentioned, so the server learns who, not what ([§9](#9-mentions-unreads-and-notifications)).
+3. **History backup:** not in M2. New devices see messages from when they join; the encrypted history backup comes later ([§12](#12-new-devices-verification-and-recovery)).
+4. **Recovery:** both a recovery key and a passphrase, with the app recommending the key ([§12](#12-new-devices-verification-and-recovery)).
