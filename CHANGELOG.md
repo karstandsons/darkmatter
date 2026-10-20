@@ -5,6 +5,9 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **Typing no longer makes the conversation jiggle.** Pictures and GIFs
+  further up changed height for a moment on every keystroke, nudging the
+  messages and the scrollbar. They now keep their size.
 - **With axiond:** private channels (`/create private <name>`, then
   `/invite`), end-to-end encrypted like DMs, and encrypted files and
   pictures in them. Pictures are shrunk for the conversation on your own

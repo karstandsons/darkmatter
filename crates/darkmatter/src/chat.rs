@@ -2962,6 +2962,67 @@ mod tests {
         chat
     }
 
+    /// Draws the chat offscreen after each keystroke, as the app would
+    /// (keeping widget state between frames), and returns each frame's
+    /// pixels above the message box.
+    fn frames_while_typing(chat: &mut Chat, typed: &str, size: iced::Size, backend: &str) -> Vec<Vec<u8>> {
+        use iced::advanced::renderer::Headless;
+        use iced_runtime::user_interface::{Cache, UserInterface};
+        let colors = crate::style::Colors::from_palette(&omarchy_theme::Palette::fallback());
+        let theme = iced::Theme::Dark;
+        let mut renderer = iced::futures::executor::block_on(iced::Renderer::new(iced::Font::DEFAULT, iced::Pixels(16.0), Some(backend))).unwrap();
+        let mut cache = Cache::default();
+        let mut frames = Vec::new();
+        let style = iced::advanced::renderer::Style { text_color: iced::Color::WHITE };
+        let cursor = iced::mouse::Cursor::Unavailable;
+        let mut keys: Vec<Option<char>> = vec![None, None];
+        keys.extend(typed.chars().map(Some));
+        for key in keys {
+            if let Some(ch) = key {
+                let _ = chat.handle(Message::Edit(false, iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert(ch))));
+            }
+            let mut ui = UserInterface::build(chat.view(colors, &theme), size, cache, &mut renderer);
+            let mut messages = Vec::new();
+            let redraw = iced::Event::Window(iced::window::Event::RedrawRequested(std::time::Instant::now()));
+            let _ = ui.update(&[redraw], cursor, &mut renderer, &mut iced::advanced::clipboard::Null, &mut messages);
+            ui.draw(&mut renderer, &theme, &style, cursor);
+            cache = ui.into_cache();
+            let shot = renderer.screenshot(iced::Size::new(size.width as u32, size.height as u32), 1.0, iced::Color::BLACK);
+            // The timeline: everything above the bottom 140 pixels (the composer).
+            let rows = size.height as usize - 140;
+            frames.push(shot[..rows * size.width as usize * 4].to_vec());
+        }
+        frames
+    }
+
+    #[test]
+    fn typing_leaves_the_messages_still() {
+        let mut chat = chat();
+        // Pictures too, above what's on screen and in it. (The GPU renderer
+        // loads pictures in the background and forgets those off screen, so
+        // a size taken from it came and went on every keystroke; this
+        // renderer doesn't, so `animated::fit` is what's tested for that.)
+        let mut png = Vec::new();
+        ::image::RgbaImage::from_pixel(640, 480, ::image::Rgba([200, 80, 40, 255])).write_to(&mut std::io::Cursor::new(&mut png), ::image::ImageFormat::Png).unwrap();
+        let picture = |id: &str| mm_api::models::FileInfo { id: id.into(), name: "a.png".into(), mime_type: "image/png".into(), has_preview_image: true, ..Default::default() };
+        let posts: Vec<Post> = (0..40)
+            .map(|i| {
+                let mut p = Post { id: format!("p{i:02}"), channel_id: "c1".into(), user_id: "me".into(), create_at: 1_000 + i * 60_000, message: format!("message number {i}"), ..Default::default() };
+                if i % 10 == 5 {
+                    p.metadata.files = vec![picture(&format!("f{i}"))];
+                    chat.media.loaded(media::Key::Preview(format!("f{i}")), Ok(png.clone()));
+                }
+                p
+            })
+            .collect();
+        let list = mm_api::models::PostList { order: posts.iter().rev().map(|p| p.id.clone()).collect(), posts: posts.into_iter().map(|p| (p.id.clone(), p)).collect(), ..Default::default() };
+        chat.store.set_history("c1", list);
+        let frames = frames_while_typing(&mut chat, "hello there", iced::Size::new(900.0, 600.0), "tiny-skia");
+        let first = &frames[1];
+        let moved: Vec<usize> = frames.iter().enumerate().skip(1).filter(|(_, f)| f != &first).map(|(i, _)| i).collect();
+        assert!(moved.is_empty(), "the messages moved on keystrokes {moved:?}");
+    }
+
     #[test]
     fn attachments_gate_send_and_clear_after() {
         let dir = tempfile::tempdir().unwrap();

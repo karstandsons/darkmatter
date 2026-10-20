@@ -28,7 +28,10 @@ pub enum Key {
 
 pub enum Media {
     Loading,
-    Ready(image::Handle),
+    /// With its size in pixels, read from the file's header, so it can be
+    /// laid out without the renderer (which loads pictures in the
+    /// background, and forgets the ones off screen).
+    Ready(image::Handle, Option<(u32, u32)>),
     Animated(std::sync::Arc<crate::animated::Frames>),
     Failed,
 }
@@ -41,8 +44,17 @@ pub struct Cache {
 impl Cache {
     pub fn get(&self, key: &Key) -> Option<&image::Handle> {
         match self.items.get(key) {
-            Some(Media::Ready(h)) => Some(h),
+            Some(Media::Ready(h, _)) => Some(h),
             Some(Media::Animated(f)) => Some(f.first()),
+            _ => None,
+        }
+    }
+
+    /// A picture's size in pixels, once loaded.
+    pub fn size(&self, key: &Key) -> Option<(u32, u32)> {
+        match self.items.get(key) {
+            Some(Media::Ready(_, size)) => *size,
+            Some(Media::Animated(f)) => Some(f.size()),
             _ => None,
         }
     }
@@ -122,7 +134,10 @@ impl Cache {
 
     pub fn loaded(&mut self, key: Key, result: Result<Vec<u8>, String>) {
         let media = match result {
-            Ok(bytes) => Media::Ready(image::Handle::from_bytes(bytes)),
+            Ok(bytes) => {
+                let size = ::image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format().ok().and_then(|r| r.into_dimensions().ok());
+                Media::Ready(image::Handle::from_bytes(bytes), size)
+            }
             Err(e) => {
                 tracing::warn!("media {key:?}: {e}");
                 Media::Failed

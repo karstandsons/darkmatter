@@ -1087,13 +1087,16 @@ impl Chat {
         let open = Message::OpenFile(f.id.clone(), f.name.clone());
         if crate::lightbox::is_image(f) {
             let open = Message::Lightbox(crate::lightbox::Msg::Open(f.id.clone(), post_id.to_string()));
-            let (w, h) = media::preview_size(f.width, f.height);
             let gif = crate::lightbox::is_gif(f);
             let key = if gif { media::Key::Gif(f.id.clone()) } else { media::Key::Preview(f.id.clone()) };
+            // Sized from what's known (the server's numbers, or the picture's
+            // own once it's loaded), never measured by the renderer.
+            let size = (f.width > 0 && f.height > 0).then_some((f.width as u32, f.height as u32)).or_else(|| self.media.size(&key));
+            let (w, h) = media::preview_size(size.map_or(0, |s| i64::from(s.0)), size.map_or(0, |s| i64::from(s.1)));
             let inner: Element<'_, Message> = match (self.media.frames(&key), self.media.get(&key)) {
                 (Some(frames), _) => crate::animated::animated(frames, w).into(),
                 // Height follows the width the pane allows, keeping the aspect ratio.
-                (None, Some(handle)) => image(handle.clone()).width(w).height(Length::Shrink).border_radius(6).into(),
+                (None, Some(handle)) => crate::animated::still(handle, size.unwrap_or((w as u32, h as u32)), w).into(),
                 (None, None) => container(
                     text(if self.media.failed(&key) { "Preview unavailable" } else { "Loading…" }).size(12).color(c.muted),
                 )

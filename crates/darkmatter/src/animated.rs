@@ -1,6 +1,13 @@
-//! Animated GIFs. iced's image widget draws one still frame, so this one
-//! picks the frame that's due and asks for a redraw when the next is. It
-//! asks only while it's drawn, so a GIF scrolled out of view costs nothing.
+//! Pictures in messages, still or animated. iced's image widget draws one
+//! still frame, so this one picks the frame that's due and asks for a
+//! redraw when the next is. It asks only while it's drawn, so a GIF
+//! scrolled out of view costs nothing.
+//!
+//! Its size comes from the picture's known size, never from the renderer:
+//! the GPU renderer loads pictures in the background and drops the ones
+//! that weren't drawn, so a size measured from it comes and goes, and
+//! everything around the picture moves with it (as it did on every
+//! keystroke).
 
 use std::time::{Duration, Instant};
 
@@ -15,6 +22,7 @@ use iced::{ContentFit, Element, Event, Length, Rectangle, Rotation, Size, mouse,
 #[derive(Clone, Debug)]
 pub struct Frames {
     pub frames: Vec<(Handle, Duration)>,
+    size: (u32, u32),
     total: Duration,
     /// When it started playing (all GIFs share the app's clock).
     start: Instant,
@@ -36,6 +44,7 @@ impl Frames {
         use ::image::AnimationDecoder;
         let decoder = ::image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
         let mut frames = Vec::new();
+        let mut size = (0, 0);
         let mut used = 0usize;
         for frame in decoder.into_frames() {
             let frame = frame.map_err(|e| e.to_string())?;
@@ -50,6 +59,9 @@ impl Frames {
                 buffer = ::image::imageops::resize(&buffer, nw, nh, ::image::imageops::FilterType::Triangle);
             }
             let (w, h) = buffer.dimensions();
+            if frames.is_empty() {
+                size = (w, h);
+            }
             used += (w * h * 4) as usize;
             frames.push((Handle::from_rgba(w, h, buffer.into_raw()), delay));
             if frames.len() >= MAX_FRAMES || used >= MAX_BYTES {
@@ -60,11 +72,16 @@ impl Frames {
             return Err("no frames".into());
         }
         let total = frames.iter().map(|(_, d)| *d).sum();
-        Ok(Frames { frames, total, start: Instant::now() })
+        Ok(Frames { frames, size, total, start: Instant::now() })
     }
 
     pub fn first(&self) -> &Handle {
         &self.frames[0].0
+    }
+
+    /// The frames' size in pixels.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
     }
 
     /// The frame to show at `now`, and how long until the next one.
@@ -83,31 +100,47 @@ impl Frames {
     }
 }
 
-/// Plays `frames` at `width` (height follows), with rounded corners.
-pub fn animated(frames: &Frames, width: f32) -> Animated<'_> {
-    Animated { frames, width: Length::Fixed(width), radius: 6.0 }
+/// Plays `frames` at most `width` wide, with rounded corners.
+pub fn animated(frames: &Frames, width: f32) -> Picture<'_> {
+    Picture { source: Source::Frames(frames), size: frames.size(), width, radius: 6.0 }
 }
 
-pub struct Animated<'a> {
-    frames: &'a Frames,
-    width: Length,
+/// A still picture of `size` pixels, at most `width` wide.
+pub fn still(handle: &Handle, size: (u32, u32), width: f32) -> Picture<'_> {
+    Picture { source: Source::Still(handle), size, width, radius: 6.0 }
+}
+
+enum Source<'a> {
+    Still(&'a Handle),
+    Frames(&'a Frames),
+}
+
+pub struct Picture<'a> {
+    source: Source<'a>,
+    /// Its own size in pixels, for the aspect ratio.
+    size: (u32, u32),
+    /// The widest it's shown; narrower if the pane is.
+    width: f32,
     radius: f32,
 }
 
-impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for Animated<'_>
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for Picture<'_>
 where
     Renderer: iced::advanced::image::Renderer<Handle = Handle>,
 {
     fn size(&self) -> Size<Length> {
-        Size { width: self.width, height: Length::Shrink }
+        Size { width: Length::Shrink, height: Length::Shrink }
     }
 
-    fn layout(&mut self, _tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
-        image::layout(renderer, limits, self.frames.first(), self.width, Length::Shrink, None, ContentFit::Contain, Rotation::default(), false)
+    fn layout(&mut self, _tree: &mut Tree, _renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::Node::new(fit(self.size, self.width, limits.max().width))
     }
 
     fn draw(&self, _tree: &Tree, renderer: &mut Renderer, _theme: &Theme, _style: &renderer::Style, layout: Layout<'_>, _cursor: mouse::Cursor, _viewport: &Rectangle) {
-        let (handle, _) = self.frames.at(Instant::now());
+        let handle = match &self.source {
+            Source::Still(handle) => handle,
+            Source::Frames(frames) => frames.at(Instant::now()).0,
+        };
         image::draw(renderer, layout, handle, None, self.radius.into(), ContentFit::Contain, FilterMethod::Linear, Rotation::default(), 1.0, 1.0);
     }
 
@@ -123,8 +156,10 @@ where
         _viewport: &Rectangle,
     ) {
         // Each frame drawn asks for the next, for as long as it's on screen.
-        if let Event::Window(window::Event::RedrawRequested(now)) = event {
-            let (_, wait) = self.frames.at(*now);
+        if let Source::Frames(frames) = &self.source
+            && let Event::Window(window::Event::RedrawRequested(now)) = event
+        {
+            let (_, wait) = frames.at(*now);
             if wait != Duration::MAX {
                 shell.request_redraw_at(*now + wait);
             }
@@ -136,13 +171,21 @@ where
     }
 }
 
-impl<'a, Message: 'a, Theme: 'a, Renderer> From<Animated<'a>> for Element<'a, Message, Theme, Renderer>
+impl<'a, Message: 'a, Theme: 'a, Renderer> From<Picture<'a>> for Element<'a, Message, Theme, Renderer>
 where
     Renderer: iced::advanced::image::Renderer<Handle = Handle> + 'a,
 {
-    fn from(a: Animated<'a>) -> Self {
-        Element::new(a)
+    fn from(p: Picture<'a>) -> Self {
+        Element::new(p)
     }
+}
+
+/// A picture of `size` pixels shown at most `width` wide (and never wider
+/// than `room`), keeping its aspect ratio.
+fn fit(size: (u32, u32), width: f32, room: f32) -> Size {
+    let width = width.min(room).max(1.0);
+    let (w, h) = (size.0.max(1) as f32, size.1.max(1) as f32);
+    Size::new(width, (width * h / w).round())
 }
 
 #[cfg(test)]
@@ -173,6 +216,13 @@ mod tests {
         let index = |ms| f.frames.iter().position(|(h, _)| h == at(ms).0).unwrap();
         assert_eq!([index(0), index(150), index(250), index(350)], [0, 1, 2, 0]);
         assert_eq!(at(150).1, Duration::from_millis(50), "time until the next frame");
+    }
+
+    #[test]
+    fn pictures_keep_their_shape_in_narrow_panes() {
+        assert_eq!(fit((800, 600), 400.0, 1000.0), Size::new(400.0, 300.0));
+        assert_eq!(fit((800, 600), 400.0, 200.0), Size::new(200.0, 150.0), "narrower than the pane allows");
+        assert_eq!(fit((0, 0), 400.0, 1000.0), Size::new(400.0, 400.0), "no size known: square");
     }
 
     #[test]
