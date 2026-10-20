@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/omarchy-theme", "crates/mm-api", "crates/darkmatter", "crates/axiond"]
+members = ["crates/omarchy-theme", "crates/mm-api", "crates/darkmatter", "crates/axiond", "crates/dm-crypto"]
 
 [workspace.package]
 edition = "2024"

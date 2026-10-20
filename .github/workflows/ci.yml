@@ -61,3 +61,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked -p darkmatter
       - run: cargo test --workspace --locked
+      # The encryption crate is shared with the phone apps (M4): it must
+      # build for iPhone from the start.
+      - run: rustup target add aarch64-apple-ios
+      - run: cargo build --locked -p dm-crypto --target aarch64-apple-ios
+
+  # And for Android, with the NDK the runner already has: the library and
+  # its tests, linked.
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+      - run: cargo test --locked -p dm-crypto --target aarch64-linux-android --no-run

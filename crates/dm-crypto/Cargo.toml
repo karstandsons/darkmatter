@@ -1,0 +1,27 @@
+[package]
+name = "dm-crypto"
+description = "Darkmatter's end-to-end encryption: MLS (openmls) wired to identities, devices and the wire format"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# MLS (RFC 9420). openmls was independently audited (SRLabs, 2026); see
+# docs/axiond/PLAN.md. Crypto from libcrux, whose primitives are formally
+# verified.
+openmls = "0.9.1"
+openmls_traits = "0.6"
+openmls_basic_credential = "0.6"
+openmls_libcrux_crypto = "0.4"
+# The user identity key that signs device certificates.
+ed25519-dalek = "2"
+getrandom = "0.3"
+zeroize = "1"
+base64 = "0.22"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+openmls_memory_storage = "0.6"
