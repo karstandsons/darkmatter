@@ -5,6 +5,8 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-20
+
 - **Typing no longer makes the conversation jiggle.** Pictures and GIFs
   further up changed height for a moment on every keystroke, nudging the
   messages and the scrollbar. They now keep their size.
