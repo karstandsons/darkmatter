@@ -14,7 +14,8 @@ esac
 U=http://localhost:8065/api/v4
 P='Devpass-123!'
 
-docker start mm-dev 2>/dev/null || docker run -d --name mm-dev -p 8065:8065 mattermost/mattermost-preview
+# Pinned to the version our group's server runs (CI tests it and the newest).
+docker start mm-dev 2>/dev/null || docker run -d --name mm-dev -p 8065:8065 mattermost/mattermost-preview:11.7.12
 until curl -sf $U/system/ping >/dev/null; do sleep 2; done
 
 login() {

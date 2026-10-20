@@ -26,3 +26,5 @@ client = ["dep:tokio", "dep:tracing", "dep:reqwest", "dep:tokio-tungstenite", "d
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { workspace = true, features = ["net"] }
+# tests/mattermost.rs: a picture to upload.
+image = { version = "0.25", default-features = false, features = ["png"] }
