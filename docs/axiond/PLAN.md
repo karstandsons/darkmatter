@@ -397,6 +397,7 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
   - Darkmatter: invite sign-up, the Account window (signed-in apps, two-factor codes with a QR code, blocked people, deleting the account), ⚑ report or block, and telling axiond from plain Mattermost.
 - **Changes from the plan:**
   - **The outbox is a JSON file** (state dir, mode 0600), not the SQLCipher database. That database arrives in M2 with the MLS state that needs it; the outbox moves into it then.
+- **Soak result:** 10 minutes, 249 SIGKILL crashes, 13,822 messages from five people: none lost, none doubled, all in order. **To look into:** six "database is locked" errors in one five-second burst (SQLite busy, codes 5 and 517). Clients retried and nothing was lost, but a server under normal load shouldn't return them.
 - **Not checked yet:** Let's Encrypt against a real domain, the release workflow's first run (arm64 under emulation), and the outbox in the running app (only through tests). The two of you running it on a VPS is the real test of M1.
 
 **Order note:** the **wire format and API reserve space for E2EE from M0**: `props.dm_e2ee`, device IDs on sessions, and an `encrypted` flag on channels. That way M2 doesn't need a migration of the data model.
