@@ -371,6 +371,15 @@ impl Client {
     // End-to-end encryption on axiond (docs/axiond/E2EE.md §15). Binary data
     // is base64.
 
+    /// The device this session signs in as.
+    pub async fn my_device(&self) -> Result<String, Error> {
+        #[derive(serde::Deserialize)]
+        struct Device {
+            device_id: String,
+        }
+        Ok(self.get::<Device>("e2ee/device").await?.device_id)
+    }
+
     /// Publishes your identity key (base64), the first time.
     pub async fn put_identity(&self, identity_key: &str) -> Result<(), Error> {
         self.send_unit(Method::PUT, "e2ee/identity", Some(&json!({ "identity_key": identity_key }))).await

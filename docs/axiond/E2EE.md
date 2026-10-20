@@ -206,12 +206,12 @@ The server stores only the ciphertext. A passphrase can be used instead of a rec
 
 ## 13. Storage on the client
 
-Encrypted chat needs Darkmatter to keep state on disk, which it doesn't today:
-- the MLS state (`openmls_sqlx_storage`, SQLite);
+Encrypted chat needs Darkmatter to keep state on disk:
+- the MLS state (openmls's key/value pairs, written after every change, deletions included);
 - decrypted messages and the local search index;
 - verification state and known identity keys.
 
-**One local SQLite database per account**, encrypted at rest with **SQLCipher**, with its key in the OS keychain (the `keyring` crate, as sessions already use). The file is readable only by the user. This database is also the base for the offline outbox and cache that M1's reliability work and M4's phones need.
+**One local SQLite database per account** (the "vault", built in M2 step 3), encrypted at rest with **SQLCipher** under a random 256-bit key in the OS keychain (the `keyring` crate, as sessions use; a 0600 file when there's no keychain). The files are readable only by the user, `secure_delete` overwrites freed pages, and writes go through one ordered queue. It holds the outbox too, on Mattermost servers as well. SQLCipher uses the system's libcrypto on Linux and CommonCrypto on macOS. If its key is lost, the old file is set aside and the device starts again as a new device.
 
 ## 14. What a malicious server can and can't do
 

@@ -4,6 +4,7 @@ mod chat;
 mod chat_view;
 mod commands;
 mod config;
+mod crypto;
 mod emoji_picker;
 mod layout;
 mod lightbox;
@@ -23,6 +24,7 @@ mod switcher;
 mod text;
 mod theme_picker;
 mod update;
+mod vault;
 mod viewer;
 mod zoom;
 

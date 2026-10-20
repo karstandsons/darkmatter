@@ -103,7 +103,7 @@ pub enum Message {
     /// Switch between signing in and making an account with an invite.
     LoginInvite(bool),
     LoggedIn(Result<(Session, User), (String, bool)>),
-    Bootstrapped(Result<Bootstrap, String>),
+    Bootstrapped(Result<Box<Bootstrap>, String>),
     SessionFailed(String),
     SelectTeam(String),
     SelectChannel(String),
@@ -284,6 +284,12 @@ pub struct Bootstrap {
     pub axiond: Option<mm_api::models::AxiondInfo>,
     /// People you've blocked (axiond).
     pub blocked: Vec<String>,
+    /// The account's encrypted local database, if it could be opened.
+    pub vault: Option<std::sync::Arc<crate::vault::Vault>>,
+    /// Messages still waiting to be sent, from the vault.
+    pub outbox: Vec<crate::outbox::Queued>,
+    pub crypto_status: crate::crypto::Status,
+    pub crypto: Option<std::sync::Arc<crate::crypto::Crypto>>,
 }
 
 pub(crate) fn err(e: mm_api::Error) -> String {
@@ -770,7 +776,7 @@ impl App {
                     chat.server_config = b.server_config;
                     chat.goto_pending()
                 }
-                _ => self.start_chat(b),
+                _ => self.start_chat(*b),
             },
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::Tab), modifiers, .. })
                 if matches!(self.screen, Screen::Login(_)) =>
@@ -938,8 +944,8 @@ impl App {
         if let (Some(m), Screen::Chat(chat)) = (&self.plugin_manager, &self.screen) {
             body = body.push(m.view(&chat.plugins, &self.config, &chat.server_config, c));
         }
-        if let Some(a) = &self.account {
-            body = body.push(a.view(c));
+        if let (Some(a), Screen::Chat(chat)) = (&self.account, &self.screen) {
+            body = body.push(a.view(&chat.crypto_status, c));
         }
         if let Some(r) = &self.report {
             body = body.push(r.view(c));
@@ -1003,7 +1009,37 @@ pub(crate) fn bootstrap(session: Session) -> Task<Message> {
                 None
             });
             let blocked = if axiond.is_some() { client.blocked().await.unwrap_or_default() } else { Vec::new() };
-            Ok(Bootstrap { session, me, teams, channels, members, users, server_config, axiond, blocked })
+            // The encrypted local database. Without it Darkmatter still works,
+            // but unsent messages live only in memory and encryption is off.
+            let vault = match crate::vault::Vault::open_account(&session.server, &me.id).await {
+                Ok(v) => Some(std::sync::Arc::new(v)),
+                Err(e) => {
+                    tracing::error!("couldn't open the local database: {e}");
+                    None
+                }
+            };
+            let (outbox, crypto_status, crypto) = match &vault {
+                Some(v) => {
+                    let mut outbox = v.outbox().await;
+                    let legacy = crate::outbox::take_legacy(&session.server);
+                    if !legacy.is_empty() {
+                        tracing::info!("moved {} unsent message(s) into the local database", legacy.len());
+                        outbox.extend(legacy);
+                        v.writer().outbox(outbox.clone());
+                    }
+                    let (status, crypto) = crate::crypto::setup(&client, &me.id, v, axiond.as_ref()).await;
+                    (outbox, status, crypto)
+                }
+                None => {
+                    let status = if axiond.as_ref().is_some_and(|a| a.enabled) {
+                        crate::crypto::Status::Failed("the local database couldn't be opened".into())
+                    } else {
+                        crate::crypto::Status::Off
+                    };
+                    (crate::outbox::take_legacy(&session.server), status, None)
+                }
+            };
+            Ok(Box::new(Bootstrap { session, me, teams, channels, members, users, server_config, axiond, blocked, vault, outbox, crypto_status, crypto }))
         },
         Message::Bootstrapped,
     )

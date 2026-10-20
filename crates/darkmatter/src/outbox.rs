@@ -26,21 +26,38 @@ pub struct Queued {
     pub in_flight: bool,
 }
 
-/// One server's queue. The file holds every server's, by URL.
+/// One account's queue, kept in its encrypted database ([`crate::vault`]).
 #[derive(Default)]
 pub struct Outbox {
-    server: String,
     pub items: Vec<Queued>,
-    /// No file (tests): kept in memory only.
-    path: Option<PathBuf>,
+    /// No vault (tests, or it couldn't be opened): kept in memory only.
+    vault: Option<crate::vault::Writer>,
 }
 
-fn path() -> Option<PathBuf> {
+/// Where versions before the vault kept every server's queue, as JSON.
+fn legacy_path() -> Option<PathBuf> {
     Some(dirs::state_dir().or_else(dirs::data_local_dir)?.join("darkmatter/outbox.json"))
 }
 
 fn read_all(path: &std::path::Path) -> HashMap<String, Vec<Queued>> {
     std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+/// Takes `server`'s messages out of the old JSON file (removing the file when
+/// nothing is left in it), to move them into the vault.
+pub fn take_legacy(server: &str) -> Vec<Queued> {
+    let Some(path) = legacy_path() else { return Vec::new() };
+    take_legacy_from(&path, server)
+}
+
+fn take_legacy_from(path: &std::path::Path, server: &str) -> Vec<Queued> {
+    let mut all = read_all(path);
+    let Some(items) = all.remove(server) else { return Vec::new() };
+    let result = if all.is_empty() { std::fs::remove_file(path) } else { serde_json::to_vec(&all).map_err(std::io::Error::other).and_then(|b| std::fs::write(path, b)) };
+    if let Err(e) = result {
+        tracing::warn!("couldn't update the old outbox file: {e}");
+    }
+    items
 }
 
 /// How long to wait before try `attempts + 1`: 2 s, 4 s, 8 s… up to a minute.
@@ -49,34 +66,14 @@ fn backoff(attempts: u32) -> Duration {
 }
 
 impl Outbox {
-    pub fn load(server: &str) -> Self {
-        // Tests never touch the real file.
-        let path = if cfg!(test) { None } else { path() };
-        let items = path.as_deref().map(read_all).unwrap_or_default().remove(server).unwrap_or_default();
-        Outbox { server: server.into(), items, path }
+    /// The queue as the vault had it.
+    pub fn new(items: Vec<Queued>, vault: Option<crate::vault::Writer>) -> Self {
+        Outbox { items, vault }
     }
 
-    /// Writes the queue (others' servers untouched), readable only by you.
     fn save(&self) {
-        let Some(path) = &self.path else { return };
-        let mut all = read_all(path);
-        if self.items.is_empty() {
-            all.remove(&self.server);
-        } else {
-            all.insert(self.server.clone(), self.items.clone());
-        }
-        let result = (|| {
-            std::fs::create_dir_all(path.parent().ok_or(std::io::ErrorKind::NotFound)?)?;
-            let tmp = path.with_extension("json.part");
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-            std::io::Write::write_all(&mut options.open(&tmp)?, serde_json::to_string(&all)?.as_bytes())?;
-            std::fs::rename(&tmp, path)
-        })();
-        if let Err(e) = result {
-            tracing::warn!("couldn't save the outbox: {e}");
+        if let Some(vault) = &self.vault {
+            vault.outbox(self.items.clone());
         }
     }
 
@@ -165,6 +162,10 @@ pub fn problem(e: &mm_api::Error) -> String {
 mod tests {
     use super::*;
 
+    fn queued(id: &str) -> Queued {
+        Queued { post: post(id), queued_at: 0, attempts: 0, problem: None, next_try: None, in_flight: false }
+    }
+
     fn post(id: &str) -> NewPost {
         NewPost { channel_id: "c".into(), message: id.into(), pending_post_id: id.into(), ..Default::default() }
     }
@@ -199,18 +200,16 @@ mod tests {
     }
 
     #[test]
-    fn survives_a_restart() {
+    fn old_queues_move_out_of_the_json_file() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("outbox.json");
-        let mut o = Outbox { server: "https://a".into(), items: Vec::new(), path: Some(file.clone()) };
-        o.push(post("x"));
-        let mut other = Outbox { server: "https://b".into(), items: Vec::new(), path: Some(file.clone()) };
-        other.push(post("y"));
-        let all = read_all(&file);
-        assert_eq!((all["https://a"].len(), all["https://b"].len()), (1, 1));
-        #[cfg(unix)]
-        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&file).unwrap().permissions()) & 0o777, 0o600);
-        o.remove("x");
-        assert!(!read_all(&file).contains_key("https://a"));
+        let all = HashMap::from([("https://a".to_string(), vec![queued("x")]), ("https://b".to_string(), vec![queued("y")])]);
+        std::fs::write(&file, serde_json::to_vec(&all).unwrap()).unwrap();
+        assert_eq!(take_legacy_from(&file, "https://a").len(), 1);
+        assert!(take_legacy_from(&file, "https://a").is_empty(), "taken once");
+        assert!(read_all(&file).contains_key("https://b"));
+        assert_eq!(take_legacy_from(&file, "https://b").len(), 1);
+        assert!(!file.exists(), "gone once empty");
     }
+
 }

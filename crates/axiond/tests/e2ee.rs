@@ -52,6 +52,7 @@ impl Phone {
     async fn new(s: &Server, name: &str, device_id: &str, identity: &UserIdentity) -> Phone {
         let mut api = Client::new(&s.url).unwrap().device_id(device_id);
         let me = api.login(name, PASSWORD, None).await.unwrap();
+        assert_eq!(api.my_device().await.unwrap(), device_id);
         let config = api.axiond().await.unwrap().expect("axiond");
         assert!(config.enabled);
         let server_key = ServerKey { signature_key: B64.decode(config.external_sender).unwrap() };

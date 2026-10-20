@@ -259,7 +259,7 @@ impl Account {
         self.loaded.as_ref().filter(|_| self.axiond).map(|l| l.blocked.iter().map(|u| u.id.clone()).collect())
     }
 
-    pub fn view<'a>(&'a self, c: Colors) -> Element<'a, Message> {
+    pub fn view<'a>(&'a self, encryption: &'a crate::crypto::Status, c: Colors) -> Element<'a, Message> {
         let busy = self.busy;
         let mut body = column![row![text("Account").size(18).font(bold()).color(c.fg_bright), space::horizontal()]].spacing(14);
         let Some(l) = &self.loaded else {
@@ -280,6 +280,26 @@ impl Account {
                 .into()
         });
         body = body.push(column![heading(c, "Signed-in apps"), Column::with_children(apps).spacing(8)].spacing(8));
+
+        // End-to-end encryption (axiond).
+        let encryption: Option<Element<'a, Message>> = match encryption {
+            crate::crypto::Status::Off => None,
+            crate::crypto::Status::Ready { fingerprint } => Some(
+                column![
+                    text("Set up on this device. Your identity key (comparing it with others' apps comes with verification, in a later update):").size(13),
+                    text(fingerprint).size(12).font(iced::Font::MONOSPACE).color(c.fg_bright),
+                ]
+                .spacing(6)
+                .into(),
+            ),
+            crate::crypto::Status::NeedsLink => Some(
+                text("Your encryption keys are on another of your devices. Linking this one to it comes in a later update.").size(13).color(c.muted).into(),
+            ),
+            crate::crypto::Status::Failed(why) => Some(text(format!("Couldn't set it up on this device: {why}")).size(13).color(c.red).into()),
+        };
+        if let Some(e) = encryption {
+            body = body.push(column![heading(c, "Encryption"), e].spacing(8));
+        }
 
         // Two-factor codes.
         let mfa: Element<'a, Message> = match &self.mfa {

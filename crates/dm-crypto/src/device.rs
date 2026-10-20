@@ -90,6 +90,11 @@ impl<S: StorageProvider<CURRENT_VERSION>> Device<S> {
         self.signer.public()
     }
 
+    /// Where the device keeps its state (the app saves it).
+    pub fn storage(&self) -> &S {
+        self.provider.storage()
+    }
+
     fn credential(&self) -> CredentialWithKey {
         CredentialWithKey { credential: identity::credential(&self.user_id, &self.device_id), signature_key: self.signer.to_public_vec().into() }
     }

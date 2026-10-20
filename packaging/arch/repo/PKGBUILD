@@ -10,7 +10,7 @@ pkgdesc="Darkmatter: an Omarchy-themed Mattermost client"
 arch=('x86_64' 'aarch64')
 url="https://github.com/karstandsons/darkmatter"
 license=('MIT OR Apache-2.0')
-depends=('gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'hicolor-icon-theme')
+depends=('gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'hicolor-icon-theme' 'openssl')
 optdepends=(
   'vulkan-icd-loader: GPU rendering'
   'libx11: running under X11'

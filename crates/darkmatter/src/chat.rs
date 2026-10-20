@@ -197,6 +197,13 @@ pub struct Chat {
     pub server_config: plugins::ServerConfig,
     /// What axiond says about itself; `None` on plain Mattermost.
     pub axiond: Option<mm_api::models::AxiondInfo>,
+    /// The account's encrypted local database.
+    #[expect(dead_code, reason = "encrypted messages are kept in it: M2 step 4")]
+    pub vault: Option<std::sync::Arc<crate::vault::Vault>>,
+    /// End-to-end encryption on this device (axiond), and how it stands.
+    #[expect(dead_code, reason = "encrypted DMs: M2 step 4")]
+    pub crypto: Option<std::sync::Arc<crate::crypto::Crypto>>,
+    pub crypto_status: crate::crypto::Status,
     /// Installed plugins (`~/.config/darkmatter/plugins`).
     pub plugins: std::sync::Arc<Plugins>,
     /// A plugin's picker, opened from the + menu.
@@ -422,7 +429,7 @@ impl Chat {
             }
             None => pane_grid::State::new(PaneView::new(0, String::new())),
         };
-        let outbox = crate::outbox::Outbox::load(&b.session.server);
+        let outbox = crate::outbox::Outbox::new(b.outbox, b.vault.as_ref().map(|v| v.writer()));
         let chat = Chat {
             session: b.session,
             client,
@@ -470,6 +477,9 @@ impl Chat {
             command_sent: None,
             server_config: b.server_config,
             axiond: b.axiond,
+            vault: b.vault,
+            crypto: b.crypto,
+            crypto_status: b.crypto_status,
             plugins: Default::default(),
             plugin_picker: None,
             editors: HashMap::new(),
@@ -2673,6 +2683,10 @@ mod tests {
             server_config: Default::default(),
             axiond: None,
             blocked: vec![],
+            vault: None,
+            outbox: vec![],
+            crypto_status: crate::crypto::Status::Off,
+            crypto: None,
         };
         let (mut chat, _) = Chat::start(b).unwrap();
         chat.pv_mut().channel = "c1".into();

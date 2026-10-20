@@ -12,7 +12,7 @@ url="https://github.com/karstandsons/darkmatter"
 license=('MIT OR Apache-2.0')
 # Linked: glibc, gcc-libs. Loaded at runtime: Wayland/X11, xkbcommon, and a GPU
 # driver through Vulkan (it falls back to a CPU renderer without one).
-depends=('gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'hicolor-icon-theme')
+depends=('gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'hicolor-icon-theme' 'openssl')
 makedepends=('cargo' 'git')
 optdepends=(
   'vulkan-icd-loader: GPU rendering'

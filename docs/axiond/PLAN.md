@@ -422,7 +422,7 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
    - the handshake log, checked with `PublicGroup`;
    - GroupInfo and Welcomes, with the server as external sender for Removes;
    - the websocket events.
-3. **Darkmatter's local database:** SQLCipher, with the key in the keychain. It holds the MLS state, decrypted messages and known identity keys, and the outbox moves into it. First-run setup makes the identity key and offers the recovery key.
+3. **Darkmatter's local database:** *(done 2026-10-20)* SQLCipher, with the key in the keychain. It holds the MLS state, known identity keys and the outbox (moved from its JSON file). On axiond, sign-in sets the device up: the identity key on the account's first device, the device certificate and key packages; a device whose account has keys elsewhere waits for linking (step 9). The Account window shows it. Decrypted messages are stored from step 4. Offering the recovery key moved to step 10, with the backup it unlocks.
 4. **Encrypted DMs, end to end:**
    - opening a DM creates its group;
    - sending and receiving;
@@ -437,7 +437,7 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
    - the devices page and revocation;
    - safety numbers, verification marks;
    - blocking sending when a verified key changes.
-10. **Recovery:** the recovery key and passphrase backups of the identity key.
+10. **Recovery:** the recovery key (offered at first setup) and passphrase backups of the identity key.
 11. **Proving it:**
     - property tests over group operations;
     - the malicious-server harness;

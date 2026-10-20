@@ -39,6 +39,12 @@ fn refused(e: dm_crypto::Error) -> Error {
     Error::bad_request(format!("Refused: {e}"))
 }
 
+/// Which device the signed-in session is: Darkmatter asks rather than
+/// naming one at login, which Mattermost would take for a push address.
+pub async fn my_device(me: Me) -> Json<Value> {
+    Json(json!({ "user_id": me.user_id, "device_id": me.device_id }))
+}
+
 #[derive(Deserialize)]
 pub struct NewIdentity {
     identity_key: String,
