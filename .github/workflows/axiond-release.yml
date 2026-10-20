@@ -1,0 +1,93 @@
+# Build and publish axiond: a multi-arch image (amd64, arm64) on GitHub's
+# container registry, plus the static binaries and their checksums on a
+# GitHub release.
+#
+# - Push a tag like axiond-v0.2.0 (it must match crates/axiond/Cargo.toml).
+# - Run it by hand (Actions → axiond release → Run workflow) for a dry run:
+#   the same builds, uploaded as workflow artifacts, nothing published.
+#
+# Images are not signed yet: keyless signing (cosign, attestations) writes to
+# public transparency logs, which would announce this private repository.
+# Turn it on when the repository goes public.
+name: axiond release
+on:
+  push:
+    tags: ['axiond-v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/${{ github.repository_owner }}/axiond
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version from crates/axiond/Cargo.toml (and check it matches the tag)
+        id: v
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/axiond/Cargo.toml | head -1)
+          if [[ $GITHUB_REF == refs/tags/axiond-v* && ${GITHUB_REF#refs/tags/axiond-v} != "$version" ]]; then
+            echo "::error::tag ${GITHUB_REF#refs/tags/} doesn't match axiond's version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=${{ startsWith(github.ref, 'refs/tags/axiond-v') }}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - if: steps.v.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # arm64 builds under emulation: slow, but releases are rare.
+      - name: Build (and push, for a tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: crates/axiond/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.v.outputs.publish == 'true' }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.title=axiond
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          outputs: ${{ steps.v.outputs.publish == 'true' && 'type=registry' || 'type=local,dest=out' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Static binaries and checksums
+        run: |
+          mkdir -p dist
+          version=${{ steps.v.outputs.version }}
+          for arch in amd64 arm64; do
+            if [[ ${{ steps.v.outputs.publish }} == true ]]; then
+              id=$(docker create --platform linux/$arch "$IMAGE:$version")
+              docker cp "$id:/usr/local/bin/axiond" "dist/axiond-$version-linux-$arch"
+              docker rm "$id"
+            else
+              cp "out/linux_$arch/usr/local/bin/axiond" "dist/axiond-$version-linux-$arch"
+            fi
+          done
+          cd dist && sha256sum axiond-* > SHA256SUMS && cat SHA256SUMS
+      - if: steps.v.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: axiond-${{ steps.v.outputs.version }}
+          path: dist/
+      - if: steps.v.outputs.publish == 'true'
+        name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          gh release create "$tag" dist/* --title "axiond ${{ steps.v.outputs.version }}" \
+            --notes "Image: \`$IMAGE:${{ steps.v.outputs.version }}\` (amd64, arm64). See crates/axiond/README.md and deploy/axiond."
