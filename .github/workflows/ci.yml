@@ -3,6 +3,8 @@ name: CI
 on:
   push:
   pull_request:
+  # Run by hand from the Actions tab (e.g. to check macOS before a release).
+  workflow_dispatch:
 
 # A newer push to the same branch cancels the run still going for the old one.
 concurrency:
@@ -53,7 +55,10 @@ jobs:
         env:
           MM_TEST_URL: http://127.0.0.1:8065
 
+  # macOS minutes count ten times on a private repository, so this runs for
+  # release tags and by hand, not every push.
   macos:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

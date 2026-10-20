@@ -5,6 +5,25 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **GIFs show and play.** A GIF (from `/gif` or any upload) used to show
+  only its file name, because Mattermost makes no preview of GIFs. They now
+  play in the conversation, and only while they're on screen. The image
+  viewer shows the first frame.
+- **No message is lost.** Messages wait in an outbox until the server has
+  them, through dropped connections, server restarts and closing
+  Darkmatter, and are retried without being sent twice. One that's waiting
+  shows under your name with why ("can't reach the server").
+- **An encrypted local database** for each account (SQLCipher, its key in
+  the system keyring). Unsent messages live there now, moved once from the
+  old plain file. On Linux, Darkmatter now needs OpenSSL's libcrypto
+  (the Arch packages depend on `openssl`).
+- Darkmatter names itself to servers ("Darkmatter/0.4.1 (linux)"), so its
+  sessions are recognisable in a server's list of signed-in apps.
+- **With axiond** (our own server, in development): sign up with an invite
+  code, an Account window (signed-in apps, two-factor codes, blocked people,
+  deleting your account), ⚑ to report a message or block someone, and the
+  first end-to-end encrypted direct messages.
+
 ## [0.4.0] - 2026-10-18
 
 - **Image viewer:** clicking an image shows it large over the app instead of
