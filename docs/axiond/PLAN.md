@@ -423,7 +423,7 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
    - GroupInfo and Welcomes, with the server as external sender for Removes;
    - the websocket events.
 3. **Darkmatter's local database:** *(done 2026-10-20)* SQLCipher, with the key in the keychain. It holds the MLS state, known identity keys and the outbox (moved from its JSON file). On axiond, sign-in sets the device up: the identity key on the account's first device, the device certificate and key packages; a device whose account has keys elsewhere waits for linking (step 9). The Account window shows it. Decrypted messages are stored from step 4. Offering the recovery key moved to step 10, with the backup it unlocks.
-4. **Encrypted DMs, end to end:** *(built 2026-10-20; tested end to end through axiond, the in-app check still to do)*
+4. **Encrypted DMs, end to end:** *(done 2026-10-20; checked in the app with three people)* A message waits, saying why, until everyone in the conversation has set up encryption, and the sender adds devices set up after the group was made.
    - opening a DM creates its group;
    - sending and receiving;
    - the "🔒 Encrypted message" fallback for other clients;

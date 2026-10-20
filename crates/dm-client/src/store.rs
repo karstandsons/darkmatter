@@ -64,7 +64,7 @@ impl LocalStore for MemoryStore {
     async fn clear_device(&self) {
         let mut m = self.0.lock().unwrap();
         m.mls.clear();
-        m.kv.retain(|k, _| !k.starts_with("device.") && !k.starts_with("seq."));
+        m.kv.retain(|k, _| !k.starts_with("device.") && !k.starts_with("seq.") && !k.starts_with("joined."));
     }
 
     async fn identity(&self, user_id: &str) -> Option<String> {

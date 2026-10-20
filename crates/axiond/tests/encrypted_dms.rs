@@ -23,6 +23,7 @@ async fn server() -> Server {
     let user = |name: &str| NewUser { username: name.into(), email: format!("{name}@example.com"), password: PASSWORD.into() };
     admin::setup(&app, user("alice"), "home", "Home").await.unwrap();
     admin::add_user(&app, user("bob"), false).await.unwrap();
+    admin::add_user(&app, user("carol"), false).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(app.clone().serve(listener));
@@ -126,4 +127,33 @@ async fn an_encrypted_dm_between_two_people_and_a_new_device() {
     assert_eq!(alice.device.members(&dm.id).unwrap().len(), 2);
     assert_eq!(text(read(&bob, &after).await), "phone's gone");
     assert!(matches!(read(&phone, &after).await, Decrypted::Unreadable(_)));
+}
+
+#[tokio::test]
+async fn nobody_is_sent_a_message_they_cant_read() {
+    let s = server().await;
+    let (alice_api, alice) = device(&s, "alice", MemoryStore::default()).await;
+    // Carol has never signed in with an app that encrypts.
+    let mut carol_api = Client::new(&s.url).unwrap();
+    let carol_id = carol_api.login("carol", PASSWORD, None).await.unwrap().id;
+    let dm = alice_api.create_direct(&alice.user_id, &carol_id).await.unwrap();
+    let post = NewPost { channel_id: dm.id.clone(), message: "are you there?".into(), pending_post_id: "p1".into(), ..Default::default() };
+    let refused = alice.encrypt_post(&post).await.unwrap_err();
+    assert!(refused.contains("@carol can't get encrypted messages yet"), "{refused}");
+
+    // Once she has, the same message (as the outbox retries it) reaches her.
+    let carol_store = MemoryStore::default();
+    let (_, carol) = device(&s, "carol", carol_store.clone()).await;
+    let sealed = alice.encrypt_post(&post).await.unwrap();
+    let sent = alice_api.create_post(&sealed).await.unwrap();
+    assert_eq!(text(read(&carol, &sent).await), "are you there?");
+
+    // A device Carol sets up later is added by the next sender, without
+    // having to join by itself first.
+    let laptop_store = MemoryStore::default();
+    laptop_store.set("identity.secret", carol_store.get("identity.secret").await.unwrap());
+    let (_, carol_laptop) = device(&s, "carol", laptop_store).await;
+    let later = send(&alice_api, &alice, &dm.id, "both of yours").await;
+    assert_eq!(text(read(&carol_laptop, &later).await), "both of yours");
+    assert!(matches!(read(&carol_laptop, &sent).await, Decrypted::Unreadable(why) if why.contains("before this device joined")));
 }

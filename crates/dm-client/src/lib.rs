@@ -14,7 +14,7 @@
 
 mod store;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use base64::Engine;
@@ -245,6 +245,18 @@ impl<S: LocalStore> E2ee<S> {
         self.store.set(&format!("seq.{channel_id}"), seq.to_string().into_bytes());
     }
 
+    /// Remembers the epoch this device came into a group at: anything sent
+    /// before it was never encrypted for this device.
+    fn set_joined(&self, channel_id: &str) {
+        if let Ok(epoch) = self.device.epoch(channel_id) {
+            self.store.set(&format!("joined.{channel_id}"), epoch.to_string().into_bytes());
+        }
+    }
+
+    async fn joined(&self, channel_id: &str) -> Option<u64> {
+        self.store.get(&format!("joined.{channel_id}")).await.and_then(|v| String::from_utf8(v).ok()).and_then(|v| v.parse().ok())
+    }
+
     /// Takes in the Welcomes waiting for this device.
     async fn take_welcomes(&self) -> Result<(), String> {
         for w in self.api.welcomes().await.map_err(s)? {
@@ -259,6 +271,7 @@ impl<S: LocalStore> E2ee<S> {
             match joined {
                 Ok(channel) => {
                     self.set_cursor(&channel, w.seq);
+                    self.set_joined(&channel);
                     tracing::info!("joined the encrypted group of {channel}");
                 }
                 Err(e) => tracing::warn!("a Welcome for {} wasn't taken: {e}", w.channel_id),
@@ -331,6 +344,18 @@ impl<S: LocalStore> E2ee<S> {
     /// Makes sure this device is in the channel's group, up to date, with
     /// the server's removals committed: what has to be true before sending.
     async fn ready(&self, channel_id: &str) -> Result<(), String> {
+        // Everyone in the conversation must be able to read it: someone who
+        // has never set up encryption has no device to encrypt for.
+        let members = self.members(channel_id).await?;
+        let keys = self.keys(&members).await?;
+        let unable: Vec<String> = members.iter().filter(|u| !keys.certificates.keys().any(|(cu, _)| cu == *u)).cloned().collect();
+        if !unable.is_empty() {
+            let names: Vec<String> = match self.api.users_by_ids(&unable).await {
+                Ok(users) => users.into_iter().map(|u| format!("@{}", u.username)).collect(),
+                Err(_) => unable,
+            };
+            return Err(format!("{} can't get encrypted messages yet: they need to sign in with Darkmatter once", names.join(", ")));
+        }
         if !self.device.has_group(channel_id) {
             self.take_welcomes().await?;
         }
@@ -344,14 +369,55 @@ impl<S: LocalStore> E2ee<S> {
                 Ok(_) => self.join_external(channel_id).await?,
             }
         }
+        let mut committed = false;
         for _ in 0..RETRIES {
-            let Some(h) = self.device.commit_pending(channel_id).map_err(s)? else { return Ok(()) };
+            let Some(h) = self.device.commit_pending(channel_id).map_err(s)? else {
+                committed = true;
+                break;
+            };
+            if self.send(channel_id, &h).await? {
+                committed = true;
+                break;
+            }
+            self.catch_up(channel_id).await?;
+        }
+        if !committed {
+            return Err("the conversation kept changing; try again".into());
+        }
+        self.add_missing(channel_id, &keys).await
+    }
+
+    /// Adds members' devices the group doesn't have yet (set up after it was
+    /// made), so they can read what's sent next without waiting to join.
+    async fn add_missing(&self, channel_id: &str, keys: &Keys) -> Result<(), String> {
+        for _ in 0..RETRIES {
+            let in_group: HashSet<(String, String)> = self.device.members(channel_id).map_err(s)?.into_iter().collect();
+            let mut users: Vec<String> = keys.certificates.keys().filter(|d| !in_group.contains(*d)).map(|(u, _)| u.clone()).collect();
+            users.dedup();
+            if users.is_empty() {
+                return Ok(());
+            }
+            let claimed: Vec<_> = self
+                .api
+                .claim_key_packages(&users)
+                .await
+                .map_err(s)?
+                .into_iter()
+                .filter(|c| !in_group.contains(&(c.user_id.clone(), c.device_id.clone())))
+                .collect();
+            // Out of key packages: those devices join by themselves instead.
+            if claimed.is_empty() {
+                return Ok(());
+            }
+            let packages: Vec<Vec<u8>> = claimed.iter().filter_map(|c| B64.decode(&c.key_package).ok()).collect();
+            let h = self.device.add(channel_id, &packages, keys).map_err(s)?;
+            self.persist();
             if self.send(channel_id, &h).await? {
                 return Ok(());
             }
             self.catch_up(channel_id).await?;
         }
-        Err("the conversation kept changing; try again".into())
+        Err("couldn't add everyone's devices to the conversation".into())
     }
 
     /// Starts the channel's group and adds every member's devices.
@@ -365,6 +431,7 @@ impl<S: LocalStore> E2ee<S> {
             return if conflict(&e) { self.join_external(channel_id).await } else { Err(s(e)) };
         }
         self.set_cursor(channel_id, 0);
+        self.set_joined(channel_id);
         let members = self.members(channel_id).await?;
         let keys = self.keys(&members).await?;
         for _ in 0..RETRIES {
@@ -392,6 +459,7 @@ impl<S: LocalStore> E2ee<S> {
             let (_, h) = self.device.join_external(&info, &self.server, &keys).map_err(s)?;
             self.persist();
             if self.send(channel_id, &h).await? {
+                self.set_joined(channel_id);
                 tracing::info!("joined the encrypted group of {channel_id}");
                 return Ok(());
             }
@@ -444,8 +512,9 @@ impl<S: LocalStore> E2ee<S> {
         {
             tracing::warn!("couldn't fetch Welcomes: {e}");
         }
-        if !self.device.has_group(&post.channel_id) {
-            return Decrypted::Unreadable("it was sent before this device joined the conversation".into());
+        let before = "it was sent before this device joined the conversation";
+        if !self.device.has_group(&post.channel_id) || self.joined(&post.channel_id).await.is_some_and(|j| e2ee.epoch < j) {
+            return Decrypted::Unreadable(before.into());
         }
         if self.device.epoch(&post.channel_id).is_ok_and(|e| e2ee.epoch > e)
             && let Err(e) = self.catch_up(&post.channel_id).await
