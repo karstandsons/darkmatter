@@ -175,13 +175,15 @@ The server's search (FTS5) never sees encrypted content and skips encrypted chan
 
 ## 11. Calls
 
-Calls in encrypted channels are encrypted end to end with **SFrame**:
-- The base key comes from the channel's MLS group: `export_secret("darkmatter call", call_id ‖ epoch, 32)`.
-- Each participant derives its own sending key from that base key, as RFC 9605 describes for MLS.
-- When the group's epoch changes (someone joins or leaves), keys rotate. Someone removed from the group can't derive the next key.
-- The SFU and TURN relay in axiond forward media they can't decode.
+From the calls research ([research/calls.md](research/calls.md)):
+- **Each call gets its own MLS group**, holding only the devices in the call, with the same device credentials as chat (so chat verification carries over). The caller creates it, claims key packages for the invited devices and sends Welcomes; axiond, as external sender, proposes Removes when someone leaves or drops.
+- **Per-sender frame keys** come from that group's exporter and change with every epoch (every join or leave). Old epochs' decrypt keys are kept about 10 seconds for frames in flight.
+- **Phase A:** LiveKit's frame encryption (AES-GCM-128, HKDF), keyed `MLS-Exporter("darkmatter call v1 lk", sender leaf index, 16)`. **Phase B:** RFC 9605 SFrame in its MLS mode, with the `sframe` crate.
+- **Never reuse a key and nonce:** never encrypt in an epoch the process didn't freshly enter (after a restart, commit an Update first), and every stream has its own key id.
+- Opus at a constant bitrate, no DTX, no audio-level header extension.
+- The SFU and any relay forward ciphertext they can't decode.
 
-The media details (libraries, the SFU) come from the calls research and get their own design section before M3.
+The full call design gets its own document before M3.
 
 ## 12. New devices, verification and recovery
 
