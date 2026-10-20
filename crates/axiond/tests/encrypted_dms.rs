@@ -377,3 +377,54 @@ async fn edits_reactions_mentions_and_deletes_stay_encrypted() {
     bob.forget_post(&lunch);
     assert!(bob_store.text(&lunch.id).await.is_none());
 }
+
+#[tokio::test]
+async fn a_device_away_for_a_while_reads_its_backlog() {
+    let s = server().await;
+    let alice_store = MemoryStore::default();
+    let (alice_api, alice) = device(&s, "alice", alice_store.clone()).await;
+    let (bob_api, bob) = device(&s, "bob", MemoryStore::default()).await;
+    let dm = alice_api.create_direct(&alice.user_id, &bob.user_id).await.unwrap();
+    let first = send(&alice_api, &alice, &dm.id, "before the trip").await;
+    assert_eq!(text(read(&bob, &first).await), "before the trip");
+
+    // Bob's away. Alice writes more than MLS keeps skipped keys for (20 per
+    // sender, in one epoch), then her device refreshes its key more times
+    // than devices keep old epochs (5): nothing but reading in order gets
+    // it all. (axiond lets someone send 30 at once, so this stays under.)
+    let sent = rounds(&alice_api, &alice, &alice_store, &dm.id, &[22, 0, 0, 0, 0, 0, 0]).await;
+    assert!(alice.device.epoch(&dm.id).unwrap() >= 8);
+
+    // Back: syncing reads what came while away, oldest first. Then it shows
+    // the newest first, as an app opening the conversation would.
+    bob.sync(&dm.id).await.unwrap();
+    for (post, said) in sent.iter().rev() {
+        assert_eq!(&text(read(&bob, post).await), said, "{}", post.id);
+    }
+
+    // Away again, and this time back without a sync: the app's connection
+    // comes back and it opens the conversation at its newest message. The
+    // backlog is read first all the same.
+    let more = rounds(&alice_api, &alice, &alice_store, &dm.id, &[1, 1, 1, 1, 1, 1, 1, 1]).await;
+    bob.reconnected().await;
+    bob.read_in_order(&[&more.last().unwrap().0]).await;
+    for (post, said) in more.iter().rev() {
+        assert_eq!(&text(read(&bob, post).await), said, "{}", post.id);
+    }
+    let _ = bob_api;
+}
+
+/// Alice sends `n` messages, then her device refreshes its key, for each
+/// `n`: one epoch each.
+async fn rounds(api: &Client, e2ee: &E2ee<MemoryStore>, store: &MemoryStore, channel: &str, counts: &[usize]) -> Vec<(Post, String)> {
+    let mut sent = Vec::new();
+    for (round, n) in counts.iter().enumerate() {
+        for i in 0..*n {
+            let said = format!("round {round}, message {i}, {}", sent.len());
+            sent.push((send(api, e2ee, channel, &said).await, said));
+        }
+        store.set(&format!("updated.{channel}"), b"0".to_vec());
+        e2ee.sync(channel).await.unwrap();
+    }
+    sent
+}

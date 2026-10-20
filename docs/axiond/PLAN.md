@@ -437,11 +437,12 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
    - **Deletes:** a deleted post's ciphertext and events go from the server, and devices forget what they kept of it.
    - **Reading in order:** a page of posts is decrypted in the order it was sent: posts, edits and events together.
    - **Per account:** the keys of decrypted files moved into each account's encryption state, the first piece of the [multi-server plan](../darkmatter/MULTI_SERVER.md).
-   - **Found while building, still to do:** reading a long backlog. MLS keeps only 20 skipped message keys per sender, and 5 past epochs. A device that was offline for a while and opens a channel at its newest page decrypts the newest messages first. Older ones that are further back than that then can't be read, and catching up to the latest epoch for a new message skips old epochs' keys. The fix:
-     - fetch what came since the last message read, oldest first;
-     - catch up handshakes only as far as each message's epoch.
-
-     It goes next, before step 8.
+   - **Reading a backlog** *(done 2026-10-20)*: found while building this step. MLS keeps only 20 skipped message keys per sender and 5 past epochs, so a device back from a while away lost messages by reading the newest first or catching up to the latest epoch. Now:
+     - each device notes the newest message it read in each channel;
+     - before decrypting anything newer there, it reads what came since, oldest first: new messages page by page, and edits and reactions on older ones;
+     - this happens once per connection, and again after the connection drops;
+     - catching up for a message stops at that message's epoch;
+     - sending and live handshakes wait for the backlog too.
 8. **Local search** over decrypted messages, merged with the server's results.
 9. **Devices:**
    - linking a new device by QR or code;

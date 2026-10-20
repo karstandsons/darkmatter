@@ -2678,7 +2678,12 @@ impl Chat {
             }
             M::Disconnected => {
                 self.online = false;
-                Task::none()
+                // Messages may come while we're away: encrypted channels read
+                // what they missed, in order, before anything newer.
+                match self.crypto.clone() {
+                    Some(c) => Task::future(async move { c.reconnected().await }).discard(),
+                    None => Task::none(),
+                }
             }
             M::Resync => {
                 // Events were lost: drop cached history and reload the sidebar.

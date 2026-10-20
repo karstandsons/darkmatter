@@ -252,11 +252,14 @@ pub struct E2ee<S> {
     away: bool,
     /// The keys of files in messages read so far, by file id.
     file_keys: Mutex<HashMap<String, FileKey>>,
+    /// Channels whose backlog has been read since connecting; held while
+    /// one is read, so nothing newer is decrypted before it.
+    caught_up: tokio::sync::Mutex<HashSet<String>>,
 }
 
 impl<S: LocalStore> E2ee<S> {
     fn new(api: Client, user_id: &str, device: Device<MemoryStorage>, identity: IdentityKey, server: ServerKey, store: S, saved: HashMap<Vec<u8>, Vec<u8>>) -> Self {
-        E2ee { api, user_id: user_id.into(), device, identity, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false, file_keys: Default::default() }
+        E2ee { api, user_id: user_id.into(), device, identity, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false, file_keys: Default::default(), caught_up: Default::default() }
     }
 
     /// Gives the store whatever openmls changed since the last time.
@@ -375,6 +378,13 @@ impl<S: LocalStore> E2ee<S> {
 
     /// Applies the group's handshakes this device hasn't seen.
     async fn catch_up(&self, channel_id: &str) -> Result<(), String> {
+        self.catch_up_to(channel_id, None).await
+    }
+
+    /// Applies the group's handshakes in order, stopping before any made in
+    /// epoch `until` or later (so the device is at `until`, to read a
+    /// message from then, and keeps older epochs' keys for older ones).
+    async fn catch_up_to(&self, channel_id: &str, until: Option<u64>) -> Result<(), String> {
         let mut keys: Option<Keys> = None;
         loop {
             let cursor = self.cursor(channel_id).await;
@@ -386,6 +396,9 @@ impl<S: LocalStore> E2ee<S> {
                 keys = Some(self.keys(&self.members(channel_id).await?).await?);
             }
             for h in &page {
+                if until.is_some_and(|until| h.epoch >= until) {
+                    return Ok(());
+                }
                 let bytes = B64.decode(&h.data).map_err(s)?;
                 let result = self.process_with_keys(channel_id, &bytes, keys.as_mut().unwrap()).await;
                 self.persist();
@@ -597,6 +610,7 @@ impl<S: LocalStore> E2ee<S> {
     /// device can show it (it can't decrypt its own messages). The app's
     /// `dm_files` go inside; its `dm_mentions` stay beside, for the server.
     pub async fn encrypt_post(&self, post: &NewPost) -> Result<NewPost, String> {
+        self.backlog_first(&post.channel_id).await;
         let _held = self.lock.lock().await;
         self.ready(&post.channel_id).await?;
         let content = Content::Post { message: post.message.clone(), files: files_of(post)? };
@@ -616,6 +630,7 @@ impl<S: LocalStore> E2ee<S> {
     /// Encrypts new text for one of this user's posts (E2EE.md §8), as the
     /// `dm_edit` to send. The text is kept, as for posts.
     pub async fn encrypt_edit(&self, channel_id: &str, post_id: &str, message: &str) -> Result<serde_json::Value, String> {
+        self.backlog_first(channel_id).await;
         let _held = self.lock.lock().await;
         self.ready(channel_id).await?;
         let content = Content::Edit { message: message.into() };
@@ -628,6 +643,7 @@ impl<S: LocalStore> E2ee<S> {
 
     /// Encrypts a reaction added (`on`) or taken back, as an event to send.
     pub async fn encrypt_reaction(&self, channel_id: &str, post_id: &str, emoji: &str, on: bool) -> Result<NewE2eeEvent, String> {
+        self.backlog_first(channel_id).await;
         let _held = self.lock.lock().await;
         self.ready(channel_id).await?;
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
@@ -639,11 +655,94 @@ impl<S: LocalStore> E2ee<S> {
         Ok(NewE2eeEvent { post_id: post_id.into(), client_id, dm_e2ee: serde_json::to_value(&e2ee).map_err(s)? })
     }
 
+    /// Reads everything sent in a channel since the last message this device
+    /// read there, oldest first: new messages page by page, and edits and
+    /// reactions on older ones. MLS keeps only so many keys for messages
+    /// skipped (20 per sender) and for past epochs (5), so a device back
+    /// from a while away must read in order, not newest first.
+    pub async fn read_backlog(&self, channel_id: &str) -> Result<(), String> {
+        let mut caught_up = self.caught_up.lock().await;
+        if caught_up.contains(channel_id) {
+            return Ok(());
+        }
+        self.read_backlog_now(channel_id).await?;
+        caught_up.insert(channel_id.into());
+        Ok(())
+    }
+
+    /// Reads the channel's backlog if it hasn't been yet, before something
+    /// that catches up to the latest epoch (sending, a new handshake) would
+    /// lose older epochs' keys.
+    async fn backlog_first(&self, channel_id: &str) {
+        if self.device.has_group(channel_id)
+            && let Err(e) = self.read_backlog(channel_id).await
+        {
+            tracing::warn!("couldn't read what came in {channel_id} while away: {e}");
+        }
+    }
+
+    /// The connection dropped: messages may have come that this device
+    /// hasn't seen, so each channel's backlog is read again before anything
+    /// newer is decrypted there.
+    pub async fn reconnected(&self) {
+        self.caught_up.lock().await.clear();
+    }
+
+    async fn read_backlog_now(&self, channel_id: &str) -> Result<(), String> {
+        let Some((since, last)) = self.read_cursor(channel_id).await else { return Ok(()) };
+        let mut seen: HashMap<String, Post> = HashMap::new();
+        let mut anchor = last;
+        loop {
+            let page = match self.api.posts(channel_id, mm_api::PostsQuery::After { post_id: anchor.clone(), per_page: 200 }, false).await {
+                Ok(page) => page,
+                // The last one read is gone (deleted): what changed since then still says.
+                Err(e) if not_found(&e) => break,
+                Err(e) => return Err(s(e)),
+            };
+            let Some(newest) = page.order.first().cloned() else { break };
+            let more = page.has_next;
+            seen.extend(page.posts);
+            if !more || newest == anchor {
+                break;
+            }
+            anchor = newest;
+        }
+        // Edits and reactions on messages from before.
+        let changed = self.api.posts(channel_id, mm_api::PostsQuery::Since(since), false).await.map_err(s)?;
+        for (id, post) in changed.posts {
+            seen.entry(id).or_insert(post);
+        }
+        let posts: Vec<&Post> = seen.values().collect();
+        self.read_items(&posts).await;
+        Ok(())
+    }
+
+    /// Where reading a channel got to: the time and id of the newest
+    /// encrypted message read in order.
+    async fn read_cursor(&self, channel_id: &str) -> Option<(i64, String)> {
+        let v = String::from_utf8(self.store.get(&format!("read.{channel_id}")).await?).ok()?;
+        let (at, id) = v.split_once(':')?;
+        Some((at.parse().ok()?, id.to_string()))
+    }
+
     /// Reads posts, their edits and their events in the order they were
     /// sent, so each is decrypted with the keys of its moment (MLS keeps
     /// only a few skipped keys). What's read is kept; [`E2ee::decrypt_post`]
     /// and [`E2ee::reactions`] then find it.
     pub async fn read_in_order(&self, posts: &[&Post]) {
+        // First what came before these, if this device hasn't read it yet.
+        let mut channels: Vec<&str> = posts.iter().filter(|p| p.props.get("dm_e2ee").is_some()).map(|p| p.channel_id.as_str()).collect();
+        channels.sort();
+        channels.dedup();
+        for channel_id in channels {
+            if let Err(e) = self.read_backlog(channel_id).await {
+                tracing::warn!("couldn't read what came in {channel_id} while away: {e}");
+            }
+        }
+        self.read_items(posts).await;
+    }
+
+    async fn read_items(&self, posts: &[&Post]) {
         enum Item<'a> {
             Post(&'a Post),
             Edit(&'a Post, &'a serde_json::Value),
@@ -660,12 +759,34 @@ impl<S: LocalStore> E2ee<S> {
             items.extend(post.metadata.e2ee_events.iter().map(|e| (e.create_at, Item::Event(e))));
         }
         items.sort_by_key(|(at, _)| *at);
+        // Each channel's newest message read here: where reading its backlog
+        // starts next time.
+        let mut newest: HashMap<&str, &Post> = HashMap::new();
+        for (_, item) in &items {
+            if let Item::Post(p) = item {
+                let n = newest.entry(p.channel_id.as_str()).or_insert(p);
+                if (p.create_at, &p.id) > (n.create_at, &n.id) {
+                    *n = p;
+                }
+            }
+        }
         for (_, item) in items {
             match item {
                 Item::Post(post) => drop(self.decrypt_original(post).await),
                 Item::Edit(post, edit) => drop(self.decrypt_edit(post, edit).await),
                 Item::Event(event) => drop(self.decrypt_event(event).await),
             }
+        }
+        for post in newest.into_values() {
+            self.advance_cursor(post).await;
+        }
+    }
+
+    /// Notes `post` as read, if it's newer than any read before in its
+    /// channel.
+    async fn advance_cursor(&self, post: &Post) {
+        if self.read_cursor(&post.channel_id).await.is_none_or(|(at, id)| (post.create_at, &post.id) > (at, &id)) {
+            self.store.set(&format!("read.{}", post.channel_id), format!("{}:{}", post.create_at, post.id).into_bytes());
         }
     }
 
@@ -698,12 +819,16 @@ impl<S: LocalStore> E2ee<S> {
             && let Some(text) = self.text(&format!("pending:{}", post.pending_post_id)).await
         {
             self.keep(&post.id, &post.channel_id, &text);
+            self.advance_cursor(post).await;
             return Decrypted::Text(text);
         }
         let Some((e2ee, ct)) = parse(e2ee) else { return Decrypted::Unreadable("it isn't a message this app understands".into()) };
         let expected = Aad::post(&post.channel_id, &post.root_id, &post.pending_post_id);
         match self.open(&post.id, &post.channel_id, &e2ee, &ct, &post.user_id, &expected).await {
-            Ok(content) => Decrypted::Text(content),
+            Ok(content) => {
+                self.advance_cursor(post).await;
+                Decrypted::Text(content)
+            }
             Err(why) => Decrypted::Unreadable(why),
         }
     }
@@ -788,8 +913,10 @@ impl<S: LocalStore> E2ee<S> {
         if !self.device.has_group(channel_id) || self.joined(channel_id).await.is_some_and(|j| e2ee.epoch < j) {
             return Err(before.into());
         }
+        // Only as far as this message's epoch: a later one would throw
+        // away the keys for messages still unread from before it.
         if self.device.epoch(channel_id).is_ok_and(|e| e2ee.epoch > e)
-            && let Err(e) = self.catch_up(channel_id).await
+            && let Err(e) = self.catch_up_to(channel_id, Some(e2ee.epoch)).await
         {
             tracing::warn!("couldn't catch up on {channel_id}: {e}");
         }
@@ -831,6 +958,9 @@ impl<S: LocalStore> E2ee<S> {
     /// isn't in it yet (a new device), and up to date. Darkmatter calls it
     /// for each encrypted channel when it starts.
     pub async fn sync(&self, channel_id: &str) -> Result<(), String> {
+        // What came while this device was away, in order, before catching
+        // up to the latest epoch would lose older epochs' keys.
+        self.backlog_first(channel_id).await;
         let _held = self.lock.lock().await;
         if !self.device.has_group(channel_id) {
             self.take_welcomes().await?;
@@ -897,6 +1027,7 @@ impl<S: LocalStore> E2ee<S> {
     /// The server's `mls_commit` event: catch up now, so the next message
     /// in a new epoch decrypts without waiting.
     pub async fn on_handshake(&self, channel_id: &str) -> Result<(), String> {
+        self.backlog_first(channel_id).await;
         let _held = self.lock.lock().await;
         if self.device.has_group(channel_id) { self.catch_up(channel_id).await } else { Ok(()) }
     }
