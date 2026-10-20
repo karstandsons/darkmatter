@@ -99,6 +99,8 @@ Every encrypted chat app makes this trade-off. Our answer is to choose **per cha
 
 ## End-to-end encryption
 
+The detailed design (identities, groups, the delivery service, files, mentions, calls, recovery, what a malicious server can do, and the API) is in [E2EE.md](E2EE.md). This section is the summary.
+
 ### Protocol: MLS (RFC 9420) via **openmls**
 
 **Why MLS:**

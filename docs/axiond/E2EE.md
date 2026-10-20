@@ -1,0 +1,269 @@
+# End-to-end encryption: design
+
+**Status: draft, M1 (2026-10-19).** This is the design that M1's features are built around and that M2 implements. It's written to be read and criticised by people outside the project. [PLAN.md](PLAN.md) has the goals and the reasons for MLS; this document says exactly how it works.
+
+Contents:
+1. [Goals and limits](#1-goals-and-limits)
+2. [Building blocks](#2-building-blocks)
+3. [Identities and devices](#3-identities-and-devices)
+4. [Groups](#4-groups)
+5. [The server as delivery service](#5-the-server-as-delivery-service)
+6. [Messages](#6-messages)
+7. [Files](#7-files)
+8. [Reactions, edits, deletes, threads](#8-reactions-edits-deletes-threads)
+9. [Mentions, unreads and notifications](#9-mentions-unreads-and-notifications)
+10. [Search](#10-search)
+11. [Calls](#11-calls)
+12. [New devices, verification and recovery](#12-new-devices-verification-and-recovery)
+13. [Storage on the client](#13-storage-on-the-client)
+14. [What a malicious server can and can't do](#14-what-a-malicious-server-can-and-cant-do)
+15. [API](#15-api)
+16. [Testing](#16-testing)
+17. [What M1 builds because of this](#17-what-m1-builds-because-of-this)
+18. [Open questions](#18-open-questions)
+
+---
+
+## 1. Goals and limits
+
+**Protected:** the content of messages, edits, reactions, files and file names, thumbnails, link previews and calls in encrypted channels. Neither the server operator, the VPS provider, nor anyone who gets a copy of the database or a backup can read them.
+
+**Not protected, and said so in the app:** metadata. The server knows who is in which channel, who sent something when, roughly how big it is, who is in a call and for how long, and which users a message mentions (see [§9](#9-mentions-unreads-and-notifications)).
+
+**Where encryption applies** (from PLAN.md): DMs and group DMs always; private channels by default; public channels when an admin turns it on. Turning it on affects new messages only. Turning it off needs an admin and posts a visible system message, and clients show a warning.
+
+**Rules we hold ourselves to:**
+- **No crypto of our own.** Everything is MLS ([RFC 9420](https://www.rfc-editor.org/rfc/rfc9420)) through openmls, or a named construction from a reviewed crate. Every such choice is listed in [§2](#2-building-blocks).
+- **The server is never trusted for content or for keys.** It's trusted for availability and ordering only, and clients check what they can (see [§14](#14-what-a-malicious-server-can-and-cant-do)).
+- **Everything the server stores for encryption is either public or ciphertext.**
+
+## 2. Building blocks
+
+| Purpose | Choice | Notes |
+|---|---|---|
+| Group key agreement | **MLS** via **openmls 0.9** (MIT) | Library choice confirmed against audit status at the start of M2 (PLAN.md, open question 11). mls-rs is the fallback. |
+| Crypto provider | `openmls_libcrux_crypto` (formally verified primitives), else `openmls_rust_crypto` | Pick the one openmls recommends at M2. |
+| Ciphersuite | `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (0x0001) | The one every MLS implementation must support. A post-quantum suite (an X-Wing KEM) is added once openmls ships it as stable; groups record their suite, so old and new groups can coexist. |
+| User identity key | Ed25519 (`ed25519-dalek`) | Signs device certificates ([§3](#3-identities-and-devices)). |
+| File encryption | XChaCha20-Poly1305 in the **STREAM** construction (`chacha20poly1305` + `aead::stream`, RustCrypto) | Chunked, so big files stream and truncation is detected. |
+| Key derivation | HKDF-SHA256 (`hkdf`) | For deriving backup keys from the recovery key. |
+| Passphrase stretching | argon2id (`argon2`, already used by axiond) | Only for the optional passphrase backup. |
+| Call media | SFrame ([RFC 9605](https://www.rfc-editor.org/rfc/rfc9605)), keys from the MLS exporter | Details in [§11](#11-calls) and the calls research. |
+| Randomness | The OS (`getrandom`) | Nothing seeded by hand. |
+
+Everything above is MIT or Apache-2.0, so it fits the permissive client and the AGPL server.
+
+## 3. Identities and devices
+
+Two layers, like Matrix's cross-signing and Signal's linked devices:
+
+- **A user identity key** (Ed25519), one per user. Its public half is what people verify (safety numbers, QR codes). Its private half lives on the user's devices, and in the encrypted backup if they made one ([§12](#12-new-devices-verification-and-recovery)).
+- **A device**, one per installation of Darkmatter (desktop or phone). Each device has:
+  - a random **device ID** (26 characters, like other IDs), tied to its login session;
+  - an **MLS signature key** (Ed25519), generated on the device and never leaving it;
+  - a **device certificate**: `{user_id, device_id, device_signature_public_key, created_at}` signed by the user identity key.
+
+**MLS credentials** are `BasicCredential`s whose identity is `user_id:device_id`. A client accepts a group member only if:
+1. the server can show a device certificate for that `user_id:device_id`;
+2. the certificate's signature verifies against that user's identity key;
+3. the certificate's signature key matches the member's leaf signature key in the MLS tree;
+4. that identity key is the one this client has seen for the user before (trust on first use), or the one the user verified.
+
+So the server can't add a device of its own making: it has no user identity key to sign one with.
+
+**Changes to a user's identity key** only happen when someone loses every device and has no backup. Clients show a warning in every conversation with that user. **In a conversation where the user was verified, sending is blocked** until the change is accepted. (Signal only warns; the stricter rule fits our priorities. See open question 1.)
+
+**Removing a device** (from the devices page, or because a session is revoked): the user's other device publishes a revocation signed by the identity key, the server stops delivering to the device, and the device is removed from every group ([§4](#4-groups)).
+
+## 4. Groups
+
+- **One MLS group per encrypted channel.** The MLS group ID is the channel ID.
+- **Members are devices, not users.** Every device of every channel member is in the group. A user's own devices are members too, so what you send appears on your other devices.
+- **Handshake messages (proposals, commits) are sent as MLS `PublicMessage`s; application messages as `PrivateMessage`s.**
+  - Handshake messages carry membership changes, which the server knows anyway. Making them public lets the server check them with openmls's `PublicGroup` ([§5](#5-the-server-as-delivery-service)): that commits come from current members, that they're for the current epoch, and that adds are for real members of the channel.
+  - Content is always a `PrivateMessage`.
+- **The server is an MLS "external sender"** (the `external_senders` group extension) with its own signing key. It may propose **Remove** only. Clients reject any other proposal from it. That lets removals happen even when the person who removed someone is offline.
+- **Membership changes:**
+  - **Someone is added** (an invite, or opening a DM): the client making the change claims a key package for each of the new person's devices and commits the Adds. New devices get an MLS `Welcome`.
+  - **Someone joins a public encrypted channel by themselves:** their device joins with an **external commit**, using the group's `GroupInfo` from the server. The server only hands `GroupInfo` to channel members.
+  - **Someone leaves or is removed:** the server proposes Remove for each of their devices. The next member to send anything **must commit pending proposals first** (clients do this automatically), and the server refuses application messages for an epoch that still has pending removals older than a few seconds. In the meantime the server has already stopped delivering to the removed devices.
+  - **A user adds a device:** the new device joins each of the user's groups with an external commit, once it has a device certificate ([§12](#12-new-devices-verification-and-recovery)).
+- **Updates.** Each device commits an update of its own leaf at least every 7 days and after it has been offline for a day, for post-compromise security.
+- **Old epochs.** Clients keep the secrets of the last few epochs (openmls `max_past_epochs`, starting at 5) so messages sent just before a commit still decrypt.
+- **The UI shows membership from the MLS group**, not from the server: "Bob's phone joined" and "Alice removed Carol" come from processed commits. If the server's member list and the group disagree for more than a short while, the channel shows a warning.
+
+## 5. The server as delivery service
+
+axiond takes the MLS **Delivery Service** role. It also uses openmls's `PublicGroup` to track the public state of every encrypted group (the tree and epoch, no secrets).
+
+**Ordering.** Per group, the server keeps a sequence of handshake messages. A commit is accepted only if it's for the group's current epoch and `PublicGroup` validates it. The first valid commit for an epoch wins; others are refused with `409` and the losing client fetches the new commit, re-applies its change and tries again.
+
+**Storage** (all public or ciphertext):
+- each device's **key packages** ([§15](#15-api)): one-time ones plus one last-resort package;
+- per group: the **handshake log** (commits and proposals, in order), the latest **`GroupInfo`**, and pending **`Welcome`s** per device;
+- **device certificates**, revocations and **user identity public keys**;
+- **encrypted backups** ([§12](#12-new-devices-verification-and-recovery));
+- **posts** whose content is ciphertext ([§6](#6-messages)).
+
+**Delivery.** Handshake messages and Welcomes go to devices over the websocket (`mls_commit`, `mls_welcome`) and can be fetched by sequence number after a disconnect. The handshake log is kept for **30 days**. A device that has been away longer re-joins its groups with an external commit; it can't read what was sent while it was away unless it has a history backup.
+
+**What the server checks** (so a buggy or malicious client can't break a group for everyone):
+- the sender of a commit is a current member device, and the device belongs to the logged-in session;
+- every Add is for a device of a user who is a channel member, with a valid certificate;
+- the server's own proposals are only Removes;
+- application messages are for the current epoch (or one of the few before it).
+
+## 6. Messages
+
+An encrypted post uses the normal `POST /api/v4/posts`:
+
+```json
+{
+  "channel_id": "…",
+  "root_id": "…",
+  "message": "",
+  "props": {
+    "dm_e2ee": { "v": 1, "epoch": 42, "ct": "<base64 MLS PrivateMessage>" },
+    "dm_mentions": ["<user id>", "…"]
+  },
+  "file_ids": ["…"],
+  "pending_post_id": "…"
+}
+```
+
+- **`message` is empty.** axiond fills in "🔒 Encrypted message" for any client that doesn't understand `dm_e2ee`, and refuses posts with any other text in an encrypted channel, so plaintext can't slip into an encrypted room.
+- **The MLS plaintext** is a small JSON document:
+
+  ```json
+  { "t": "post", "message": "the text", "files": [ { "id": "…", "key": "…", "name": "…", "type": "…", "size": 0, "sha256": "…", "thumb": { … } } ], "preview": { … } }
+  ```
+
+  Link previews, when the sender has them on, are fetched by the sender's client and travel inside the plaintext.
+- **The MLS authenticated data** (signed but not encrypted) binds the ciphertext to its place: `channel_id`, `root_id`, `pending_post_id` and the kind of event. A server that moves a ciphertext to another channel or thread, or replays it as an edit, is detected.
+- **Server-visible:** channel, thread (`root_id`), sender device, time, ciphertext size, file IDs and sizes, and the mention list.
+- **Padding:** plaintext is padded to a multiple of 256 bytes before encryption (MLS supports padding), so the size reveals less.
+
+## 7. Files
+
+1. The client picks a random 256-bit key and encrypts the file with XChaCha20-Poly1305 STREAM, in 64 KiB chunks.
+2. It uploads the ciphertext with the normal `POST /api/v4/files`, with a neutral file name (`blob`) and type `application/octet-stream`.
+3. For images and video, it makes a thumbnail and preview itself, encrypts them the same way, and uploads them as separate blobs.
+4. The keys, real name, type, size, SHA-256 of the ciphertext, and thumbnail details go inside the encrypted post ([§6](#6-messages)).
+
+The server sees only blob sizes. It never makes thumbnails for these files, and serves them as `application/octet-stream` downloads.
+
+## 8. Reactions, edits, deletes, threads
+
+- **Edits:** `PUT /api/v4/posts/{id}/patch` with a new `dm_e2ee`. The plaintext has `"t": "edit"`, and the authenticated data names the post being edited. Clients accept an edit only from the device's user who wrote the original.
+- **Deletes** stay as they are (`DELETE /api/v4/posts/{id}`). The server deletes the ciphertext. Clients also delete their local copy.
+- **Reactions:** encrypted events through `POST /api/v4/e2ee/channels/{id}/events`, plaintext `{"t":"reaction","post_id":"…","emoji":"…","on":true}`. The server stores them against the post and counts them, but can't see which emoji. Clients show the decrypted reactions. Plain `POST /reactions` is refused in encrypted channels.
+- **Threads:** `root_id` stays visible to the server, so threads, reply counts and the Threads list keep working.
+- **Pinning, saving and read state** are plain operations on post IDs and stay as they are.
+
+## 9. Mentions, unreads and notifications
+
+The server can't read a message, so it can't find @mentions in it. The sender's client does, and lists the mentioned user IDs in `props.dm_mentions` (`@channel`, `@all` and `@here` become a flag). The server uses that for mention counts and notifications.
+
+- **The trade-off:** the server learns who was mentioned, but not what was said. In DMs every message counts as a mention anyway. This is in the metadata list in [§1](#1-goals-and-limits). (Open question 2.)
+- A client can't lie its way into someone else's mention count beyond what any channel member could do by mentioning them.
+- **Unread counts** work as today: they count posts, not content.
+- **Push notifications** on phones (M4) carry no content: the phone wakes, fetches the post by ID, decrypts it and shows the text itself.
+
+## 10. Search
+
+The server's search (FTS5) never sees encrypted content and skips encrypted channels. Each client keeps a **local search index** of what it has decrypted, in its encrypted local database ([§13](#13-storage-on-the-client)). Searching shows server results for plain channels and local results for encrypted ones, merged.
+
+## 11. Calls
+
+Calls in encrypted channels are encrypted end to end with **SFrame**:
+- The base key comes from the channel's MLS group: `export_secret("darkmatter call", call_id ‖ epoch, 32)`.
+- Each participant derives its own sending key from that base key, as RFC 9605 describes for MLS.
+- When the group's epoch changes (someone joins or leaves), keys rotate. Someone removed from the group can't derive the next key.
+- The SFU and TURN relay in axiond forward media they can't decode.
+
+The media details (libraries, the SFU) come from the calls research and get their own design section before M3.
+
+## 12. New devices, verification and recovery
+
+**Linking a new device.** The new device logs in, generates its keys and shows a short code and a QR code. One of the user's existing devices scans it or types the code, sees the new device's name and key fingerprint, and approves. Approval means the existing device signs the new device's certificate and sends the identity key to it, encrypted to the new device inside a one-off MLS group between the two. The new device then joins the user's groups by external commit.
+
+**Recovery.** At first setup, Darkmatter offers a **recovery key**: 128 random bits shown once as 24 words (or a code to print). From it, HKDF derives a backup key that encrypts:
+- the user identity key (so a lost-every-device user can sign a new device without breaking everyone's verification);
+- later, an optional **history backup**: the device's decrypted messages, uploaded encrypted in chunks.
+
+The server stores only the ciphertext. A passphrase can be used instead of a recovery key, stretched with argon2id with strong settings, but the app recommends the recovery key.
+
+**With no recovery key and no device left,** the user makes a new identity key. Everyone sees the warning from [§3](#3-identities-and-devices), and the new devices see only messages from then on.
+
+**Verification.**
+- A **safety number** for each pair of users: 60 digits computed from both identity keys (the same idea as Signal's), compared in person or over a call.
+- A **QR code** for in-person verification.
+- Verified users show a mark. A changed identity key removes it and shows the warning.
+
+## 13. Storage on the client
+
+Encrypted chat needs Darkmatter to keep state on disk, which it doesn't today:
+- the MLS state (`openmls_sqlx_storage`, SQLite);
+- decrypted messages and the local search index;
+- verification state and known identity keys.
+
+**One local SQLite database per account**, encrypted at rest with **SQLCipher**, with its key in the OS keychain (the `keyring` crate, as sessions already use). The file is readable only by the user. This database is also the base for the offline outbox and cache that M1's reliability work and M4's phones need.
+
+## 14. What a malicious server can and can't do
+
+| Attack | Result |
+|---|---|
+| Read messages, files, reactions, call media | **Can't.** It has only ciphertext. |
+| Add a device or user of its own to a group | **Can't** without a user identity key to sign a device certificate. Clients reject unsigned devices. It can't make Add proposals (Remove only). |
+| Swap a user's identity key | **Detected.** Warning in every conversation; sending blocked where the user was verified. Unverified first contact is trust on first use, as in Signal. |
+| Move a message to another channel or thread, or replay it | **Detected** through the authenticated data ([§6](#6-messages)). |
+| Drop, delay or reorder messages | **Possible.** MLS detects gaps within an epoch, and clients show "some messages couldn't be delivered". Availability needs a server we run ourselves. |
+| Withhold a commit from some members (fork the group) | **Detected** when the forks next meet: epochs and tree hashes won't match. Clients show a warning and recover (openmls fork resolution). |
+| Keep a removed member's device | It can keep *delivering* to it, but the device can't decrypt anything after the next commit, which members make before sending. |
+| See metadata | **Yes:** membership, timing, sizes, mentions, call participation ([§1](#1-goals-and-limits)). |
+| Serve a modified Darkmatter | **Not via the server.** Darkmatter is a signed native app from our releases, unlike web apps delivered by the server. |
+
+## 15. API
+
+All new paths are under `/api/v4/e2ee/`; the existing posts, files and channels APIs carry the rest. Websocket events: `mls_commit`, `mls_welcome`, `e2ee_event`, `device_added`, `device_removed`, `identity_changed`.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET e2ee/config` | Server capabilities, ciphersuites, the server's external sender key. Darkmatter uses this to tell axiond from plain Mattermost. |
+| `PUT e2ee/identity` | Publish the user identity public key (first device, or after a reset). |
+| `GET e2ee/users/{id}/identity` | A user's identity key, device certificates and revocations. |
+| `POST e2ee/devices` / `DELETE e2ee/devices/{id}` | Publish a device certificate; publish a signed revocation. |
+| `POST e2ee/key_packages` | Upload key packages for this device. |
+| `POST e2ee/key_packages/claim` | Claim one key package per device for a list of users. |
+| `GET e2ee/channels/{id}/group_info` | The latest `GroupInfo`, for external commits. Members only. |
+| `POST e2ee/channels/{id}/handshake` | Send a commit (with its Welcomes and the new `GroupInfo`). `409` if the epoch moved on. |
+| `GET e2ee/channels/{id}/handshake?after=` | Fetch handshake messages after a sequence number. |
+| `GET e2ee/welcomes` | Pending Welcomes for this device. |
+| `POST e2ee/channels/{id}/events` | Encrypted reactions and other small events. |
+| `PUT e2ee/backup` / `GET e2ee/backup` | The encrypted identity-key and history backup. |
+
+## 16. Testing
+
+From PLAN.md's [review section](PLAN.md#review-without-a-paid-audit-decided-2026-10-19), made specific:
+- openmls's RFC 9420 test vectors run in our CI against the version we pin.
+- **Property tests** over random sequences of adds, removes, updates, sends, and devices going offline and coming back, checking every device ends up in the same epoch and decrypts every message it should, and none it shouldn't.
+- **A malicious-server test harness:** a test axiond that drops, reorders, replays, moves and forges messages and key material, checking each attack in [§14](#14-what-a-malicious-server-can-and-cant-do) is refused or detected.
+- **Fuzzing** (`cargo-fuzz`) of everything that parses data from the network: `dm_e2ee`, the plaintext JSON, device certificates, backups, file chunks.
+- **Cross-platform:** `dm-crypto` builds and its tests pass for `aarch64-apple-ios` and `aarch64-linux-android` in CI from the start.
+
+## 17. What M1 builds because of this
+
+Built now, so M2 doesn't redo it:
+- **Device IDs on sessions** (the column exists since M0): every login gets one, and the sessions page shows them.
+- **Files are stored as opaque blobs** under random IDs and served as downloads; thumbnails are optional per file, so encrypted files without server thumbnails just work.
+- **Search skips channels flagged `encrypted`**, and the client merges results from more than one source.
+- **Reactions and mentions** go through code paths that can take a different source later (`e2ee/events`, `dm_mentions`).
+- **Darkmatter's local database** (SQLCipher, keychain key) arrives with the offline outbox, so M2 adds MLS tables rather than a new storage layer.
+- **`GET e2ee/config`** answers with `{"enabled": false}`, so Darkmatter's server detection is in place.
+
+## 18. Open questions
+
+1. **Identity key changes in verified conversations:** block sending until accepted (proposed), or warn only, as Signal does?
+2. **Mentions:** OK for the server to learn who was mentioned in encrypted channels (proposed), or should clients work out their own mentions and the server notify everyone on every message?
+3. **History backup:** worth building in M2, or start with "new devices see messages from when they join" and add it later?
+4. **Recovery key vs passphrase:** offer both (proposed), or recovery key only?
