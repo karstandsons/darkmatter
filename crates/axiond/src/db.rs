@@ -4,7 +4,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use mm_api::models::{Channel, ChannelMember, ChannelType, Post, Team, User};
+use mm_api::models::{Channel, ChannelMember, ChannelType, Post, Reaction, Team, User};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
@@ -280,7 +280,32 @@ pub async fn in_team(db: &Db, team_id: &str, user_id: &str) -> sqlx::Result<bool
     Ok(n > 0)
 }
 
+/// A post with its reactions.
 pub async fn post(db: &Db, id: &str) -> sqlx::Result<Option<Post>> {
     let sql = format!("SELECT {POST_COLUMNS} FROM posts p WHERE p.id = ?");
-    Ok(sqlx::query_as::<_, PostRow>(&sql).bind(id).fetch_optional(db).await?.map(Into::into))
+    let Some(row) = sqlx::query_as::<_, PostRow>(&sql).bind(id).fetch_optional(db).await? else { return Ok(None) };
+    let mut posts = vec![row.into()];
+    with_reactions(db, &mut posts).await?;
+    Ok(posts.pop())
+}
+
+/// Fills in `metadata.reactions`, oldest first, as Mattermost sends them.
+pub async fn with_reactions(db: &Db, posts: &mut [Post]) -> sqlx::Result<()> {
+    if posts.is_empty() {
+        return Ok(());
+    }
+    let ids = serde_json::to_string(&posts.iter().map(|p| &p.id).collect::<Vec<_>>()).unwrap_or_default();
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT post_id, user_id, emoji_name, create_at FROM reactions \
+         WHERE post_id IN (SELECT value FROM json_each(?1)) ORDER BY create_at, user_id",
+    )
+    .bind(ids)
+    .fetch_all(db)
+    .await?;
+    for (post_id, user_id, emoji_name, create_at) in rows {
+        if let Some(post) = posts.iter_mut().find(|p| p.id == post_id) {
+            post.metadata.reactions.push(Reaction { user_id, post_id, emoji_name, create_at });
+        }
+    }
+    Ok(())
 }

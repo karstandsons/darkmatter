@@ -2,6 +2,8 @@
 
 mod channels;
 mod posts;
+mod reactions;
+mod threads;
 mod users;
 mod ws;
 
@@ -30,7 +32,13 @@ pub fn router(app: App) -> Router {
         .route("/users/me/teams", get(users::my_teams))
         .route("/users/me/teams/{team}/channels", get(channels::mine))
         .route("/users/me/teams/{team}/channels/members", get(channels::my_members))
-        .route("/users/me/teams/{team}/threads", get(users::threads))
+        .route("/users/me/teams/{team}/threads", get(threads::list))
+        .route("/users/me/teams/{team}/threads/{thread}/read/{at}", put(threads::read))
+        .route("/users/me/teams/{team}/threads/{thread}/following", put(threads::follow).delete(threads::unfollow))
+        .route("/users/{user}/posts/{post}/set_unread", post(posts::set_unread))
+        .route("/users/{user}/posts/{post}/reactions/{emoji}", delete(reactions::remove))
+        .route("/reactions", post(reactions::add))
+        .route("/posts/{id}/reactions", get(reactions::of_post))
         .route("/teams/{team}/channels/search", post(channels::search))
         .route("/teams/{team}/commands/autocomplete_suggestions", get(no_commands))
         .route("/channels/direct", post(channels::direct))

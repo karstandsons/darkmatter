@@ -46,6 +46,17 @@ impl Event {
         self
     }
 
+    /// Meant for one user (their other apps, say).
+    pub fn user(mut self, user_id: &str) -> Self {
+        self.broadcast.user_id = user_id.into();
+        self
+    }
+
+    pub fn team(mut self, team_id: &str) -> Self {
+        self.broadcast.team_id = team_id.into();
+        self
+    }
+
     fn frame(&self, seq: i64) -> Arc<str> {
         json!({ "event": self.name, "data": self.data, "broadcast": self.broadcast, "seq": seq }).to_string().into()
     }

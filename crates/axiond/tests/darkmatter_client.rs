@@ -114,6 +114,8 @@ async fn login_bootstrap_and_chat() {
         .await
         .unwrap();
     assert!(matches!(next_event(&mut events).await, Event::Posted { post: p, .. } if p.root_id == post.id));
+    // Replying follows the thread.
+    assert!(matches!(next_event(&mut events).await, Event::ThreadUpdated(t) if t.id == post.id && t.unread_replies == 0));
     let thread = alice.thread(&reply.id).await.unwrap();
     assert_eq!(thread.order, [reply.id.clone(), post.id.clone()]);
     assert_eq!(thread.posts[&post.id].reply_count, 1);
@@ -204,4 +206,75 @@ async fn paging_direct_messages_and_channels() {
     bob.logout().await.unwrap();
     assert!(Client::new(&s.url).unwrap().with_token(token).me().await.unwrap_err().is_unauthorized());
     assert!(alice.me().await.is_ok());
+}
+
+#[tokio::test]
+async fn reactions_threads_and_unread() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let rust = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "rust").unwrap().id;
+    let post = |c: &Client, message: &str, root: &str| {
+        let new = NewPost { channel_id: rust.clone(), message: message.into(), root_id: root.into(), ..Default::default() };
+        let c = c.clone();
+        async move { c.create_post(&new).await.unwrap() }
+    };
+
+    // Reactions: added once, shown on the post, and sent live.
+    let root = post(&alice, "lunch?", "").await;
+    let mut alice_events = ws::connect(&alice).unwrap();
+    assert!(matches!(alice_events.next().await, Some(Message::Connected { .. })));
+    let r = bob.add_reaction(&bob_id, &root.id, "+1").await.unwrap();
+    assert_eq!((r.emoji_name.as_str(), r.user_id.as_str()), ("+1", bob_id.as_str()));
+    bob.add_reaction(&bob_id, &root.id, "+1").await.unwrap();
+    match next_event(&mut alice_events).await {
+        Event::ReactionAdded(r) => assert_eq!((r.post_id, r.emoji_name), (root.id.clone(), "+1".into())),
+        e => panic!("expected a reaction, got {e:?}"),
+    }
+    let thread = alice.thread(&root.id).await.unwrap();
+    assert_eq!(thread.posts[&root.id].metadata.reactions.len(), 1);
+    assert!(bob.add_reaction(&alice_id, &root.id, "smile").await.is_err(), "can't react as someone else");
+    assert!(bob.add_reaction(&bob_id, &root.id, "Not An Emoji").await.is_err());
+    bob.remove_reaction(&bob_id, &root.id, "+1").await.unwrap();
+    assert!(matches!(next_event(&mut alice_events).await, Event::ReactionRemoved(_)));
+    let page = alice.posts(&rust, PostsQuery::Page { page: 0, per_page: 10 }, true).await.unwrap();
+    assert!(page.posts[&root.id].metadata.reactions.is_empty());
+
+    // Bob replies and mentions nobody: Alice follows her thread and has an unread reply.
+    post(&bob, "yes, noon", &root.id).await;
+    loop {
+        match next_event(&mut alice_events).await {
+            Event::ThreadUpdated(t) => {
+                assert_eq!((t.id.as_str(), t.reply_count, t.unread_replies), (root.id.as_str(), 1, 1));
+                assert_eq!(t.participants.iter().map(|u| u.username.as_str()).collect::<Vec<_>>(), ["alice", "bob"]);
+                break;
+            }
+            Event::Posted { .. } => continue,
+            e => panic!("expected the thread update, got {e:?}"),
+        }
+    }
+    let threads = alice.user_threads(&team).await.unwrap();
+    assert_eq!((threads.total, threads.total_unread_threads, threads.total_unread_mentions), (1, 1, 0));
+    assert!(bob.user_threads(&team).await.unwrap().threads[0].unread_replies == 0, "your own reply is read");
+
+    // A mention in the thread counts for Alice, and reading clears it.
+    let mention = post(&bob, "@alice bring cake", &root.id).await;
+    let t = &alice.user_threads(&team).await.unwrap().threads[0];
+    assert_eq!((t.unread_replies, t.unread_mentions), (2, 1));
+    alice.mark_thread_read(&team, &root.id, mention.create_at).await.unwrap();
+    let t = &alice.user_threads(&team).await.unwrap().threads[0];
+    assert_eq!((t.unread_replies, t.unread_mentions, t.last_viewed_at), (0, 0, mention.create_at));
+
+    // "Mark as unread" from the mention: two messages unread, one a mention.
+    alice.view_channel(&rust, None).await.unwrap();
+    let unread = alice.set_unread(&alice_id, &mention.id).await.unwrap();
+    let ch = alice.channel(&rust).await.unwrap();
+    assert_eq!((ch.total_msg_count - unread.msg_count, unread.mention_count), (1, 1));
+    let member = alice.my_channel_members(&team).await.unwrap().into_iter().find(|m| m.channel_id == rust).unwrap();
+    assert_eq!((member.unread_count(&ch), member.mention_count), (1, 1));
+    let from_root = alice.set_unread(&alice_id, &root.id).await.unwrap();
+    assert_eq!((ch.total_msg_count - from_root.msg_count, ch.total_msg_count_root - from_root.msg_count_root), (3, 1));
+    assert!(bob.set_unread(&alice_id, &root.id).await.is_err(), "only for yourself");
 }

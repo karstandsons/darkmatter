@@ -1,7 +1,7 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue};
-use mm_api::models::{Status, Team, User, UserThreads};
+use mm_api::models::{Status, Team, User};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -137,9 +137,4 @@ pub async fn my_teams(State(app): State<App>, me: Me) -> Result<Json<Vec<Team>>>
     .fetch_all(&app.db)
     .await?;
     Ok(Json(rows.into_iter().map(Into::into).collect()))
-}
-
-/// Followed threads come later; an empty list keeps the Threads view working.
-pub async fn threads(_: Me, Path(_team): Path<String>) -> Json<UserThreads> {
-    Json(UserThreads::default())
 }

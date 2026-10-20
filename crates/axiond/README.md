@@ -13,9 +13,11 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
   before it can try again, and the wait doubles with each try.
 - Teams, public channels and direct messages: joining, leaving, and finding
   channels by name.
-- Messages: posting, threads, editing and deleting.
-- Unread counts and mentions (`@name`, `@channel`, `@all`, `@here`), and
-  marking a channel read.
+- Messages: posting, threads, editing, deleting and reactions.
+- The Threads list: you follow a thread when you start it, reply or are
+  mentioned, with unread replies and mentions per thread.
+- Unread counts and mentions (`@name`, `@channel`, `@all`, `@here`),
+  marking a channel read, and "mark as unread".
 - Live events, so new posts, edits, deletes, typing and read changes show up
   in Darkmatter as they happen. After a dropped connection, Darkmatter picks
   up where it left off.
@@ -24,10 +26,8 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
 Anything else Darkmatter asks for gets a clear "axiond doesn't support that
 yet". That includes:
 - files and pictures;
-- reactions;
 - search;
 - custom emoji;
-- the Threads list;
 - slash commands on the server;
 - invites;
 - TLS.
