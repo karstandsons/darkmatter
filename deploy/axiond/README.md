@@ -7,36 +7,76 @@ Pebble (Let's Encrypt's test server) in place of Let's Encrypt, run
 
 ## 1. The server
 
-- **Size:** 2 vCPU and 2–4 GB of memory is plenty for chat. For calls later
-  (M3), monthly traffic matters more than CPU: a 20-person video call sends
-  about 50 GB an hour. A plan with 20 TB included (Hetzner EU, for example)
-  covers about 400 such hours a month; a 1 TB plan about 20.
-- **System:** Debian 13 or Ubuntu 24.04, with automatic security updates.
-- **A name:** point an A (and AAAA) record such as `chat.example.com` at the
-  server before the first start.
+Any provider and any domain will do. axiond runs in a container, so all it
+needs is a Linux machine with Docker and a name pointing at it.
+
+- **Size:** the smallest plans work: 1 vCPU and 1 GB of memory runs a
+  group's chat, and builds axiond in about 8 minutes (5 with 2 vCPU and
+  2 GB). With less memory, add swap first (`preflight.sh` says how). x86_64
+  and arm64 both work.
+- **Traffic, for calls later (M3):** monthly traffic matters more than CPU.
+  A 20-person video call sends about 50 GB an hour, so a plan with 20 TB a
+  month covers about 400 such hours, and 1 TB about 20. Plans differ a lot
+  here, so check before choosing.
+- **Address:** a public IPv4 address. IPv6 as well is good. IPv6 alone
+  isn't enough, because people on IPv4-only networks couldn't reach it.
+- **System:** any current Linux that Docker supports. The commands below are
+  for Debian/Ubuntu and for Fedora/Rocky/Alma.
+- **A name:** any domain or subdomain you control, at any registrar or DNS
+  host, such as `chat.example.com`. A free dynamic-DNS name works too, as long
+  as you can point it at the server. Add an A record (and an AAAA record if
+  the server has IPv6) with the server's public address, before the first
+  start.
+- **The provider's firewall:** many providers have one in their control
+  panel, outside the server (AWS, Google Cloud, Azure and Oracle always do;
+  DigitalOcean and Hetzner optionally). Allow 22/tcp and 443/tcp in there as
+  well, or Let's Encrypt can't reach the server.
 
 ## 2. Lock it down
+
+Install Docker first, from Docker's own repository
+(https://docs.docker.com/engine/install/), so its group exists.
 
 Each admin gets their own login with their own SSH key. Nobody shares one.
 
 ```sh
 # As root, once per admin:
-adduser --disabled-password alex && usermod -aG sudo,docker alex
+#   Debian/Ubuntu:
+adduser --disabled-password --gecos '' alex && usermod -aG sudo,docker alex
+#   Fedora/Rocky/Alma:
+useradd -m -G wheel,docker alex
+# Then, on either:
 install -d -m 700 -o alex -g alex /home/alex/.ssh
 # put alex's public key in /home/alex/.ssh/authorized_keys (mode 600, owned by alex)
+```
 
-# SSH: keys only, no root.
+Check you can log in as each admin with their key **before** the next step,
+which turns off passwords and root logins:
+
+```sh
 printf 'PasswordAuthentication no\nPermitRootLogin no\n' > /etc/ssh/sshd_config.d/10-axiond.conf
-systemctl reload ssh
+systemctl reload ssh 2>/dev/null || systemctl reload sshd
+```
 
-# Firewall: SSH and HTTPS only. (Calls will add 443/udp.)
+A firewall that lets in only SSH and HTTPS (calls will add 443/udp), and
+security updates installed automatically:
+
+```sh
+#   Debian/Ubuntu:
 apt install -y ufw unattended-upgrades
 ufw allow OpenSSH && ufw allow 443/tcp && ufw enable
 dpkg-reconfigure -plow unattended-upgrades
+#   Fedora/Rocky/Alma:
+dnf install -y firewalld dnf-automatic
+systemctl enable --now firewalld
+firewall-cmd --permanent --add-service=ssh --add-service=https && firewall-cmd --reload
+printf '[commands]\napply_updates = yes\n' > /etc/dnf/automatic.conf
+systemctl enable --now dnf-automatic.timer
 ```
 
-Then install Docker from Docker's own repository
-(https://docs.docker.com/engine/install/).
+Docker opens the ports it publishes past these firewalls. That's why
+`compose.yaml` publishes 443 only (and the Caddy variant binds to
+127.0.0.1).
 
 ## 3. Start axiond
 
@@ -44,6 +84,7 @@ Then install Docker from Docker's own repository
 sudo git clone <this repository> /opt/axiond && cd /opt/axiond/deploy/axiond
 cp .env.example .env && $EDITOR .env          # your domain and email
 sudo install -d -o 65532 -g 65532 -m 0700 data
+./preflight.sh                                # checks all of the above
 docker compose up -d --build
 docker compose logs -f                        # watch for the certificate
 ```
@@ -78,10 +119,10 @@ axiond backs itself up every day into `data/backups` and keeps a week. That
 doesn't survive losing the VPS, so copy them off, encrypted, with restic:
 
 ```sh
-sudo apt install -y restic
+sudo apt install -y restic        # or: sudo dnf install -y restic (Rocky/Alma: from EPEL)
 sudo install -m 600 /dev/null /etc/axiond-backup.env
 sudo $EDITOR /etc/axiond-backup.env
-#   RESTIC_REPOSITORY=s3:https://<bucket endpoint>/axiond   (B2, R2, S3, or sftp:…)
+#   RESTIC_REPOSITORY=s3:https://<bucket endpoint>/axiond   (any S3-compatible storage, or sftp:user@host:/path, or rest:…)
 #   RESTIC_PASSWORD_FILE=/etc/axiond-restic-password
 #   AWS_ACCESS_KEY_ID=…  AWS_SECRET_ACCESS_KEY=…
 sudo sh -c 'head -c 32 /dev/urandom | base64 > /etc/axiond-restic-password && chmod 600 /etc/axiond-restic-password'

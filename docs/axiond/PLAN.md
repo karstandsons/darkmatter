@@ -404,6 +404,7 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
   - HTTP/2 with Let's Encrypt certificates;
   - admins added from the command line were missing from the audit log;
   - queued messages were drawn under the previous person's name.
+- **Any provider, any domain:** the kit doesn't assume either. The README covers Debian/Ubuntu and Fedora/Rocky/Alma (the commands were tried in each), provider firewalls, and IPv4/IPv6. `preflight.sh` checks a server before the first start: Docker, `.env`, the data folder, port 443, memory, the domain's DNS, and reaching Let's Encrypt. axiond builds on a 1 GB, 1 vCPU machine (8 minutes).
 - **Not checked yet:** Let's Encrypt itself with a real domain, and the release workflow's first run (arm64 under emulation). The two of you running it on a VPS is the real test of M1.
 
 **Order note:** the **wire format and API reserve space for E2EE from M0**: `props.dm_e2ee`, device IDs on sessions, and an `encrypted` flag on channels. That way M2 doesn't need a migration of the data model.
