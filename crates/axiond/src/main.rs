@@ -161,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Changed {username}'s password and signed them out everywhere.");
             Ok(())
         }
-        Command::Ping => ping(config.listen).await,
+        Command::Ping => ping(&config).await,
         Command::User(UserCommand::Picture { username, file }) => {
             let app = App::open(config).await?;
             let bytes = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
@@ -231,18 +231,43 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// `GET /api/v4/system/ping` on the server's own port; fails unless it says 200.
-async fn ping(mut addr: std::net::SocketAddr) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// `GET /api/v4/system/ping` on the server's own port (over HTTPS if it
+/// serves HTTPS, checking the certificate); fails unless it says 200.
+async fn ping(config: &Config) -> anyhow::Result<()> {
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    async fn ask<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, host: &str) -> anyhow::Result<String> {
+        stream.write_all(format!("GET /api/v4/system/ping HTTP/1.0\r\nHost: {host}\r\n\r\n").as_bytes()).await?;
+        let mut reply = Vec::new();
+        // A TLS server may close without a goodbye; what arrived counts.
+        let _ = stream.read_to_end(&mut reply).await;
+        Ok(String::from_utf8_lossy(&reply).into_owned())
+    }
+    let mut addr = config.listen;
     if addr.ip().is_unspecified() {
         addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
     }
+    let tls = config.tls()?;
     let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let mut stream = tokio::net::TcpStream::connect(addr).await?;
-        stream.write_all(b"GET /api/v4/system/ping HTTP/1.0\r\nHost: localhost\r\n\r\n").await?;
-        let mut reply = String::new();
-        stream.read_to_string(&mut reply).await?;
-        anyhow::Ok(reply)
+        let stream = tokio::net::TcpStream::connect(addr).await?;
+        let Some(host) = (match &tls {
+            axiond::config::Tls::None => None,
+            _ => Some(config.domain.clone().unwrap_or_else(|| "localhost".into())),
+        }) else {
+            return ask(stream, "localhost").await;
+        };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        // Our own certificate files are trusted as given (they may be self-signed).
+        if let axiond::config::Tls::Files(cert, _) = &tls {
+            use rustls_pki_types::pem::PemObject;
+            for c in rustls_pki_types::CertificateDer::pem_file_iter(cert)? {
+                roots.add(c?)?;
+            }
+        }
+        let client = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let name = rustls_pki_types::ServerName::try_from(host.clone())?;
+        let stream = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client)).connect(name, stream).await?;
+        ask(stream, &host).await
     })
     .await??;
     if !reply.starts_with("HTTP/1.0 200") && !reply.starts_with("HTTP/1.1 200") {

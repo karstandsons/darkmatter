@@ -51,10 +51,7 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
   `/kick`, `/mute` and `/help`, with completion as you type.
 
 Anything else Darkmatter asks for gets a clear "axiond doesn't support that
-yet". That includes:
-- TLS.
-
-These come in M1.
+yet".
 
 ## Run it
 
@@ -84,16 +81,34 @@ Settings live in `axiond.toml` (in the working directory, or pass
 | `behind_proxy` | `AXIOND_BEHIND_PROXY` | `false` | A TLS proxy is in front |
 | `site_name` | `AXIOND_SITE_NAME` | `axiond` | The name apps show |
 | `max_file_mb` | `AXIOND_MAX_FILE_MB` | `100` | The largest upload, in MB |
+| `domain` | `AXIOND_DOMAIN` | | Serve HTTPS for this domain, with a Let's Encrypt certificate |
+| `acme_email` | `AXIOND_ACME_EMAIL` | | Where Let's Encrypt sends certificate notices |
+| `acme_staging` | `AXIOND_ACME_STAGING` | `false` | Use Let's Encrypt's test service |
+| `tls_cert`, `tls_key` | `AXIOND_TLS_CERT`, `AXIOND_TLS_KEY` | | Serve HTTPS with your own PEM files |
 
-axiond doesn't serve TLS yet, so it **refuses to listen anywhere but
-localhost** unless `behind_proxy` is on. Never send passwords over plain HTTP
-across a network. Put Caddy (or Traefik, or nginx) in front, for example:
+### HTTPS
 
-```
-chat.example.com {
-    reverse_proxy 127.0.0.1:8065
-}
-```
+axiond **refuses to serve plain HTTP anywhere but localhost**: passwords and
+messages would cross the network readable. Choose one:
+
+- **Let's Encrypt, built in:** set `domain` and listen on port 443
+  (`listen = "0.0.0.0:443"`). axiond gets its certificate itself (TLS-ALPN-01,
+  so only port 443 needs to be open) and renews it. The certificate is kept
+  in `data_dir/acme`. Try `acme_staging = true` first: Let's Encrypt limits
+  how often you can ask for real certificates. (Not yet tried against a real
+  domain; please report how it goes.)
+- **Your own certificate:** set `tls_cert` and `tls_key`.
+- **A proxy in front** (Caddy, Traefik, nginx) with `behind_proxy = true`.
+  With Caddy:
+
+  ```
+  chat.example.com {
+      reverse_proxy 127.0.0.1:8065
+  }
+  ```
+
+Either way, responses carry `Strict-Transport-Security`, so apps and browsers
+never fall back to plain HTTP.
 
 `AXIOND_LOG=axiond=debug` logs more. Logs never include message text.
 

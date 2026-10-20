@@ -88,10 +88,18 @@ pub fn router(app: App) -> Router {
         .route("/emoji/{id}/image", get(images::emoji_image))
         .route("/websocket", get(ws::websocket))
         .fallback(not_yet);
-    Router::new()
-        .nest("/api/v4", api)
-        .layer(axum::middleware::from_fn_with_state(app.clone(), crate::limits::by_address))
-        .with_state(app)
+    let https = app.config.behind_proxy || !matches!(app.config.tls(), Ok(crate::config::Tls::None));
+    let router = Router::new().nest("/api/v4", api).layer(axum::middleware::from_fn_with_state(app.clone(), crate::limits::by_address));
+    // Once a server is on HTTPS, browsers and apps should never try plain HTTP.
+    let router = if https {
+        router.layer(axum::middleware::map_response(|mut r: axum::response::Response| async move {
+            r.headers_mut().insert("strict-transport-security", axum::http::HeaderValue::from_static("max-age=31536000"));
+            r
+        }))
+    } else {
+        router
+    };
+    router.with_state(app)
 }
 
 /// What end-to-end encryption this server offers. Darkmatter uses it to

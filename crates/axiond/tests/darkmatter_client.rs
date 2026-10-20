@@ -780,3 +780,53 @@ async fn rate_limits() {
     }
     assert!(refused > 0);
 }
+
+#[tokio::test]
+async fn https_with_certificate_files() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let certs = tempfile::tempdir().unwrap();
+    let made = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let (cert, key) = (certs.path().join("cert.pem"), certs.path().join("key.pem"));
+    std::fs::write(&cert, made.cert.pem()).unwrap();
+    std::fs::write(&key, made.signing_key.serialize_pem()).unwrap();
+    let (c2, k2) = (cert.clone(), key.clone());
+    let s = server_with(move |c| {
+        c.tls_cert = Some(c2);
+        c.tls_key = Some(k2);
+    })
+    .await;
+    let addr = s.url.trim_start_matches("http://").to_string();
+
+    // HTTPS answers, and says to stay on HTTPS.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(made.cert.der().clone()).unwrap();
+    let client = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    let mut tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client)).connect(name, tcp).await.unwrap();
+    tls.write_all(b"GET /api/v4/system/ping HTTP/1.0\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let mut reply = Vec::new();
+    let _ = tls.read_to_end(&mut reply).await;
+    let reply = String::from_utf8_lossy(&reply).to_lowercase();
+    assert!(reply.starts_with("http/1.0 200") || reply.starts_with("http/1.1 200"), "{reply}");
+    assert!(reply.contains("strict-transport-security: max-age=31536000"));
+
+    // Plain HTTP on the same port gets nothing useful.
+    let mut plain = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    plain.write_all(b"GET /api/v4/system/ping HTTP/1.0\r\n\r\n").await.unwrap();
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), plain.read_to_end(&mut got)).await;
+    assert!(!String::from_utf8_lossy(&got).contains("200 OK"));
+
+    // `axiond ping` (the health check) speaks HTTPS and checks the certificate.
+    let ping = tokio::process::Command::new(env!("CARGO_BIN_EXE_axiond"))
+        .arg("ping")
+        .env("AXIOND_LISTEN", &addr)
+        .env("AXIOND_TLS_CERT", &cert)
+        .env("AXIOND_TLS_KEY", &key)
+        .output()
+        .await
+        .unwrap();
+    assert!(ping.status.success(), "{}", String::from_utf8_lossy(&ping.stderr));
+}

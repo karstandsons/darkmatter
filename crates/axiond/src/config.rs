@@ -9,8 +9,8 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Where to listen. Anything but localhost needs `behind_proxy` until
-    /// axiond serves TLS itself.
+    /// Where to listen. Anything but localhost needs TLS: `domain`, the
+    /// `tls_cert` and `tls_key` files, or `behind_proxy`.
     pub listen: SocketAddr,
     /// The database and uploaded files.
     pub data_dir: PathBuf,
@@ -20,6 +20,18 @@ pub struct Config {
     pub site_name: String,
     /// The largest file someone can upload, in megabytes.
     pub max_file_mb: u64,
+    /// Serve HTTPS for this domain with a certificate from Let's Encrypt,
+    /// fetched and renewed by itself (TLS-ALPN-01, so `listen` must be
+    /// reachable on port 443).
+    pub domain: Option<String>,
+    /// Where Let's Encrypt sends notices about the certificate.
+    pub acme_email: Option<String>,
+    /// Use Let's Encrypt's staging service (for trying things out).
+    pub acme_staging: bool,
+    /// Serve HTTPS with these PEM files instead of Let's Encrypt's (for
+    /// `domain`, if set).
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -30,6 +42,11 @@ impl Default for Config {
             behind_proxy: false,
             site_name: "axiond".into(),
             max_file_mb: 100,
+            domain: None,
+            acme_email: None,
+            acme_staging: false,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -64,25 +81,63 @@ impl Config {
         if let Some(v) = var("AXIOND_SITE_NAME") {
             self.site_name = v;
         }
+        let some = |v: String| (!v.trim().is_empty()).then(|| v.trim().to_string());
+        if let Some(v) = var("AXIOND_DOMAIN") {
+            self.domain = some(v);
+        }
+        if let Some(v) = var("AXIOND_ACME_EMAIL") {
+            self.acme_email = some(v);
+        }
+        if let Some(v) = var("AXIOND_ACME_STAGING") {
+            self.acme_staging = matches!(v.as_str(), "1" | "true" | "yes");
+        }
+        if let Some(v) = var("AXIOND_TLS_CERT") {
+            self.tls_cert = some(v).map(Into::into);
+        }
+        if let Some(v) = var("AXIOND_TLS_KEY") {
+            self.tls_key = some(v).map(Into::into);
+        }
         if let Some(v) = var("AXIOND_MAX_FILE_MB") {
             self.max_file_mb = v.parse().with_context(|| format!("AXIOND_MAX_FILE_MB={v}"))?;
         }
         Ok(())
     }
 
+    /// How connections are secured.
+    pub fn tls(&self) -> anyhow::Result<Tls> {
+        match (&self.domain, &self.tls_cert, &self.tls_key) {
+            (_, Some(cert), Some(key)) => Ok(Tls::Files(cert.clone(), key.clone())),
+            (_, Some(_), None) | (_, None, Some(_)) => bail!("tls_cert and tls_key go together"),
+            (Some(domain), None, None) => Ok(Tls::Acme(domain.clone())),
+            (None, None, None) => Ok(Tls::None),
+        }
+    }
+
     /// Plain HTTP is only for this machine: passwords and messages would
     /// cross the network readable.
     pub fn check_transport(&self) -> anyhow::Result<()> {
-        if !self.listen.ip().is_loopback() && !self.behind_proxy {
+        if matches!(self.tls()?, Tls::None) && !self.listen.ip().is_loopback() && !self.behind_proxy {
             bail!(
-                "refusing to serve plain HTTP on {}: axiond doesn't do TLS yet. Put a TLS proxy \
-                 (Caddy, Traefik, nginx) in front and set behind_proxy = true \
-                 (AXIOND_BEHIND_PROXY=true), or listen on 127.0.0.1.",
+                "refusing to serve plain HTTP on {}. Either set domain (AXIOND_DOMAIN) for a \
+                 Let's Encrypt certificate, give tls_cert and tls_key, or put a TLS proxy (Caddy, \
+                 Traefik, nginx) in front and set behind_proxy = true (AXIOND_BEHIND_PROXY=true). \
+                 Or listen on 127.0.0.1.",
                 self.listen
             );
         }
         Ok(())
     }
+}
+
+/// How axiond secures connections itself.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Tls {
+    /// Plain HTTP: on localhost, or behind a TLS proxy.
+    None,
+    /// A Let's Encrypt certificate for this domain.
+    Acme(String),
+    /// Certificate and key PEM files.
+    Files(PathBuf, PathBuf),
 }
 
 #[cfg(test)]
@@ -98,6 +153,14 @@ mod tests {
         assert!(c.check_transport().is_err());
         c.apply_env(|k| (k == "AXIOND_BEHIND_PROXY").then(|| "true".into())).unwrap();
         assert!(c.check_transport().is_ok());
+        c.behind_proxy = false;
+        c.apply_env(|k| (k == "AXIOND_DOMAIN").then(|| "chat.example.com".into())).unwrap();
+        assert!(c.check_transport().is_ok());
+        assert_eq!(c.tls().unwrap(), Tls::Acme("chat.example.com".into()));
+        c.tls_key = Some("key.pem".into());
+        assert!(c.tls().is_err());
+        c.tls_cert = Some("cert.pem".into());
+        assert_eq!(c.tls().unwrap(), Tls::Files("cert.pem".into(), "key.pem".into()));
     }
 
     #[test]
