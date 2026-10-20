@@ -229,3 +229,68 @@ async fn a_private_channel_as_people_come_and_go() {
     assert_eq!(text(read(&bob, &sealed).await), "lobby is encrypted now");
     assert!(bob_api.encrypt_channel(&plans.id).await.is_err(), "only admins");
 }
+
+#[tokio::test]
+async fn files_in_an_encrypted_dm() {
+    use dm_client::files::{Outgoing, Thumb};
+    let s = server().await;
+    let (alice_api, alice) = device(&s, "alice", MemoryStore::default()).await;
+    let (bob_api, bob) = device(&s, "bob", MemoryStore::default()).await;
+    let carol_api = {
+        let mut api = Client::new(&s.url).unwrap();
+        api.login("carol", PASSWORD, None).await.unwrap();
+        api
+    };
+    let dm = alice_api.create_direct(&alice.user_id, &bob.user_id).await.unwrap();
+
+    // Big enough for several chunks; a "picture" with a thumbnail.
+    let photo: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
+    let file = Outgoing {
+        name: "beach.png".into(),
+        mime: "image/png".into(),
+        bytes: photo.clone(),
+        width: 4000,
+        height: 3000,
+        thumb: Some(Thumb { mime: "image/jpeg".into(), bytes: b"small".to_vec(), width: 800, height: 600 }),
+    };
+    let key = dm_client::files::upload(&alice_api, &dm.id, file).await.unwrap();
+    let thumb_id = key.thumb.as_ref().unwrap().id.clone();
+
+    // The server has anonymous bytes: no name, no type, no thumbnail of its own.
+    let info = alice_api.file_info(&key.id).await.unwrap();
+    assert_eq!((info.name.as_str(), info.mime_type.as_str(), info.has_preview_image), ("blob", "application/octet-stream", false));
+    let stored = alice_api.file(&key.id).await.unwrap();
+    assert!(!stored.windows(photo.len().min(64)).any(|w| w == &photo[..64]), "the server never sees the bytes");
+
+    // The keys travel in the post; leaving out an upload they name is refused.
+    let mut post = NewPost {
+        channel_id: dm.id.clone(),
+        message: "look".into(),
+        file_ids: vec![key.id.clone()],
+        props: serde_json::json!({ dm_client::FILES_PROP: [key.clone()] }),
+        pending_post_id: "alice:photo".into(),
+        ..Default::default()
+    };
+    assert!(alice.encrypt_post(&post).await.is_err(), "the thumbnail isn't attached");
+    post.file_ids.push(thumb_id.clone());
+    let sealed = alice.encrypt_post(&post).await.unwrap();
+    assert!(sealed.props.get(dm_client::FILES_PROP).is_none(), "the keys never reach the server");
+    assert!(!sealed.props.to_string().contains(&key.key));
+    let sent = alice_api.create_post(&sealed).await.unwrap();
+
+    // Bob reads the message, then the files, checked against what was sent.
+    let got = posts(&bob_api, &dm.id).await.into_iter().find(|p| p.id == sent.id).unwrap();
+    let Decrypted::Text(Content::Post { message, files }) = read(&bob, &got).await else { panic!() };
+    assert_eq!((message.as_str(), files.len()), ("look", 1));
+    assert_eq!((files[0].name.as_str(), files[0].width, files[0].height), ("beach.png", 4000, 3000));
+    assert_eq!(dm_client::files::download(&bob_api, &files[0]).await.unwrap(), photo);
+    assert_eq!(dm_client::files::download(&bob_api, files[0].thumb.as_ref().unwrap()).await.unwrap(), b"small");
+
+    // A swapped file is caught: here, the thumbnail's bytes under the photo's key.
+    let mut wrong = files[0].clone();
+    wrong.id = thumb_id;
+    assert!(dm_client::files::download(&bob_api, &wrong).await.is_err());
+
+    // Someone outside the conversation can't fetch even the blob.
+    assert!(carol_api.file(&key.id).await.is_err());
+}

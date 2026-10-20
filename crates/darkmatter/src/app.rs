@@ -217,7 +217,7 @@ pub enum Message {
     /// Ctrl+V: attach the clipboard's image, if it holds one and no text.
     PasteImage,
     Pasted(Result<Option<std::path::PathBuf>, String>),
-    Uploaded(u64, Result<String, String>),
+    Uploaded(u64, Result<crate::media::Uploaded, String>),
     RemoveAttachment(u64),
     OpenEmoji(String),
     CloseEmoji,
@@ -762,6 +762,7 @@ impl App {
                 if let Screen::Chat(chat) = &self.screen {
                     let mut client = chat.client.clone();
                     Session::clear();
+                    crate::media::forget_keys();
                     self.screen = Screen::Login(LoginForm { server: chat.session.server.clone(), ..Default::default() });
                     let logout = Task::future(async move { client.logout().await }).discard();
                     return Task::batch([logout, operation::focus(LOGIN_FIRST)]);

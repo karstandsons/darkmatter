@@ -9,9 +9,12 @@
 //!   decrypts them, exactly once each, keeping the text in the app's
 //!   [`LocalStore`].
 //!
+//! - [`files`]: attachments, encrypted each under its own key.
+//!
 //! Shared by Darkmatter (its encrypted vault is the store) and, later, the
 //! phone apps. Everything that changes a group runs one at a time.
 
+pub mod files;
 mod store;
 
 use std::collections::{HashMap, HashSet};
@@ -20,7 +23,7 @@ use std::sync::Mutex;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use dm_crypto::device::ServerKey;
-use dm_crypto::wire::{Aad, Content, DmE2ee};
+use dm_crypto::wire::{Aad, Content, DmE2ee, FileKey};
 use dm_crypto::{Device, DeviceCertificate, Directory, Handshake, IdentityKey, Incoming, UserIdentity};
 use mm_api::Client;
 use mm_api::models::{AxiondInfo, NewHandshake, NewPost, Post};
@@ -93,6 +96,20 @@ impl Directory for Keys {
     fn certificate(&self, user_id: &str, device_id: &str) -> Option<DeviceCertificate> {
         self.certificates.get(&(user_id.into(), device_id.into())).cloned()
     }
+}
+
+/// The prop the app puts a post's file keys in before it's encrypted. It
+/// never reaches the server: [`E2ee::encrypt_post`] moves them inside.
+pub const FILES_PROP: &str = "dm_files";
+
+/// The keys of a post's files, each of which must be attached to it.
+fn files_of(post: &NewPost) -> Result<Vec<FileKey>, String> {
+    let Some(files) = post.props.get(FILES_PROP) else { return Ok(Vec::new()) };
+    let files: Vec<FileKey> = serde_json::from_value(files.clone()).map_err(s)?;
+    if let Some(id) = files.iter().flat_map(FileKey::ids).find(|id| !post.file_ids.iter().any(|f| f == id)) {
+        return Err(format!("file {id} isn't attached to the message"));
+    }
+    Ok(files)
 }
 
 fn s(e: impl std::fmt::Display) -> String {
@@ -536,7 +553,7 @@ impl<S: LocalStore> E2ee<S> {
     pub async fn encrypt_post(&self, post: &NewPost) -> Result<NewPost, String> {
         let _held = self.lock.lock().await;
         self.ready(&post.channel_id).await?;
-        let content = Content::Post { message: post.message.clone(), files: vec![] };
+        let content = Content::Post { message: post.message.clone(), files: files_of(post)? };
         let aad = Aad::post(&post.channel_id, &post.root_id, &post.pending_post_id);
         let e2ee = self.device.encrypt(&post.channel_id, &content, &aad).map_err(s)?;
         self.persist();

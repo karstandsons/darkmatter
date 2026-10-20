@@ -5,6 +5,11 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **With axiond:** private channels (`/create private <name>`, then
+  `/invite`), end-to-end encrypted like DMs, and encrypted files and
+  pictures in them. Pictures are shrunk for the conversation on your own
+  computer, since the server can't see them.
+
 ## [0.4.1] - 2026-10-20
 
 - **GIFs show and play.** A GIF (from `/gif` or any upload) used to show

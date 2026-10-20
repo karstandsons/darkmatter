@@ -109,9 +109,21 @@ pub async fn open(crypto: &Shared, posts: &mut [&mut Post]) {
         };
         post.message = match shown {
             Decrypted::Plain => continue,
-            Decrypted::Text(Content::Post { message, .. }) => message,
+            Decrypted::Text(Content::Post { message, files }) => {
+                // The files as the sender described them; the server knows
+                // them only as blobs (thumbnails included).
+                for key in &files {
+                    crate::media::remember(key);
+                }
+                post.metadata.files = files.iter().map(|k| crate::media::file_info(k, post)).collect();
+                message
+            }
             Decrypted::Text(_) => "🔒 *Not a message this app shows yet.*".into(),
-            Decrypted::Unreadable(why) => format!("🔒 *This message can't be read here: {why}.*"),
+            Decrypted::Unreadable(why) => {
+                // Its files are blobs without their keys: nothing to show.
+                post.metadata.files.clear();
+                format!("🔒 *This message can't be read here: {why}.*")
+            }
         };
     }
 }

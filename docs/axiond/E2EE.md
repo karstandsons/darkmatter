@@ -157,6 +157,13 @@ An encrypted post uses the normal `POST /api/v4/posts`:
 
 The server sees only blob sizes. It never makes thumbnails for these files, and serves them as `application/octet-stream` downloads.
 
+As built (step 6):
+- **Format:** `DMF1`, a random 19-byte nonce prefix, then 64 KiB chunks, each with its 16-byte tag (RustCrypto's `aead::stream`, big-endian 32-bit counter with the last-chunk flag). A file that divides evenly ends on a full chunk marked last; an empty file is one empty last chunk.
+- **Checks on download:** the SHA-256 of the ciphertext must match the post's, then every chunk must authenticate and the last must be marked last. A swapped, changed or cut-off file is refused.
+- **Thumbnails:** pictures (PNG, JPEG, GIF, WebP, by their bytes, not their name) get a JPEG thumbnail at most 800x600, uploaded as a second blob. Both uploads are attached to the post, so axiond allows 20 per encrypted post.
+- **Before sending,** the keys wait in the outbox (in the encrypted local database) as `props.dm_files`; `encrypt_post` moves them inside the ciphertext and refuses if a file they name isn't attached. A post with `dm_files` is never sent to a channel that isn't encrypted.
+- **Opening a file in another app** writes it decrypted to Darkmatter's cache folder (mode 0600), since that app has to read it.
+
 ## 8. Reactions, edits, deletes, threads
 
 - **Edits:** `PUT /api/v4/posts/{id}/patch` with a new `dm_e2ee`. The plaintext has `"t": "edit"`, and the authenticated data names the post being edited. Clients accept an edit only from the device's user who wrote the original.

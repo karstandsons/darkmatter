@@ -24,6 +24,9 @@ use crate::{App, ids};
 
 /// Files one upload can carry, and one post (Mattermost's limit).
 pub const MAX_PER_POST: usize = 10;
+/// In an encrypted channel each picture comes with its thumbnail, made by
+/// the sender's app, as a second upload.
+pub const MAX_PER_ENCRYPTED_POST: usize = 2 * MAX_PER_POST;
 const THUMB: (u32, u32) = (120, 100);
 const PREVIEW_WIDTH: u32 = 1920;
 
@@ -98,10 +101,12 @@ pub async fn of_posts(db: &db::Db, post_ids: &str) -> sqlx::Result<Vec<FileInfo>
 }
 
 /// Checks that `ids` are this user's uploads to this channel, not yet in a post.
-pub async fn check_unattached(app: &App, user_id: &str, channel_id: &str, ids: &[String]) -> Result<()> {
-    if ids.len() > MAX_PER_POST {
+pub async fn check_unattached(app: &App, user_id: &str, channel: &db::ChannelRow, ids: &[String]) -> Result<()> {
+    let max = if channel.encrypted { MAX_PER_ENCRYPTED_POST } else { MAX_PER_POST };
+    if ids.len() > max {
         return Err(Error::bad_request(format!("A message can have at most {MAX_PER_POST} files.")));
     }
+    let channel_id = channel.id.as_str();
     for id in ids {
         let ok = file_row(app, id)
             .await?
@@ -216,7 +221,8 @@ fn io_error(e: std::io::Error) -> Error {
 /// channel that isn't encrypted.
 async fn describe(app: &App, channel: &db::ChannelRow, user_id: &str, id: String, name: String, size: i64, path: &FsPath) -> Result<FileInfo> {
     let extension = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).filter(|e| e.len() <= 10).unwrap_or_default();
-    let mut mime_type = mime_for(&extension).to_string();
+    // An encrypted file is bytes to the server, whatever it's called.
+    let mut mime_type = if channel.encrypted { "application/octet-stream" } else { mime_for(&extension) }.to_string();
     let (mut width, mut height, mut has_preview) = (0, 0, false);
     if !channel.encrypted && size > 0 {
         let (src, thumb, preview) = (path.to_owned(), file_path(app, &id, Kind::Thumbnail), file_path(app, &id, Kind::Preview));

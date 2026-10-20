@@ -8,6 +8,7 @@
 //!   encrypted channel): creating, joining, sending and reading;
 //! - [`wire`]: what goes on the wire (`props.dm_e2ee`), the plaintext inside
 //!   and the authenticated data that ties a message to its place;
+//! - [`file`]: encrypting attachments, each under its own key;
 //! - [`ds`]: the server's side, which checks handshake messages without
 //!   seeing any secrets and may propose removals.
 //!
@@ -16,6 +17,7 @@
 
 pub mod device;
 pub mod ds;
+pub mod file;
 pub mod identity;
 mod provider;
 pub mod wire;

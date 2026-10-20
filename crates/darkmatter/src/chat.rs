@@ -234,6 +234,12 @@ fn thread_key(root: &str) -> String {
     format!("thread:{root}")
 }
 
+/// A new post's props: the keys of its encrypted files, which the outbox
+/// keeps (in the vault) until the post is encrypted with them inside.
+fn files_prop(files: Vec<dm_crypto::wire::FileKey>) -> serde_json::Value {
+    if files.is_empty() { serde_json::Value::Null } else { serde_json::json!({ dm_client::FILES_PROP: files }) }
+}
+
 impl Chat {
     /// Sends what's due from the outbox.
     pub fn flush(&mut self) -> Task<Message> {
@@ -245,6 +251,10 @@ impl Chat {
                 async move {
                     // In an encrypted channel the server only ever gets ciphertext.
                     let post = match (encrypted, &crypto) {
+                        // Keys of encrypted files only ever go inside an encrypted message.
+                        (false, _) if post.props.get(dm_client::FILES_PROP).is_some() => {
+                            return Err(("its files were encrypted for a conversation that isn't".to_string(), false));
+                        }
                         (false, _) => post,
                         (true, Some(c)) => c.encrypt_post(&post).await.map_err(|e| (format!("couldn't encrypt it: {e}"), true))?,
                         (true, None) => return Err(("this device can't encrypt yet (see Account)".to_string(), false)),
@@ -992,8 +1002,26 @@ impl Chat {
         Some(Task::perform(async move { client.execute_command(&team, &channel, &root, &text).await.map_err(err) }, Message::CommandRan))
     }
 
+    /// The finished uploads for the composer with draft key `key`: the ids
+    /// to attach, and the keys of encrypted ones. `None` while one is still
+    /// uploading.
+    fn uploads_for(&self, key: &str) -> Option<(Vec<String>, Vec<dm_crypto::wire::FileKey>)> {
+        let mine = || self.attachments.iter().filter(|a| a.key == key);
+        if mine().any(|a| matches!(a.state, media::Upload::Uploading)) {
+            return None;
+        }
+        let done: Vec<&media::Uploaded> = mine()
+            .filter_map(|a| match &a.state {
+                media::Upload::Done(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        Some((done.iter().flat_map(|u| u.ids()).collect(), done.iter().filter_map(|u| u.e2ee.clone()).collect()))
+    }
+
     /// Upload files for the composer with draft key `key`, in `channel`.
     fn attach_to(&mut self, key: &str, channel: &str, paths: Vec<std::path::PathBuf>) -> Task<Message> {
+        let encrypted = self.store.channels.get(channel).is_some_and(|c| c.encrypted);
         let tasks: Vec<_> = paths
             .into_iter()
             .filter(|p| p.is_file())
@@ -1006,7 +1034,7 @@ impl Chat {
                     name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
                     state: media::Upload::Uploading,
                 });
-                Task::perform(media::upload(self.client.clone(), channel.to_string(), path), move |r| Message::Uploaded(local_id, r))
+                Task::perform(media::upload(self.client.clone(), channel.to_string(), path, encrypted), move |r| Message::Uploaded(local_id, r))
             })
             .collect();
         Task::batch(tasks)
@@ -1560,20 +1588,10 @@ impl Chat {
                 self.notice = None;
                 self.last_in_thread = false;
                 let message = self.draft().trim().to_string();
-                let here = |a: &&media::Pending| a.key == self.pv().channel;
-                if self.attachments.iter().filter(here).any(|a| matches!(a.state, media::Upload::Uploading)) {
+                let Some((file_ids, files)) = self.uploads_for(&self.pv().channel) else {
                     self.error = Some("Wait for uploads to finish".into());
                     return Task::none();
-                }
-                let file_ids: Vec<String> = self
-                    .attachments
-                    .iter()
-                    .filter(here)
-                    .filter_map(|a| match &a.state {
-                        media::Upload::Done(id) => Some(id.clone()),
-                        _ => None,
-                    })
-                    .collect();
+                };
                 if (message.is_empty() && file_ids.is_empty()) || self.pv().channel.is_empty() {
                     return Task::none();
                 }
@@ -1586,6 +1604,7 @@ impl Chat {
                     channel_id: self.pv().channel.clone(),
                     message,
                     file_ids,
+                    props: files_prop(files),
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
                     ..Default::default()
                 };
@@ -1952,20 +1971,10 @@ impl Chat {
                     return Task::none();
                 };
                 let key = thread_key(&root);
-                let here = |a: &&media::Pending| a.key == key;
-                if self.attachments.iter().filter(here).any(|a| matches!(a.state, media::Upload::Uploading)) {
+                let Some((file_ids, files)) = self.uploads_for(&key) else {
                     self.error = Some("Wait for uploads to finish".into());
                     return Task::none();
-                }
-                let file_ids: Vec<String> = self
-                    .attachments
-                    .iter()
-                    .filter(here)
-                    .filter_map(|a| match &a.state {
-                        media::Upload::Done(id) => Some(id.clone()),
-                        _ => None,
-                    })
-                    .collect();
+                };
                 if message.is_empty() && file_ids.is_empty() {
                     return Task::none();
                 }
@@ -1975,9 +1984,9 @@ impl Chat {
                     channel_id,
                     message,
                     file_ids,
+                    props: files_prop(files),
                     root_id: root,
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
-                    ..Default::default()
                 };
                 self.outbox.push(post);
                 Task::batch([self.flush(), to_latest(THREAD)])
@@ -2025,7 +2034,7 @@ impl Chat {
             Message::Uploaded(local_id, result) => {
                 if let Some(a) = self.attachments.iter_mut().find(|a| a.local_id == local_id) {
                     a.state = match result {
-                        Ok(id) => media::Upload::Done(id),
+                        Ok(u) => media::Upload::Done(u),
                         Err(e) => media::Upload::Failed(e),
                     };
                 }
@@ -2890,7 +2899,7 @@ mod tests {
         assert_eq!(chat.attachments.len(), 1);
         assert!(chat.error.is_some());
 
-        let _ = chat.handle(Message::Uploaded(id, Ok("f1".into())));
+        let _ = chat.handle(Message::Uploaded(id, Ok(media::Uploaded { id: "f1".into(), e2ee: None })));
         assert!(matches!(chat.attachments[0].state, media::Upload::Done(_)));
 
         // A message with only a file is allowed, and sending clears the chips.
@@ -2939,7 +2948,7 @@ mod tests {
         assert_eq!(chat.attachments[1].key, "c1", "the next pick is for the message box again");
 
         let id = chat.attachments[0].local_id;
-        let _ = chat.handle(Message::Uploaded(id, Ok("f1".into())));
+        let _ = chat.handle(Message::Uploaded(id, Ok(media::Uploaded { id: "f1".into(), e2ee: None })));
         // A reply with only a file is allowed; the channel's file stays.
         let _ = chat.handle(Message::SendReply);
         assert_eq!(chat.attachments.len(), 1);

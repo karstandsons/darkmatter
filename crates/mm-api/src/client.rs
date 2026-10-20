@@ -286,6 +286,10 @@ impl Client {
         decode("files", check(req.send().await?).await?).await
     }
 
+    pub async fn file_info(&self, file_id: &str) -> Result<FileInfo, Error> {
+        self.get(&format!("files/{file_id}/info")).await
+    }
+
     pub async fn file(&self, file_id: &str) -> Result<Vec<u8>, Error> {
         self.bytes(&format!("files/{file_id}")).await
     }

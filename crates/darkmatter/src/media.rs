@@ -1,6 +1,11 @@
-//! In-memory cache of avatars and image previews, fetched once each.
+//! In-memory cache of avatars and image previews, fetched once each, and
+//! attachments: uploading them and fetching them, decrypted when they came
+//! in an encrypted message.
 
 use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
+
+use dm_crypto::wire::FileKey;
 
 use iced::Task;
 use iced::widget::image;
@@ -68,7 +73,7 @@ impl Cache {
                 let id = id.clone();
                 tasks.push(Task::perform(
                     async move {
-                        let bytes = client.file(&id).await.map_err(|e| e.to_string());
+                        let bytes = download(&client, &id).await;
                         // Decoding every frame takes a moment: not on the UI thread.
                         let frames = match bytes {
                             Ok(b) => tokio::task::spawn_blocking(move || crate::animated::Frames::decode(&b)).await.map_err(|e| e.to_string()).and_then(|r| r),
@@ -84,13 +89,13 @@ impl Cache {
                 Task::perform(
                     async move {
                         let bytes = match &key {
-                            Key::Avatar(id, _) => client.profile_image(id).await,
-                            Key::Preview(id) => client.file_preview(id).await,
-                            Key::Full(id) => client.file(id).await,
-                            Key::Emoji(id) => client.emoji_image(id).await,
+                            Key::Avatar(id, _) => client.profile_image(id).await.map_err(|e| e.to_string()),
+                            Key::Preview(id) => preview(&client, id).await,
+                            Key::Full(id) => download(&client, id).await,
+                            Key::Emoji(id) => client.emoji_image(id).await.map_err(|e| e.to_string()),
                             Key::Gif(_) => unreachable!("fetched above"),
                         };
-                        (key, bytes.map_err(|e| e.to_string()))
+                        (key, bytes)
                     },
                     |(key, r)| Message::Media(key, r),
                 ));
@@ -160,16 +165,150 @@ pub struct Pending {
 
 pub enum Upload {
     Uploading,
-    Done(String),
+    Done(Uploaded),
     Failed(String),
 }
 
-/// Read a local file and upload it to a channel; returns the server file id.
-pub async fn upload(client: Client, channel_id: String, path: std::path::PathBuf) -> Result<String, String> {
+/// An attachment on the server.
+#[derive(Clone, Debug)]
+pub struct Uploaded {
+    pub id: String,
+    /// In an encrypted channel: its key (and its thumbnail's), for the
+    /// message to carry.
+    pub e2ee: Option<FileKey>,
+}
+
+impl Uploaded {
+    /// Every upload the message must attach.
+    pub fn ids(&self) -> Vec<String> {
+        match &self.e2ee {
+            Some(k) => k.ids().map(String::from).collect(),
+            None => vec![self.id.clone()],
+        }
+    }
+}
+
+/// Read a local file and upload it to a channel, encrypted if the channel
+/// is.
+pub async fn upload(client: Client, channel_id: String, path: std::path::PathBuf, encrypted: bool) -> Result<Uploaded, String> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
     let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
+    if encrypted {
+        let file = tokio::task::spawn_blocking(move || outgoing(name, bytes)).await.map_err(|e| e.to_string())?;
+        let key = dm_client::files::upload(&client, &channel_id, file).await?;
+        remember(&key);
+        return Ok(Uploaded { id: key.id.clone(), e2ee: Some(key) });
+    }
     let result = client.upload_file(&channel_id, &name, bytes).await.map_err(|e| e.to_string())?;
-    result.file_infos.into_iter().next().map(|f| f.id).ok_or_else(|| "server returned no file".into())
+    let id = result.file_infos.into_iter().next().map(|f| f.id).ok_or("server returned no file")?;
+    Ok(Uploaded { id, e2ee: None })
+}
+
+/// Thumbnails made here for encrypted pictures fit in this (the inline
+/// preview is 400x300, so this is sharp at twice that).
+const THUMB: (u32, u32) = (800, 600);
+
+/// A file to encrypt: for a picture, its size and a JPEG thumbnail, since
+/// the server can't make one.
+fn outgoing(name: String, bytes: Vec<u8>) -> dm_client::files::Outgoing {
+    let mut file = dm_client::files::Outgoing { mime: mime_for(&name).into(), name, bytes, width: 0, height: 0, thumb: None };
+    let Ok(reader) = ::image::ImageReader::new(std::io::Cursor::new(&file.bytes)).with_guessed_format() else { return file };
+    let mime = match reader.format() {
+        Some(::image::ImageFormat::Png) => "image/png",
+        Some(::image::ImageFormat::Jpeg) => "image/jpeg",
+        Some(::image::ImageFormat::Gif) => "image/gif",
+        Some(::image::ImageFormat::WebP) => "image/webp",
+        _ => return file,
+    };
+    let mut reader = reader;
+    let mut limits = ::image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    reader.limits(limits);
+    let Ok(img) = reader.decode() else { return file };
+    file.mime = mime.into();
+    (file.width, file.height) = (img.width(), img.height());
+    let small = img.thumbnail(THUMB.0, THUMB.1).to_rgb8();
+    let mut jpeg = Vec::new();
+    let encoder = ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 85);
+    if small.write_with_encoder(encoder).is_ok() {
+        file.thumb = Some(dm_client::files::Thumb { mime: "image/jpeg".into(), width: small.width(), height: small.height(), bytes: jpeg });
+    }
+    file
+}
+
+/// A file's type from its name, for what the server would have said.
+fn mime_for(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "txt" | "log" | "md" => "text/plain",
+        "zip" => "application/zip",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The keys of encrypted files seen in decrypted messages, by file id.
+static KEYS: LazyLock<RwLock<HashMap<String, FileKey>>> = LazyLock::new(Default::default);
+
+/// Remembers how to read an encrypted file.
+pub fn remember(key: &FileKey) {
+    KEYS.write().unwrap_or_else(|e| e.into_inner()).insert(key.id.clone(), key.clone());
+}
+
+fn key_of(id: &str) -> Option<FileKey> {
+    KEYS.read().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+}
+
+/// Forgets every file key (signed out).
+pub fn forget_keys() {
+    KEYS.write().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// An attachment's bytes, decrypted if it's an encrypted one.
+pub async fn download(client: &Client, id: &str) -> Result<Vec<u8>, String> {
+    match key_of(id) {
+        Some(key) => dm_client::files::download(client, &key).await,
+        None => client.file(id).await.map_err(|e| e.to_string()),
+    }
+}
+
+/// A picture's preview: the server's, or the sender's encrypted thumbnail.
+async fn preview(client: &Client, id: &str) -> Result<Vec<u8>, String> {
+    match key_of(id) {
+        Some(key) => match &key.thumb {
+            Some(thumb) => dm_client::files::download(client, thumb).await,
+            None => dm_client::files::download(client, &key).await,
+        },
+        None => client.file_preview(id).await.map_err(|e| e.to_string()),
+    }
+}
+
+/// What a message shows for an encrypted file: what the sender said about
+/// it, not the server's anonymous blob.
+pub fn file_info(key: &FileKey, post: &mm_api::models::Post) -> mm_api::models::FileInfo {
+    mm_api::models::FileInfo {
+        id: key.id.clone(),
+        user_id: post.user_id.clone(),
+        post_id: post.id.clone(),
+        channel_id: post.channel_id.clone(),
+        create_at: post.create_at,
+        name: key.name.clone(),
+        extension: key.name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default(),
+        size: key.size as i64,
+        mime_type: key.mime.clone(),
+        width: i64::from(key.width),
+        height: i64::from(key.height),
+        has_preview_image: key.thumb.is_some(),
+        mini_preview: None,
+    }
 }
 
 /// Download an attachment into the cache dir and open it with the system's default app.
@@ -183,9 +322,21 @@ pub async fn open_file(client: Client, file_id: String, name: String) -> Result<
     let dir = dirs::cache_dir().ok_or("no cache dir")?.join("darkmatter/files").join(&file_id);
     let path = dir.join(name);
     if !path.exists() {
-        let bytes = client.file(&file_id).await.map_err(|e| e.to_string())?;
+        let bytes = download(&client, &file_id).await?;
         tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
+        // Another app has to open it, so a decrypted file is written out
+        // here, readable only by you.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).await;
+        }
         tokio::fs::write(&path, bytes).await.map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await;
+        }
     }
     open::that_detached(&path).map_err(|e| e.to_string())?;
     Ok(())
@@ -250,10 +401,27 @@ mod tests {
         let file = dir.path().join("pic.png");
         std::fs::write(&file, "PNGDATA").unwrap();
         let client = Client::new(&server.uri()).unwrap().with_token("t");
-        assert_eq!(upload(client, "c1".into(), file).await.unwrap(), "f9");
+        assert_eq!(upload(client, "c1".into(), file, false).await.unwrap().id, "f9");
 
-        let missing = upload(Client::new(&server.uri()).unwrap(), "c1".into(), dir.path().join("nope")).await;
+        let missing = upload(Client::new(&server.uri()).unwrap(), "c1".into(), dir.path().join("nope"), false).await;
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn encrypted_pictures_get_a_thumbnail_made_here() {
+        let mut png = Vec::new();
+        ::image::RgbaImage::from_pixel(1600, 900, ::image::Rgba([10, 20, 30, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), ::image::ImageFormat::Png)
+            .unwrap();
+        // The name says nothing: the bytes decide.
+        let f = outgoing("screenshot".into(), png);
+        assert_eq!((f.mime.as_str(), f.width, f.height), ("image/png", 1600, 900));
+        let thumb = f.thumb.unwrap();
+        assert_eq!((thumb.mime.as_str(), thumb.width, thumb.height), ("image/jpeg", 800, 450));
+        assert!(::image::load_from_memory(&thumb.bytes).is_ok());
+
+        let f = outgoing("notes.txt".into(), b"not a picture".to_vec());
+        assert_eq!((f.mime.as_str(), f.width, f.thumb.is_none()), ("text/plain", 0, true));
     }
 
     #[test]

@@ -232,7 +232,7 @@ pub async fn save(client: mm_api::Client, f: FileInfo, loaded: Option<iced::widg
     let Some(target) = dialog.save_file().await else { return Ok(None) };
     let bytes = match loaded {
         Some(iced::widget::image::Handle::Bytes(_, b)) => b.to_vec(),
-        _ => client.file(&f.id).await.map_err(|e| e.to_string())?,
+        _ => crate::media::download(&client, &f.id).await?,
     };
     let path = target.path().to_path_buf();
     tokio::fs::write(&path, bytes).await.map_err(|e| e.to_string())?;

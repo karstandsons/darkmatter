@@ -144,7 +144,7 @@ pub async fn create(State(app): State<App>, me: Me, Json(body): Json<Create>) ->
             return Err(Error::bad_request("That thread isn't in this channel."));
         }
     }
-    super::files::check_unattached(&app, &me.user_id, &channel.id, &body.file_ids).await?;
+    super::files::check_unattached(&app, &me.user_id, &channel, &body.file_ids).await?;
     let new = New { root_id: body.root_id, message, kind: "", pending_post_id: body.pending_post_id, file_ids: body.file_ids, props };
     Ok((StatusCode::CREATED, Json(insert(&app, &channel, &me.user_id, new).await?)))
 }

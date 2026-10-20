@@ -64,8 +64,36 @@ pub struct FileKey {
     pub size: u64,
     /// SHA-256 of the ciphertext, hex.
     pub sha256: String,
+    /// A picture's size in pixels (0 if it isn't one).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub width: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub height: u32,
+    /// A smaller picture to show in the conversation, made by the sender
+    /// and encrypted the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumb: Option<Box<FileKey>>,
+}
+
+impl FileKey {
+    /// The server's ids for this file and its thumbnail.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.id.as_str()).chain(self.thumb.as_deref().map(|t| t.id.as_str()))
+    }
+
+    /// Checks downloaded ciphertext is what the sender encrypted, and
+    /// decrypts it.
+    pub fn open(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        if crate::file::sha256_hex(ciphertext) != self.sha256 {
+            return Err(Error::Untrusted(format!("file {} isn't the one that was sent", self.id)));
+        }
+        let key = B64.decode(&self.key).map_err(|_| Error::Malformed("file key"))?;
+        crate::file::decrypt(&crate::file::FileSecret::from_slice(&key)?, ciphertext)
+    }
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// What kind of event a ciphertext is, in the [`Aad`].
