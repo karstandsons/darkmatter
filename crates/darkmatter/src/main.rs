@@ -1,3 +1,4 @@
+mod account;
 mod app;
 mod chat;
 mod chat_view;
@@ -12,6 +13,7 @@ mod panels;
 mod plugin_picker;
 mod plugin_manager;
 mod plugins;
+mod report;
 mod session;
 mod shortcuts;
 mod store;

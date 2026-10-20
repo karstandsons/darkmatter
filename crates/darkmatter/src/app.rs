@@ -10,6 +10,8 @@ use mm_api::{Client, ws};
 
 use crate::chat::Chat;
 use crate::config::Config;
+use crate::account::{self, Account};
+use crate::report::{self, Report};
 use crate::plugin_manager::{self, PluginManager};
 use crate::theme_picker::{self, ModeTab, ThemePicker};
 use omarchy_theme::{Catalog, ThemeChoice};
@@ -36,6 +38,10 @@ pub struct App {
     preview: Option<String>,
     /// The Plugins window.
     plugin_manager: Option<PluginManager>,
+    /// The Account window.
+    account: Option<Account>,
+    /// Reporting or blocking from a message.
+    report: Option<Report>,
 }
 
 enum Screen {
@@ -51,6 +57,10 @@ struct LoginForm {
     password: String,
     mfa: String,
     need_mfa: bool,
+    /// Making an account with an invite code instead of signing in.
+    signing_up: bool,
+    invite: String,
+    email: String,
     /// The field with keyboard focus, tracked so Tab/Enter move predictably.
     focused: LoginField,
     busy: bool,
@@ -80,12 +90,18 @@ pub enum Message {
     ThemeDone(Result<String, String>),
     /// The Plugins window.
     Plugins(plugin_manager::Msg),
+    /// The Account window.
+    Account(account::Msg),
+    /// The report-or-block dialog.
+    Report(report::Msg),
     Login(LoginField, String),
     /// Enter in a login field: next field, or sign in from the last one.
     LoginNext(LoginField),
     /// Tab (+1) or Shift+Tab (-1).
     LoginTab(isize),
     LoginSubmit,
+    /// Switch between signing in and making an account with an invite.
+    LoginInvite(bool),
     LoggedIn(Result<(Session, User), (String, bool)>),
     Bootstrapped(Result<Bootstrap, String>),
     SessionFailed(String),
@@ -248,6 +264,8 @@ pub enum LoginField {
     Login,
     Password,
     Mfa,
+    Invite,
+    Email,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +278,10 @@ pub struct Bootstrap {
     pub users: Vec<User>,
     /// The server's settings for apps; plugins can use some (its Giphy key).
     pub server_config: crate::plugins::ServerConfig,
+    /// What axiond says about itself; `None` on plain Mattermost.
+    pub axiond: Option<mm_api::models::AxiondInfo>,
+    /// People you've blocked (axiond).
+    pub blocked: Vec<String>,
 }
 
 pub(crate) fn err(e: mm_api::Error) -> String {
@@ -287,6 +309,8 @@ impl App {
             picker: None,
             preview: None,
             plugin_manager: None,
+            account: None,
+            report: None,
         };
         app.apply_theme();
         let os_theme = iced::system::theme().map(Message::OsTheme);
@@ -360,6 +384,51 @@ impl App {
         if reloaded {
             // Its plugin numbers may have moved.
             chat.plugin_picker = None;
+        }
+        ControlFlow::Break(task)
+    }
+
+    /// Account-window messages, and keys while it's open.
+    fn update_account(&mut self, message: Message) -> ControlFlow<Task<Message>, Message> {
+        let open = self.account.is_some();
+        let msg = match message {
+            Message::Account(m) => m,
+            Message::Escape if open => account::Msg::Close,
+            // Swallow keys so the chat doesn't react (typing goes to its text boxes).
+            Message::Key(_) if open => return ControlFlow::Break(Task::none()),
+            other => return ControlFlow::Continue(other),
+        };
+        let Screen::Chat(chat) = &mut self.screen else { return ControlFlow::Break(Task::none()) };
+        let (task, gone) = account::update(&mut self.account, &chat.client, chat.axiond.is_some(), msg);
+        if let Some(blocked) = self.account.as_ref().and_then(Account::blocked_ids) {
+            chat.store.blocked = blocked.into_iter().collect();
+        }
+        if gone {
+            // The account is deleted: back to signing in, with nothing saved.
+            let server = chat.session.server.clone();
+            Session::clear();
+            self.screen = Screen::Login(LoginForm { server, error: Some("Your account is deleted.".into()), ..Default::default() });
+            return ControlFlow::Break(operation::focus(LOGIN_FIRST));
+        }
+        ControlFlow::Break(task)
+    }
+
+    /// Report-dialog messages, and keys while it's open.
+    fn update_report(&mut self, message: Message) -> ControlFlow<Task<Message>, Message> {
+        let open = self.report.is_some();
+        let msg = match message {
+            Message::Report(m) => m,
+            Message::Escape if open => report::Msg::Close,
+            Message::Key(_) if open => return ControlFlow::Break(Task::none()),
+            other => return ControlFlow::Continue(other),
+        };
+        let Screen::Chat(chat) = &mut self.screen else { return ControlFlow::Break(Task::none()) };
+        let (task, done) = report::update(&mut self.report, &chat.client, msg);
+        if let Some((note, blocked)) = done {
+            if let Some(user) = blocked {
+                chat.store.blocked.insert(user);
+            }
+            return ControlFlow::Break(Task::batch([task, chat.notify(note)]));
         }
         ControlFlow::Break(task)
     }
@@ -580,9 +649,9 @@ impl App {
             }
         }
         // Keys a message box passes on (shortcuts, menu keys) are the app's,
-        // like keys no widget took, not the pane's.
+        // like keys no widget took, not the pane's; so are the app's windows.
         let message = match message {
-            Message::InPane(_, m) if matches!(*m, Message::Key(_)) => *m,
+            Message::InPane(_, m) if matches!(*m, Message::Key(_) | Message::Report(_) | Message::Account(_)) => *m,
             m => m,
         };
         // While an image is shown, keys are its: zoom, step, close.
@@ -603,6 +672,14 @@ impl App {
             }
         }
         let message = match self.update_plugin_manager(message) {
+            ControlFlow::Break(task) => return task,
+            ControlFlow::Continue(message) => message,
+        };
+        let message = match self.update_account(message) {
+            ControlFlow::Break(task) => return task,
+            ControlFlow::Continue(message) => message,
+        };
+        let message = match self.update_report(message) {
             ControlFlow::Break(task) => return task,
             ControlFlow::Continue(message) => message,
         };
@@ -642,7 +719,7 @@ impl App {
                     && command != C::Leave
                 {
                     chat.menu = false;
-                    refocus = !matches!(command, C::QuickSwitcher | C::Search | C::Shortcuts | C::Themes | C::Plugins | C::Logout);
+                    refocus = !matches!(command, C::QuickSwitcher | C::Search | C::Shortcuts | C::Themes | C::Plugins | C::Account | C::Logout);
                 }
                 let task = self.run(command, arg);
                 if refocus { Task::batch([task, Task::done(Message::FocusComposer)]) } else { task }
@@ -702,6 +779,7 @@ impl App {
             | Message::LoginNext(_)
             | Message::LoginTab(_)
             | Message::LoginSubmit
+            | Message::LoginInvite(_)
             | Message::LoggedIn(_) => {
                 let Screen::Login(form) = &mut self.screen else { return Task::none() };
                 form.update(message)
@@ -747,6 +825,12 @@ impl App {
                 self.apply_theme();
                 let msg = if self.plugin_manager.is_some() { plugin_manager::Msg::Close } else { plugin_manager::Msg::Open };
                 self.update(Message::Plugins(msg))
+            }
+            C::Account => {
+                self.plugin_manager = None;
+                self.picker = None;
+                let msg = if self.account.is_some() { account::Msg::Close } else { account::Msg::Open };
+                self.update(Message::Account(msg))
             }
             C::ThreadLayout => self.update(Message::ToggleThreadLayout),
             C::ToggleDensity | C::Compact | C::Cozy => {
@@ -852,6 +936,12 @@ impl App {
         if let (Some(m), Screen::Chat(chat)) = (&self.plugin_manager, &self.screen) {
             body = body.push(m.view(&chat.plugins, &self.config, &chat.server_config, c));
         }
+        if let Some(a) = &self.account {
+            body = body.push(a.view(c));
+        }
+        if let Some(r) = &self.report {
+            body = body.push(r.view(c));
+        }
         container(body).width(Length::Fill).height(Length::Fill).style(c.panel(c.bg)).into()
     }
 }
@@ -905,7 +995,13 @@ pub(crate) fn bootstrap(session: Session) -> Task<Message> {
                 tracing::warn!("couldn't read the server's client config: {e}");
                 Default::default()
             });
-            Ok(Bootstrap { session, me, teams, channels, members, users, server_config })
+            // axiond or plain Mattermost: some features exist only on axiond.
+            let axiond = client.axiond().await.unwrap_or_else(|e| {
+                tracing::warn!("couldn't tell what kind of server this is: {e}");
+                None
+            });
+            let blocked = if axiond.is_some() { client.blocked().await.unwrap_or_default() } else { Vec::new() };
+            Ok(Bootstrap { session, me, teams, channels, members, users, server_config, axiond, blocked })
         },
         Message::Bootstrapped,
     )
@@ -918,6 +1014,8 @@ impl LoginField {
             LoginField::Login => "login-user",
             LoginField::Password => "login-password",
             LoginField::Mfa => "login-mfa",
+            LoginField::Invite => "login-invite",
+            LoginField::Email => "login-email",
         }
     }
 }
@@ -936,6 +1034,8 @@ impl LoginForm {
                     LoginField::Login => &mut self.login,
                     LoginField::Password => &mut self.password,
                     LoginField::Mfa => &mut self.mfa,
+                    LoginField::Invite => &mut self.invite,
+                    LoginField::Email => &mut self.email,
                 } = value;
                 Task::none()
             }
@@ -951,17 +1051,36 @@ impl LoginForm {
                 let i = fields.iter().position(|f| *f == self.focused).unwrap_or(0) as isize;
                 self.focus(fields[(i + step).rem_euclid(fields.len() as isize) as usize])
             }
+            Message::LoginInvite(on) => {
+                self.signing_up = on;
+                self.error = None;
+                self.need_mfa = false;
+                self.focus(if on { LoginField::Invite } else { LoginField::Login })
+            }
             Message::LoginSubmit if !self.busy => {
                 self.busy = true;
                 self.error = None;
                 let server = fmt::server_url(&self.server);
-                let (login, password) = (self.login.clone(), self.password.clone());
+                let (login, password) = (self.login.trim().to_lowercase(), self.password.clone());
                 let mfa = (!self.mfa.is_empty()).then(|| self.mfa.clone());
+                let signup = self.signing_up.then(|| (self.invite.trim().to_string(), self.email.trim().to_string()));
                 Task::perform(
                     async move {
                         let mut client = Client::new(&server)
                             .and_then(|c| c.user_agent(&crate::session::user_agent()))
                             .map_err(|e| (e.to_string(), false))?;
+                        if let Some((invite, email)) = signup {
+                            client.sign_up(&invite, &login, &email, &password).await.map_err(|e| {
+                                let msg = match &e {
+                                    mm_api::Error::Api(api) if api.status_code == 404 || api.status_code == 403 => {
+                                        "This server doesn't take invite codes here. Ask its admin how to join.".to_string()
+                                    }
+                                    mm_api::Error::Api(api) if !api.message.is_empty() => api.message.clone(),
+                                    _ => e.to_string(),
+                                };
+                                (msg, false)
+                            })?;
+                        }
                         let user = client.login(&login, &password, mfa.as_deref()).await.map_err(|e| {
                             let msg = match &e {
                                 mm_api::Error::Http(h) if h.is_connect() || h.is_timeout() => {
@@ -995,6 +1114,9 @@ impl LoginForm {
     }
 
     fn fields(&self) -> Vec<LoginField> {
+        if self.signing_up {
+            return vec![LoginField::Server, LoginField::Invite, LoginField::Login, LoginField::Email, LoginField::Password];
+        }
         let mut f = vec![LoginField::Server, LoginField::Login, LoginField::Password];
         if self.need_mfa {
             f.push(LoginField::Mfa);
@@ -1016,14 +1138,27 @@ impl LoginForm {
                 .padding(10)
                 .style(c.input())
         };
-        let mut form = column![
-            text("Darkmatter").size(28).color(c.fg_bright),
-            text("Sign in to your Mattermost server").color(c.muted),
-            space().height(8),
-            input("Server URL, e.g. chat.example.com", &self.server, LoginField::Server),
-            input("Email or username", &self.login, LoginField::Login),
-            input("Password", &self.password, LoginField::Password).secure(true),
-        ]
+        let mut form = if self.signing_up {
+            column![
+                text("Darkmatter").size(28).color(c.fg_bright),
+                text("Make an account with an invite code").color(c.muted),
+                space().height(8),
+                input("Server URL, e.g. chat.example.com", &self.server, LoginField::Server),
+                input("Invite code", &self.invite, LoginField::Invite),
+                input("Username (lowercase, e.g. alex)", &self.login, LoginField::Login),
+                input("Email", &self.email, LoginField::Email),
+                input("Password (at least 10 characters)", &self.password, LoginField::Password).secure(true),
+            ]
+        } else {
+            column![
+                text("Darkmatter").size(28).color(c.fg_bright),
+                text("Sign in to your Mattermost or axiond server").color(c.muted),
+                space().height(8),
+                input("Server URL, e.g. chat.example.com", &self.server, LoginField::Server),
+                input("Email or username", &self.login, LoginField::Login),
+                input("Password", &self.password, LoginField::Password).secure(true),
+            ]
+        }
         .spacing(10)
         .width(360);
         if self.need_mfa {
@@ -1032,12 +1167,22 @@ impl LoginForm {
         if let Some(e) = &self.error {
             form = form.push(text(e).color(c.red));
         }
-        let submit = button(text(if self.busy { "Signing in…" } else { "Sign in" }).center().width(Length::Fill))
+        let label = match (self.busy, self.signing_up) {
+            (true, true) => "Making your account…",
+            (true, false) => "Signing in…",
+            (false, true) => "Make account",
+            (false, false) => "Sign in",
+        };
+        let submit = button(text(label).center().width(Length::Fill))
             .on_press_maybe((!self.busy).then_some(Message::LoginSubmit))
             .padding(10)
             .width(Length::Fill)
             .style(c.primary_button());
-        center(form.push(submit)).into()
+        let switch = button(text(if self.signing_up { "I already have an account" } else { "I have an invite code" }).size(13).color(c.accent))
+            .padding([2, 0])
+            .on_press(Message::LoginInvite(!self.signing_up))
+            .style(c.link_button());
+        center(form.push(submit).push(switch)).into()
     }
 }
 

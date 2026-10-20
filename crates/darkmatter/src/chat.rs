@@ -195,6 +195,8 @@ pub struct Chat {
     command_sent: Option<(String, String)>,
     /// The server's settings for apps (some fill in plugin settings).
     pub server_config: plugins::ServerConfig,
+    /// What axiond says about itself; `None` on plain Mattermost.
+    pub axiond: Option<mm_api::models::AxiondInfo>,
     /// Installed plugins (`~/.config/darkmatter/plugins`).
     pub plugins: std::sync::Arc<Plugins>,
     /// A plugin's picker, opened from the + menu.
@@ -393,6 +395,7 @@ impl Chat {
         store.teams = b.teams;
         store.add_channels(b.channels, b.members);
         store.add_users(b.users);
+        store.blocked = b.blocked.into_iter().collect();
         let team = store.teams.first().map(|t| t.id.clone()).unwrap_or_default();
         // The layout from last time on this server, if any.
         let mut next_pane = 1;
@@ -452,6 +455,7 @@ impl Chat {
             slash_server: Default::default(),
             command_sent: None,
             server_config: b.server_config,
+            axiond: b.axiond,
             plugins: Default::default(),
             plugin_picker: None,
             editors: HashMap::new(),
@@ -691,7 +695,7 @@ impl Chat {
                 operation::focus(SHORTCUTS_INPUT)
             }
             // The app's: they change its config.
-            C::Themes | C::Plugins | C::ThreadLayout | C::Logout | C::ToggleDensity | C::Compact | C::Cozy | C::ToggleSidebar | C::About => Task::none(),
+            C::Themes | C::Plugins | C::Account | C::ThreadLayout | C::Logout | C::ToggleDensity | C::Compact | C::Cozy | C::ToggleSidebar | C::About => Task::none(),
         }
     }
 
@@ -2633,6 +2637,8 @@ mod tests {
             members: vec![ChannelMember { channel_id: "c1".into(), ..Default::default() }],
             users: vec![],
             server_config: Default::default(),
+            axiond: None,
+            blocked: vec![],
         };
         let (mut chat, _) = Chat::start(b).unwrap();
         chat.pv_mut().channel = "c1".into();

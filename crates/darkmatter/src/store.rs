@@ -69,6 +69,8 @@ pub struct Store {
     pub user_threads: Vec<UserThread>,
     /// The server's custom emoji: name -> id.
     pub custom_emoji: HashMap<String, Id>,
+    /// People you've blocked (axiond): their messages are hidden.
+    pub blocked: HashSet<Id>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +95,7 @@ impl Store {
             statuses: HashMap::new(),
             user_threads: Vec::new(),
             custom_emoji: HashMap::new(),
+            blocked: HashSet::new(),
         }
     }
 

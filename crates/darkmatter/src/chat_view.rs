@@ -439,6 +439,7 @@ impl Chat {
             .push(heading("Darkmatter"))
             .push(item("Themes".into(), C::Themes, None))
             .push(item("Plugins".into(), C::Plugins, None))
+            .push(item("Account and security".into(), C::Account, None))
             .push(item("Keyboard shortcuts".into(), C::Shortcuts, None))
             .push(item(format!("About Darkmatter {}", env!("CARGO_PKG_VERSION")), C::About, None))
             .push(rule::horizontal(1))
@@ -789,6 +790,11 @@ impl Chat {
         md: markdown::Settings,
     ) -> Element<'a, Message> {
         let post = &entry.post;
+        if self.store.blocked.contains(&post.user_id) {
+            return container(text("A message from someone you blocked").size(12).color(c.muted).font(italic()))
+                .padding(iced::Padding { top: 4.0, bottom: 4.0, left: GUTTER, right: 0.0 })
+                .into();
+        }
         if post.is_system() {
             return container(text(&post.message).size(13).color(c.muted).font(italic()))
                 .padding(iced::Padding { top: 4.0, bottom: 4.0, left: GUTTER, right: 0.0 })
@@ -879,6 +885,10 @@ impl Chat {
             });
         } else if kind != Kind::Thread {
             actions = actions.push(icon("●", "Mark unread from here", Message::MarkUnread(post.id.clone())));
+        }
+        if post.user_id != self.store.me.id && self.axiond.is_some() && !post.is_system() {
+            let name = self.store.users.get(&post.user_id).map(|u| u.username.clone()).unwrap_or_default();
+            actions = actions.push(icon("⚑", "Report or block", Message::Report(crate::report::Msg::Open(post.id.clone(), post.user_id.clone(), name))));
         }
         // Plugins' actions (a few; the hover bar should stay short).
         for (plugin, def) in self.plugins.actions().take(3) {

@@ -144,8 +144,11 @@ impl From<RawPalette> for Palette {
     fn from(r: RawPalette) -> Self {
         let dark_background = r.dark_background.unwrap_or(r.background);
         let dark_foreground = r.dark_foreground.unwrap_or(r.foreground);
-        let red = r.red.unwrap_or(r.accent);
-        let yellow = r.yellow.unwrap_or(r.accent);
+        // Red and yellow carry meaning (errors, busy, away), so a theme
+        // without them gets standard ones rather than its accent, which
+        // could be green and make "away" look like "online".
+        let red = r.red.unwrap_or(Rgb { r: 0xe0, g: 0x6c, b: 0x75 });
+        let yellow = r.yellow.unwrap_or(Rgb { r: 0xe5, g: 0xc0, b: 0x7b });
         Palette {
             mode: r.mode,
             accent: r.accent,
@@ -285,7 +288,7 @@ pub(crate) mod tests {
         assert_eq!(p.mode, Mode::Light);
         assert_eq!(p.orange, p.yellow);
         assert_eq!(p.darker_background, p.background);
-        assert_eq!(p.red, p.accent);
+        assert_ne!(p.red, p.accent, "red means something; never the accent");
     }
 
     #[test]
