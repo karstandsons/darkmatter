@@ -209,7 +209,7 @@ We won't pay for an outside audit. Confidence has to come from the libraries we 
 ### Running it on a VPS, with two admins
 
 - **The hosting provider can read the disk and memory**, so for us the provider is a server operator in the threat model below. E2EE is what protects conversations from it. Disk encryption and SQLCipher on a VPS only protect old disks and snapshots.
-- **A deploy kit in the repo:** Docker Compose with axiond and Caddy (for TLS), a firewall that only opens 80 and 443 (and SSH), SSH by key only, and automatic OS security updates. Written as a short checklist.
+- **A deploy kit in the repo:** Docker Compose with axiond serving HTTPS itself (Let's Encrypt built in; calls later need axiond on 443 itself to share it with ICE over TCP), a firewall that opens only 443 (TCP, and UDP for calls) and SSH, SSH by key only, and automatic OS security updates. Written as a short checklist. Caddy in front stays a documented alternative.
 - **Two admins, both accountable:** each has their own admin account with 2FA; no shared logins. The audit log moves into M1, so each admin sees what the other did.
 - **Backups leave the VPS,** encrypted before they go (for example with restic), so the backup host can't read them. Restoring is tested on a schedule, not just documented.
 
@@ -285,23 +285,25 @@ Reliability is the second priority, for the server and the apps alike:
 
 ## Voice and video
 
-**A core feature** (decided 2026-10-19): voice and video calls in DMs and channels, with screen sharing, end-to-end encrypted like messages. Everything below is a proposal; the library choices get a research pass before the calls milestone starts.
+**A core feature** (decided 2026-10-19): voice and video calls in DMs and channels, with screen sharing, end-to-end encrypted like messages. The research behind this section is in [research/calls.md](research/calls.md) (2026-10-19); everything here is the recommendation from it, to confirm with the Phase 0 spike.
 
-- **How media flows:**
-  - 1:1 calls go peer to peer when the network allows.
-  - Group calls go through a **small SFU built into axiond**: it forwards each person's audio and video to the others without decoding them. That keeps "one binary, one container" and suits groups of up to roughly 10–20 people.
-  - A **TURN relay** for people behind strict NATs, either built in or coturn in the deploy kit. On a VPS that means opening a UDP port range as well as 443.
+- **How media flows: everything through a small SFU built into axiond**, on **str0m** (Rust, MIT OR Apache-2.0).
+  - The SFU forwards each person's audio and video without decoding it. That keeps "one binary, one container".
+  - **1:1 calls go through it too:** one code path, and people's IP addresses stay hidden from each other, so no TURN relay is needed to get through NATs.
+  - **One UDP port** for media (443/udp suggested), not a range, plus ICE over TCP on 443 for networks that block UDP. TURN over TLS is a later option for networks that let nothing but TLS through.
+  - A 2-vCPU VPS should carry one 20-person video call or several small ones (estimated from LiveKit's and Mattermost's benchmarks; Phase 0 measures it). **The real limit is monthly traffic:** a 20-person video call sends about 50 GB an hour, so a 1 TB plan covers about 20 hours a month and a 20 TB plan (Hetzner EU) about 400.
+- **Clients use libwebrtc** (Google's WebRTC) through LiveKit's `libwebrtc` crate, with our own signalling (not LiveKit's server). It brings echo cancellation, noise suppression, codecs and congestion control, which would take over a year to rebuild. **Before calls leave beta we build libwebrtc ourselves without H.264/H.265 and FFmpeg**, which the prebuilt archives link (LGPL and patent problems).
 - **Encryption:**
-  - Every hop uses DTLS-SRTP, as all WebRTC does.
-  - On top, **frames are encrypted end to end with SFrame** ([RFC 9605](https://www.rfc-editor.org/rfc/rfc9605)), with keys taken from the channel's MLS group through the MLS exporter. The SFU and the TURN relay forward ciphertext they can't decode. Keys rotate when someone joins or leaves.
-  - So calls depend on M2's MLS groups, and the same verification covers both.
-- **What the server still sees:** who is in a call, when, for how long, and roughly how much data each person sends. Not what they say or show.
-- **Candidate libraries (to confirm in research):**
-  - Server SFU: **str0m**, a Rust WebRTC library with no built-in I/O, which fits axiond's tokio design.
-  - Clients: **libwebrtc** (Google's WebRTC, the engine in browsers and most call apps), through LiveKit's Rust bindings on desktop and natively on phones. It brings echo cancellation, noise suppression, codecs and network adaptation, which would be months of work to rebuild. The alternative is str0m on the client too, with our own capture, codecs and echo cancellation.
-  - Screen sharing: PipeWire and xdg-desktop-portal on Linux (Wayland), ScreenCaptureKit on macOS.
-- **On phones:** CallKit on iOS and the Telecom framework on Android for the ringing screen; incoming calls arrive as VoIP pushes (PushKit on iOS), which have strict rules of their own.
-- **Reliability:** reconnecting after a network change (Wi-Fi to mobile), clear call-quality indicators, and long-running tests with several clients in a call.
+  - DTLS-SRTP on every hop, as all WebRTC does.
+  - **A fresh MLS group per call** (only the people in the call, with the same device identities as chat, so chat verification carries over). Per-sender frame keys come from its MLS exporter and change on every join and leave.
+  - **Phase A:** LiveKit's frame encryption (AES-GCM) keyed from MLS: works on desktop and phones without patching libwebrtc.
+  - **Phase B, before calls lose the beta label:** real **SFrame** ([RFC 9605](https://www.rfc-editor.org/rfc/rfc9605)) through a small libwebrtc patch and the `sframe` crate.
+  - **Metadata settings:** Opus at a constant bitrate, no DTX and no audio-level header, because variable packet sizes and silence detection give away speech.
+- **What the server still sees:** who is in a call, from which device and address, when and for how long, packet sizes and rates, which track is a screen share, and (with Phase A) video resolution and keyframes. Not what anyone says or shows.
+- **Screen sharing:** libwebrtc's own capturers (xdg-desktop-portal and PipeWire on Wayland, ScreenCaptureKit on macOS). Video in iced through a shader widget.
+- **On phones (M4):** CallKit on iOS and Android's Core-Telecom for the ringing screen. **No PushKit VoIP pushes:** the push relay sends an ordinary push, the notification extension decrypts it and starts the ring itself (Apple's documented path for encrypted calls; it needs the same filtering entitlement as messages).
+- **Reliability:** ICE restart on network changes, a two-level reconnect (resume, then rejoin), a call-quality badge, deterministic SFU tests with str0m's network impairment simulator, and headless libwebrtc clients in CI.
+- **Escape hatch:** if the Phase 0 spike shows str0m can't keep up, LiveKit's server in a second container with the same client and encryption.
 
 ## Mobile and push
 
@@ -371,12 +373,12 @@ Reordered 2026-10-19 around the priorities (encryption and security, then reliab
 |---|---|---|
 | **M1: a solid foundation** | **First, a short E2EE design** (the wire format, files, search, push, devices and call keys) so everything after is built the encrypted way. Then all of Appendix A: threads, reactions, files and thumbnails, emoji, search (FTS5), set-unread, typing and status, slash commands with built-ins, ephemeral messages. **Security:** TLS and ACME, rate limits, sessions page, TOTP, invites, deactivate, report and block, account deletion, the audit log. **Reliability:** Darkmatter's outbox, tested backups and restores, tested upgrades, long-running tests, Darkmatter's tests against a pinned Mattermost too. **Running it:** the VPS deploy kit, multi-arch image, `axiond-v*` releases. **The two admins run it and use it on desktop.** | 6–8 weeks |
 | **M2: E2EE on desktop** | `dm-crypto` on openmls (built for iOS and Android from day one, checked in CI), key packages and the delivery service, E2EE DMs and private channels, encrypted files, device list and verification, client search index, recovery key and backup, the threat model doc, the review steps in [Review without a paid audit](#review-without-a-paid-audit-decided-2026-10-19). Passkeys. Labelled beta. | 2–3 months |
-| **M3: calls on desktop** | The SFU and TURN in axiond, 1:1 and group voice and video, screen sharing, SFrame encryption with MLS keys, Darkmatter's call UI on Linux and macOS. | about 3–4 months (rough, until the research pass) |
-| **M4: phones** | `darkmatter-core` extracted (started earlier where it helps desktop), UniFFI, Android and iOS apps (native UI) with E2EE and calls, the push relay and encrypted push, UnifiedPush, App Store and Play setup with a demo server. | about 10–14 person-months |
+| **M3: calls on desktop** | Phase 0 spike (go/no-go for str0m), then the SFU in axiond, 1:1 and group voice and video, screen sharing, per-call MLS groups with Phase A encryption, Darkmatter's call UI on Linux and macOS (the MVP, about 5.5–6.5 person-months). Then reliability hardening, our own libwebrtc build and SFrame (Phase B). | about 8.5–10.5 person-months |
+| **M4: phones** | `darkmatter-core` extracted (started earlier where it helps desktop), UniFFI, Android and iOS apps (native UI) with E2EE and calls (calls add about 6.5–8 person-months), the push relay and encrypted push, UnifiedPush, App Store and Play setup with a demo server. | about 10–14 person-months |
 | **M5: the group moves over** | The Mattermost importer (bulk export, or reading Postgres directly), Slack if still needed, webhooks and bot accounts, then the switch. | 3–4 weeks |
 | **M6: extensions** | WASM server plugins, sealed sender and padding, maybe federation, Postgres. | Ongoing |
 
-At this pace the switch is roughly 18–22 months away. Until then the group keeps using Darkmatter on the friend's Mattermost server. If that's too long, the lever is M4: the same Rust core under Flutter, rather than two native apps, saves roughly 30–40% of the UI work.
+At this pace the switch is roughly two and a half years away (M1–M4 is about 30 person-months). The quickest ways to shorten it: ship encrypted **voice** calls first (about 2.5–3 person-months on desktop) and video later, and give the group the M3 MVP while hardening continues. Until then the group keeps using Darkmatter on the friend's Mattermost server. If that's too long, the lever is M4: the same Rust core under Flutter, rather than two native apps, saves roughly 30–40% of the UI work.
 
 **M0 as built** (see `crates/axiond/README.md`):
 - Darkmatter logs in, reads, posts, replies, edits and deletes. Unreads, mentions, DMs, joining and leaving work, and live events resume after a drop.
@@ -397,7 +399,7 @@ At this pace the switch is roughly 18–22 months away. Until then the group kee
 6. **Slack:** is Slack still in use? If so, what plan, and do private channels and DMs need to come across?
 7. **Scale:** how many people are in the group? That decides when Postgres matters.
 8. **SSO:** does anyone need OIDC (Google, GitLab, Authentik…), or are passwords plus passkeys enough?
-9. **Calls:** decided 2026-10-19 that calls are a core feature. Still open: group size for calls, screen sharing, and the SFU and media library choices in [Voice and video](#voice-and-video).
+9. **Calls:** decided 2026-10-19 that calls are a core feature; the research answered the library choices. Still open: the largest group that needs video (20 is feasible on 2 vCPU), and whether encrypted voice calls should ship before video.
 10. **Which phone first** in M4, Android or iPhone?
 11. **Encryption library:** openmls or mls-rs, decided by their audit status at the start of M2.
 12. **Review without a paid audit (decided):** no paid audit; we rely on reviewed libraries, our own testing and community review.
