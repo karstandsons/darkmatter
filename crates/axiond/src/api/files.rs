@@ -296,6 +296,13 @@ fn mime_for(extension: &str) -> &'static str {
     }
 }
 
+/// Removes a file's bytes and its pictures from disk.
+pub async fn remove_stored(app: &App, id: &str) {
+    for kind in [Kind::Original, Kind::Thumbnail, Kind::Preview] {
+        let _ = tokio::fs::remove_file(file_path(app, id, kind)).await;
+    }
+}
+
 /// The file, if `me` can see its channel.
 async fn visible(app: &App, me: &Me, id: &str) -> Result<FileRow> {
     let file = file_row(app, id).await?.filter(|f| f.delete_at == 0).ok_or_else(|| Error::not_found("File"))?;

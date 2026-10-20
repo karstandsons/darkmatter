@@ -12,6 +12,7 @@ pub mod backup;
 pub mod config;
 mod db;
 mod error;
+pub mod housekeeping;
 mod hub;
 mod ids;
 mod limits;
@@ -59,6 +60,7 @@ impl App {
         let db = self.db.clone();
         let tls = self.config.tls()?;
         self.schedule_backups();
+        housekeeping::start(&self);
         let data_dir = self.config.data_dir.clone();
         let (email, staging) = (self.config.acme_email.clone(), self.config.acme_staging);
         let service = api::router(self).into_make_service_with_connect_info::<std::net::SocketAddr>();

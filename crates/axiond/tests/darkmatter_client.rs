@@ -925,3 +925,26 @@ async fn account_calls_from_darkmatter() {
     let _ = alice.revoke_session(&me.id, &sessions[0].id).await;
     assert!(alice.me().await.unwrap_err().is_unauthorized());
 }
+
+#[tokio::test]
+async fn housekeeping_removes_deleted_files() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let posted = alice.upload_file(&town, "a.png", png(8, 8)).await.unwrap().file_infos.remove(0);
+    let post = alice.create_post(&NewPost { channel_id: town.clone(), file_ids: vec![posted.id.clone()], ..Default::default() }).await.unwrap();
+    let unposted = alice.upload_file(&town, "b.png", png(8, 8)).await.unwrap().file_infos.remove(0);
+    let stored = |id: &str| s.app.config.data_dir.join("files").join(&id[..2]).join(id);
+    assert!(stored(&posted.id).exists() && stored(&unposted.id).exists());
+
+    // Fresh deletes and uploads are kept for now.
+    alice.delete_post(&post.id).await.unwrap();
+    assert_eq!(axiond::housekeeping::run(&s.app).await.unwrap(), 0);
+
+    // Once old enough, their bytes and thumbnails go.
+    sqlx::query("UPDATE files SET delete_at = delete_at - 8 * 86400000, create_at = create_at - 2 * 86400000").execute(&s.app.db).await.unwrap();
+    assert_eq!(axiond::housekeeping::run(&s.app).await.unwrap(), 2);
+    assert!(!stored(&posted.id).exists() && !stored(&unposted.id).exists());
+    assert!(!s.app.config.data_dir.join("files").join(&posted.id[..2]).join(format!("{}_thumb.jpg", posted.id)).exists());
+}
