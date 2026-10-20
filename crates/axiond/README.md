@@ -11,6 +11,9 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
 - Logging in and out. Passwords are stored as argon2id hashes and session
   tokens as SHA-256 hashes. After five wrong passwords, an account waits
   before it can try again, and the wait doubles with each try.
+- Two-factor login codes (any authenticator app), each usable once. If
+  someone loses their phone, `axiond user mfa-off <name>` turns them off.
+- A list of your signed-in apps, with signing one or all of them out.
 - Teams, public channels and direct messages: joining, leaving, and finding
   channels by name.
 - Messages: posting, threads, editing, deleting and reactions.

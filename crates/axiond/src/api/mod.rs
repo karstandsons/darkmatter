@@ -7,6 +7,7 @@ pub(crate) mod files;
 mod posts;
 mod reactions;
 mod search;
+pub(crate) mod sessions;
 pub(crate) mod status;
 mod threads;
 mod users;
@@ -29,6 +30,12 @@ pub fn router(app: App) -> Router {
         .route("/users/login", post(users::login))
         .route("/users/logout", post(users::logout))
         .route("/users/me", get(users::me))
+        .route("/users/{id}/sessions", get(sessions::list))
+        .route("/users/{id}/sessions/revoke", post(sessions::revoke))
+        .route("/users/{id}/sessions/revoke/all", post(sessions::revoke_all))
+        .route("/users/{id}/mfa/generate", post(sessions::generate))
+        .route("/users/{id}/mfa", put(sessions::activate))
+        .route("/e2ee/config", get(e2ee_config))
         .route("/users/ids", post(users::by_ids))
         .route("/users/status/ids", post(status::by_ids))
         .route("/users/{id}/status", get(status::get_one).put(status::put))
@@ -70,6 +77,12 @@ pub fn router(app: App) -> Router {
         .route("/websocket", get(ws::websocket))
         .fallback(not_yet);
     Router::new().nest("/api/v4", api).with_state(app)
+}
+
+/// What end-to-end encryption this server offers. Darkmatter uses it to
+/// tell axiond from plain Mattermost (which answers 404). Nothing yet: M2.
+async fn e2ee_config() -> Json<Value> {
+    Json(json!({ "enabled": false, "server": "axiond", "version": crate::VERSION }))
 }
 
 /// The largest upload request: a post's worth of files at the size limit.

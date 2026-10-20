@@ -88,20 +88,23 @@ impl FromRequestParts<App> for Me {
 }
 
 /// Starts a session; returns the token, which only the app gets to see.
-pub async fn create_session(app: &App, user_id: &str, device_id: &str) -> sqlx::Result<String> {
+/// Every session is a device for end-to-end encryption: if the app didn't
+/// name one, it gets a new id.
+pub async fn create_session(app: &App, user_id: &str, device_id: &str, user_agent: &str) -> sqlx::Result<String> {
     let token = ids::new_token();
     let now = ids::now();
+    let device_id = if device_id.is_empty() { ids::new_id() } else { device_id.chars().take(64).collect() };
     sqlx::query(
-        "INSERT INTO sessions (id, token_hash, user_id, device_id, create_at, last_activity_at, expires_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sessions (id, token_hash, user_id, device_id, create_at, last_activity_at, expires_at, user_agent) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)",
     )
     .bind(ids::new_id())
     .bind(ids::hash_token(&token))
     .bind(user_id)
     .bind(device_id)
     .bind(now)
-    .bind(now)
     .bind(now + SESSION_DAYS * 86_400_000)
+    .bind(user_agent)
     .execute(&app.db)
     .await?;
     Ok(token)

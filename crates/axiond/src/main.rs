@@ -63,6 +63,8 @@ enum UserCommand {
     Password { username: String },
     /// Set someone's profile picture (PNG, JPEG, GIF or WebP).
     Picture { username: String, file: PathBuf },
+    /// Turn off someone's two-factor codes, if they lost their phone (they're signed out everywhere).
+    MfaOff { username: String },
 }
 
 #[derive(Subcommand)]
@@ -135,6 +137,12 @@ async fn main() -> anyhow::Result<()> {
             let bytes = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             admin::set_picture(&app, &username, bytes).await?;
             println!("Changed {username}'s picture.");
+            Ok(())
+        }
+        Command::User(UserCommand::MfaOff { username }) => {
+            let app = App::open(config).await?;
+            admin::mfa_off(&app, &username).await?;
+            println!("Turned off {username}'s two-factor codes and signed them out everywhere.");
             Ok(())
         }
         Command::Emoji(EmojiCommand::Add { name, file }) => {

@@ -595,3 +595,70 @@ async fn statuses_and_server_commands() {
     let s2 = alice.command_suggestions(&team, &town, "/m").await.unwrap();
     assert_eq!(s2.iter().map(|x| x.complete.as_str()).collect::<Vec<_>>(), ["me", "msg", "mute"]);
 }
+
+#[tokio::test]
+async fn sessions_and_two_factor_codes() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let laptop = login(&s, "alice").await;
+    let alice_id = alice.me().await.unwrap().id;
+    let http = reqwest::Client::new();
+    let api = |path: &str| format!("{}/api/v4/{path}", s.url);
+    let get = |c: &Client, path: String| http.get(api(&path)).bearer_auth(c.token().unwrap().to_string()).send();
+
+    // Two apps signed in; the list never shows tokens.
+    let sessions: serde_json::Value = get(&alice, format!("users/{alice_id}/sessions")).await.unwrap().json().await.unwrap();
+    let sessions = sessions.as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions.iter().all(|s| s["device_id"].as_str().unwrap().len() == 26 && s.get("token").is_none()));
+    let current = sessions.iter().filter(|s| s["is_current"] == true).count();
+    assert_eq!(current, 1);
+
+    // Signing the laptop out ends it at once.
+    let laptop_session = sessions.iter().find(|s| s["is_current"] == false).unwrap()["id"].as_str().unwrap().to_string();
+    let revoke = http
+        .post(api(&format!("users/{alice_id}/sessions/revoke")))
+        .bearer_auth(alice.token().unwrap())
+        .json(&serde_json::json!({ "session_id": laptop_session }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), 200);
+    assert!(laptop.me().await.unwrap_err().is_unauthorized());
+
+    // Turning on two-factor codes: a secret, then a code from it.
+    let generated: serde_json::Value = http.post(api(&format!("users/{alice_id}/mfa/generate"))).bearer_auth(alice.token().unwrap()).send().await.unwrap().json().await.unwrap();
+    assert!(generated["url"].as_str().unwrap().starts_with("otpauth://totp/axiond:alice?secret="));
+    let secret = totp_rs::Secret::try_from_base32(generated["secret"].as_str().unwrap()).unwrap();
+    let totp = totp_rs::Builder::new().with_secret(secret).build().unwrap();
+    let activate = |code: String, on: bool| {
+        http.put(api(&format!("users/{alice_id}/mfa")))
+            .bearer_auth(alice.token().unwrap().to_string())
+            .json(&serde_json::json!({ "activate": on, "code": code }))
+            .send()
+    };
+    assert_eq!(activate("000000".into(), true).await.unwrap().status(), 400);
+    let code = totp.generate_current().to_string();
+    assert_eq!(activate(code.clone(), true).await.unwrap().status(), 200);
+
+    // Logging in now needs a code, and each code works once.
+    let mut c = Client::new(&s.url).unwrap();
+    assert!(c.login("alice", PASSWORD, None).await.unwrap_err().needs_mfa());
+    assert!(c.login("alice", "wrong", None).await.unwrap_err().is_unauthorized(), "a wrong password doesn't reveal codes are on");
+    assert!(!c.login("alice", "wrong", None).await.unwrap_err().needs_mfa());
+    assert!(c.login("alice", PASSWORD, Some(&code)).await.is_err(), "the code used to turn it on is spent");
+    // The next step's code is accepted (clocks drift), and then it's spent too.
+    let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let next = totp.generate(unix + 30).to_string();
+    c.login("alice", PASSWORD, Some(&next)).await.unwrap();
+    assert!(Client::new(&s.url).unwrap().login("alice", PASSWORD, Some(&next)).await.is_err(), "no replays");
+
+    // An admin can turn them off for a lost phone.
+    admin::mfa_off(&s.app, "alice").await.unwrap();
+    assert!(c.me().await.unwrap_err().is_unauthorized(), "and that signs them out");
+    Client::new(&s.url).unwrap().login("alice", PASSWORD, None).await.unwrap();
+
+    // Darkmatter can tell axiond from plain Mattermost.
+    let e2ee: serde_json::Value = http.get(api("e2ee/config")).send().await.unwrap().json().await.unwrap();
+    assert_eq!((e2ee["server"].as_str(), e2ee["enabled"].as_bool()), (Some("axiond"), Some(false)));
+}

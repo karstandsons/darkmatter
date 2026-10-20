@@ -17,10 +17,13 @@ pub struct Login {
     /// The app's device, kept for end-to-end encryption later.
     #[serde(default)]
     device_id: String,
+    /// A two-factor code, for accounts that have them on.
+    #[serde(default)]
+    token: String,
 }
 
 /// `POST users/login`: the user, with the session token in the `Token` header.
-pub async fn login(State(app): State<App>, Json(body): Json<Login>) -> Result<(HeaderMap, Json<User>)> {
+pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body): Json<Login>) -> Result<(HeaderMap, Json<User>)> {
     let login = body.login_id.trim();
     if let Some(wait) = app.guard.locked(login) {
         let minutes = wait.as_secs().div_ceil(60);
@@ -29,13 +32,14 @@ pub async fn login(State(app): State<App>, Json(body): Json<Login>) -> Result<(H
             if minutes == 1 { "" } else { "s" }
         )));
     }
-    let found: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, password_hash FROM users WHERE (username = lower(?1) OR lower(email) = lower(?1)) AND delete_at = 0",
+    let found: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT id, password_hash, mfa_active FROM users WHERE (username = lower(?1) OR lower(email) = lower(?1)) AND delete_at = 0",
     )
     .bind(login)
     .fetch_optional(&app.db)
     .await?;
-    let (id, hash) = found.unzip();
+    let mfa = found.as_ref().is_some_and(|f| f.2);
+    let (id, hash) = found.map(|(id, hash, _)| (id, hash)).unzip();
     let password = body.password;
     // argon2 is deliberately slow: keep it off the async threads.
     let ok = tokio::task::spawn_blocking(move || auth::verify_password(hash.as_deref(), &password))
@@ -49,8 +53,27 @@ pub async fn login(State(app): State<App>, Json(body): Json<Login>) -> Result<(H
             message: "Enter a valid email or username and/or password.".into(),
         });
     };
+    // Asked only once the password is right, so it doesn't say who has codes on.
+    if mfa {
+        if body.token.trim().is_empty() {
+            return Err(Error {
+                status: axum::http::StatusCode::UNAUTHORIZED,
+                id: "mfa.validate_token.authenticate.app_error",
+                message: "Enter the code from your authenticator app.".into(),
+            });
+        }
+        if !super::sessions::check_code(&app, &id, &body.token).await? {
+            app.guard.failed(login);
+            return Err(Error {
+                status: axum::http::StatusCode::UNAUTHORIZED,
+                id: "mfa.validate_token.authenticate.app_error",
+                message: "That code isn't right. Use a new one from your authenticator app.".into(),
+            });
+        }
+    }
     app.guard.succeeded(login);
-    let token = auth::create_session(&app, &id, body.device_id.trim()).await?;
+    let agent: String = request_headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or_default().chars().take(200).collect();
+    let token = auth::create_session(&app, &id, body.device_id.trim(), &agent).await?;
     let mut headers = HeaderMap::new();
     headers.insert("Token", HeaderValue::from_str(&token).map_err(|_| Error::internal())?);
     Ok((headers, Json(db::user(&app.db, &id, &id).await?)))

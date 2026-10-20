@@ -54,6 +54,19 @@ pub async fn set_picture(app: &App, username: &str, bytes: Vec<u8>) -> anyhow::R
     Ok(())
 }
 
+/// Turns off someone's two-factor codes (a lost phone) and signs them out.
+pub async fn mfa_off(app: &App, username: &str) -> anyhow::Result<()> {
+    let done = sqlx::query("UPDATE users SET mfa_active = 0, mfa_secret = '', mfa_last_step = 0 WHERE username = ?")
+        .bind(username)
+        .execute(&app.db)
+        .await?;
+    if done.rows_affected() == 0 {
+        bail!("there's no {username}");
+    }
+    sqlx::query("DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?)").bind(username).execute(&app.db).await?;
+    Ok(())
+}
+
 /// Makes the first admin and their team, with Town Square and Off-Topic.
 /// Only on an empty server.
 pub async fn setup(app: &App, admin: NewUser, team: &str, team_display: &str) -> anyhow::Result<()> {
