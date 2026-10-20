@@ -4,8 +4,15 @@ axiond is the Darkmatter chat server. This is a plan, not a spec: each section s
 
 ## Who it's for and why
 
-- **Our own team**, moving off Mattermost and Slack.
+- **Our own group**, moving off Mattermost and Slack. Today we chat on a friend's Mattermost server, through Darkmatter. **The aim is independence from Mattermost:** our own server and our own apps.
+  - The group uses **Linux and macOS desktops, iPhones and Android phones.** Nobody uses Windows.
+  - axiond will be **run by two of us on a VPS.**
 - **Friends and small groups** who want a chat server that's easy to run on almost anything: a home server exposed to the internet, a cheap VPS, a NAS. It's one Docker container with a small footprint.
+
+**Priorities, in order** (decided 2026-10-19):
+1. **Encryption and security** of our chats.
+2. **Reliability** of both the server and the apps.
+3. Features.
 
 Why switch:
 - **Mattermost:** the free editions are getting smaller.
@@ -29,12 +36,19 @@ Why switch:
    - SQLite by default, so there are no other services to run.
    - Idle RAM under 50 MB.
    - A first-run setup page.
-4. **Darkmatter is the main client on every platform:** Linux and macOS now; iOS, Android and Windows later.
-5. **Migration in:** import from a Mattermost bulk export and a Slack export zip.
+4. **Darkmatter is the client on every platform the group uses:** Linux and macOS now; iOS and Android in M3. Windows isn't planned.
+5. **Reliable.** No lost messages, backups that restore, upgrades that don't break, and a server two part-time admins can keep running (see [Reliability](#reliability)).
+6. **Migration in:** import from the friend's Mattermost server and a Slack export zip.
 
 ## Non-goals (for now)
 
-- **Full Mattermost API compatibility.** We implement the part Darkmatter uses (see [Appendix A](#appendix-a-mattermost-api-surface-darkmatter-uses-today)) so today's Darkmatter runs on axiond from the start. We don't chase the Mattermost web app or the Mattermost mobile apps. Their API is several hundred endpoints, and they would never speak our E2EE extension anyway.
+- **Full Mattermost API compatibility.** We implement the part Darkmatter uses (see [Appendix A](#appendix-a-mattermost-api-surface-darkmatter-uses-today)) so today's Darkmatter runs on axiond from the start. We don't chase the Mattermost web app or the Mattermost mobile apps. The research behind this is in [research/mattermost-rewrite.md](research/mattermost-rewrite.md) (2026-10-19):
+  - **The size:** Mattermost has about 600 REST routes, about 108 websocket event types, 88 tables, 310 permissions and about 300k lines of Go, and it adds about 7 routes a month. A drop-in rewrite is roughly 40–70 person-months, then a third to half of a person indefinitely.
+  - **Push:** the official phone apps get notifications through Mattermost's push service, which needs a Mattermost license and its terms. They could never get reliable push from axiond.
+  - **Plugins:** Mattermost's server plugins speak a Go-only RPC protocol and use Mattermost's own Postgres schema.
+  - **Encryption:** the official apps would never speak our E2EE, so their users would always be second-class.
+- **Forking Mattermost** (and writing our own versions of its paid features) was also considered and rejected. It would still tie us to Mattermost's code, releases and official apps (the phone app refuses servers that report a version below 9.11, and raises that bar over time). It's Go, not Rust, and it doesn't give us encryption we control.
+- **Windows.** Nobody in the group uses it. iced makes it possible later.
 - **Federation** between servers. Maybe later (M5+). MLS doesn't rule it out.
 - **Huge installs.** The target is 2 to a few hundred users per server. Postgres and multiple nodes are possible later, but they don't drive the design.
 - **Voice and video** at launch. Calls are a later project. WebRTC with SFrame/MLS keys is a candidate, but nothing is decided.
@@ -83,6 +97,19 @@ Every encrypted chat app makes this trade-off. Our answer is to choose **per cha
 - **libsignal:** **AGPL-3.0** and not published as a general library. It's built for Signal's own server, and its license would force the client to be AGPL. Rejected.
 
 We do **not** write our own crypto. The `dm-crypto` crate (below) is a thin layer: storage, the wire format, and mapping channels to MLS groups.
+
+### Review without a paid audit (decided 2026-10-19)
+
+We won't pay for an outside audit. Confidence has to come from the libraries we choose, from community review, and from our own testing. That means:
+- **Keep our own crypto code as small as possible.** `dm-crypto` only wires openmls to storage and the wire format. No custom primitives, no custom protocol steps. If something needs crypto that MLS doesn't provide, use a reviewed construction from a reviewed crate (RustCrypto, libcrux) and write down why.
+- **Prefer reviewed components.** As of 2026-10-19 we found no published independent audit of openmls itself. NCC Group's public review of XMTP's libxmtp, which is built on openmls, is indirect evidence ([report](https://nccgroup.com/dk/research-blog/public-report-xmtp-mls-implementation-review)). Before M2 starts, check openmls's and mls-rs's current audit status again and record it here. If one has a real audit and the other doesn't, that decides the library.
+- **Test hard ourselves:**
+  - openmls's RFC 9420 test vectors and interop tests in CI;
+  - property tests over group operations (add, remove, update, out-of-order delivery, a device offline for weeks);
+  - fuzzing the wire-format parser and everything that reads `props.dm_e2ee` and the `/e2ee` endpoints;
+  - tests where a malicious server reorders, replays, drops or forges handshake messages.
+- **Publish for review.** The design doc, the threat model and the `dm-crypto` code are written to be read by outsiders. When they're ready, we ask for review where people who know MLS read: openmls's maintainers and community, and security forums.
+- **Be honest in the app.** Encryption is labelled **beta** until it has had community review and months of use by our group without problems.
 
 ### How it fits the API
 
@@ -156,6 +183,13 @@ We do **not** write our own crypto. The `dm-crypto` crate (below) is a thin laye
 - **Disclosure:** `security.txt`, `SECURITY.md` with a private reporting address, and a published threat model (next section).
 - **Dependency hygiene:** a small dependency tree, `#![forbid(unsafe_code)]` in axiond's own crates.
 
+### Running it on a VPS, with two admins
+
+- **The hosting provider can read the disk and memory**, so for us the provider is a server operator in the threat model below. E2EE is what protects conversations from it. Disk encryption and SQLCipher on a VPS only protect old disks and snapshots.
+- **A deploy kit in the repo:** Docker Compose with axiond and Caddy (for TLS), a firewall that only opens 80 and 443 (and SSH), SSH by key only, and automatic OS security updates. Written as a short checklist.
+- **Two admins, both accountable:** each has their own admin account with 2FA; no shared logins. The audit log moves into M1, so each admin sees what the other did.
+- **Backups leave the VPS,** encrypted before they go (for example with restic), so the backup host can't read them. Restoring is tested on a schedule, not just documented.
+
 ### Threat model (summary; the full version goes in `docs/axiond/THREAT_MODEL.md`)
 
 | Adversary | Protected? |
@@ -163,7 +197,7 @@ We do **not** write our own crypto. The `dm-crypto` crate (below) is a thin laye
 | Someone on the network (coffee-shop Wi-Fi, ISP) | Yes. TLS everywhere. |
 | A server operator or hosting provider reading conversations | **For E2EE channels, yes:** they get ciphertext and metadata only. For non-E2EE channels, no. That's stated in the UI. |
 | A stolen database or backup | E2EE content is safe. Passwords are argon2id hashes. Session tokens are hashed. Non-E2EE content is exposed unless at-rest encryption is on. |
-| A compromised server serving malicious keys | Mitigated by device verification and warnings when a key changes. Unverified contacts are a risk, as in Signal. |
+| A compromised server, or a VPS provider, serving malicious keys | Mitigated by device verification and warnings when a key changes. Unverified contacts are a risk, as in Signal. |
 | A stolen unlocked device | Not protected. Device removal limits the damage to new messages afterwards. |
 | A malicious plugin | Server plugins run sandboxed, can't read E2EE content, and get only the permissions they're granted. |
 | Push providers (Apple, Google) | They see only that a ping was sent: no content, no sender (see [Mobile](#mobile-and-push)). |
@@ -211,7 +245,24 @@ crates/
   - Health check at `/api/v4/system/ping`.
 - **Footprint target:** idle RAM under 50 MB, a binary under 30 MB, and running comfortably on a Raspberry Pi 4 or a $5 VPS.
 
+## Reliability
+
+Reliability is the second priority, for the server and the apps alike:
+- **No lost messages.**
+  - Darkmatter keeps an outbox: a message sent offline, or while the server restarts, is kept and retried until the server confirms it. `pending_post_id` stops retries from posting twice.
+  - Websocket resume with sequence numbers (done in M0) covers short drops; a longer gap falls back to fetching what changed.
+- **The database stays consistent.** SQLite in WAL mode, every multi-step change in one transaction, and foreign keys on.
+- **Upgrades are safe.** Migrations run inside a transaction, the server takes a backup before applying a new migration, and CI runs every migration over a database made by each earlier release.
+- **Backups restore.** CI restores a backup into a fresh server and checks it.
+- **Tested the way it's used:**
+  - end-to-end tests that drive axiond through Darkmatter's own client (`tests/darkmatter_client.rs`, started in M0);
+  - long-running tests that keep several clients posting, reconnecting and restarting the server for hours, and then check nothing was lost or duplicated;
+  - Darkmatter's tests also run against a pinned local Mattermost, so either server can't quietly break it.
+- **Easy to watch:** `axiond ping` for health checks, clear logs, and a short page for admins on what to do when something goes wrong.
+
 ## Mobile and push
+
+**Status (2026-10-19): planned for M3, after encryption works on desktop.** The research behind this section is in [research/mobile-apps.md](research/mobile-apps.md). The phone apps need a demo server, report and block, and account deletion to pass App Store review; those come into M1 and M2 so they don't hold M3 up.
 
 - **Push works by wake-up only.** The notification carries no message text, no sender and no channel. It is just "you have something new", plus an opaque ID. The app wakes, fetches over TLS, decrypts, and builds the notification on the device.
   - Signal and Wire describe the same design.
@@ -228,6 +279,12 @@ crates/
   - Why: push, background fetch, the keychain or keystore, share sheets and accessibility all need native code. iced on mobile isn't ready for a production app.
   - The desktop app keeps iced.
   - This also means moving Darkmatter's non-UI logic into a `darkmatter-core` crate over time, which helps the desktop code too.
+- **Things the research found that shape the design:**
+  - The iOS notification extension that decrypts a push gets only about 24 MB of memory, so the core needs a lean "decrypt one message" mode. Element X does the same.
+  - Hiding a notification on iOS needs an entitlement Apple grants by hand, so every push must produce a visible notification, with "New message" as the fallback.
+  - FCM lowers the priority of an app's urgent pushes if they don't lead to a visible notification, so only messages that notify are sent as urgent.
+  - Client plugins can't run as subprocesses on phones. The built-in plugins get Rust versions in the core; other plugins become server plugins.
+  - `mm-api`'s websocket uses `rustls-native-certs`, which doesn't support Android. It has to move to `rustls-platform-verifier` first.
 
 ## Plugins on the server
 
@@ -247,7 +304,8 @@ crates/
   - The importer downloads linked files while the links still work, so run it soon after exporting.
 - **What's imported:** users (as invited, with their old usernames kept), channels, history, threads, reactions, files and custom emoji.
 - **Imported history is not end-to-end encrypted.** It arrived in plaintext and the server has seen it. The UI marks it "Imported", and E2EE starts with new messages. Admins can choose to import DMs as "archived, not searchable", or skip them.
-- **Moving the team over:** run axiond next to Mattermost, import, check, then switch. Darkmatter can stay logged in to both during the overlap.
+- **A direct importer** is the other fallback: since our friend runs the Mattermost server, it can read about 12 of its Postgres tables (users, teams, channels, members, posts, reactions, files, emoji, preferences, thread memberships, sidebar categories) read-only. Roughly 2–3 weeks.
+- **Moving the group over:** run axiond next to Mattermost, import, check, then switch. Darkmatter can stay logged in to both during the overlap. **The switch waits until encrypted chat works on desktop and both phones** (M4).
 
 ## License
 
@@ -264,20 +322,26 @@ Sizes are rough and assume the current pace: one person plus Claude.
 | Milestone | Scope | Size |
 |---|---|---|
 | **M0: skeleton** (done 2026-10-19) | `crates/axiond` and the shared-crate split. SQLite schema and migrations. Login (argon2id), `users/me`, teams, channels, posts and the websocket with `hello`/`posted`. Darkmatter can log in, read and post. Dockerfile. | 1–2 weeks |
-| **M1: Darkmatter feature parity** | All of Appendix A: threads, reactions, files and thumbnails, emoji, search (FTS5), unreads and `view`, set-unread, typing and status, DMs, user autocomplete, slash commands with built-ins, ephemeral messages. TLS and ACME, rate limits, sessions page, TOTP, backups, first-run setup, admin basics (invite, deactivate, roles). Multi-arch image, `axiond-v*` releases. **Friends can use it.** | 4–6 weeks |
-| **M2: migration and team switch** | Mattermost and Slack importers, incoming and outgoing webhooks, bot accounts, the audit log, passkeys, Postgres support. **The team moves over.** | 3–4 weeks |
-| **M3: E2EE** | `dm-crypto` on openmls, key packages and the delivery service, E2EE DMs and private channels, encrypted files, device list and verification, client search index, recovery key and backup, threat model doc. An external review of the crypto layer before calling it stable. | 6–10 weeks |
-| **M4: mobile and push** | `darkmatter-core` extracted with UniFFI, iOS and Android apps (native UI), push relay, UnifiedPush, background sync. | 3–6 months |
-| **M5: extensions** | WASM server plugins, calls (WebRTC), sealed sender and padding, maybe federation. | Ongoing |
+Reordered 2026-10-19 around the priorities (encryption and security, then reliability) and the group's devices. The group moves over only when encrypted chat works on desktop **and** both phones.
+
+| Milestone | Scope | Size |
+|---|---|---|
+| **M1: a solid foundation** | **First, a short E2EE design** (the wire format, files, search, push and devices) so everything after is built the encrypted way. Then all of Appendix A: threads, reactions, files and thumbnails, emoji, search (FTS5), set-unread, typing and status, slash commands with built-ins, ephemeral messages. **Security:** TLS and ACME, rate limits, sessions page, TOTP, invites, deactivate, report and block, account deletion, the audit log. **Reliability:** Darkmatter's outbox, tested backups and restores, tested upgrades, long-running tests, Darkmatter's tests against a pinned Mattermost too. **Running it:** the VPS deploy kit, multi-arch image, `axiond-v*` releases. **The two admins run it and use it on desktop.** | 6–8 weeks |
+| **M2: E2EE on desktop** | `dm-crypto` on openmls (built for iOS and Android from day one, checked in CI), key packages and the delivery service, E2EE DMs and private channels, encrypted files, device list and verification, client search index, recovery key and backup, the threat model doc, the review steps in [Review without a paid audit](#review-without-a-paid-audit-decided-2026-10-19). Passkeys. Labelled beta. | 2–3 months |
+| **M3: phones** | `darkmatter-core` extracted (started earlier where it helps desktop), UniFFI, Android and iOS apps (native UI) with E2EE, the push relay and encrypted push, UnifiedPush, App Store and Play setup with a demo server. | about 10–14 person-months |
+| **M4: the group moves over** | The Mattermost importer (bulk export, or reading Postgres directly), Slack if still needed, webhooks and bot accounts, then the switch. | 3–4 weeks |
+| **M5: extensions** | WASM server plugins, calls (WebRTC), sealed sender and padding, maybe federation, Postgres. | Ongoing |
+
+At this pace the switch is roughly 15–18 months away. Until then the group keeps using Darkmatter on the friend's Mattermost server. If that's too long, the lever is M3: the same Rust core under Flutter, rather than two native apps, saves roughly 30–40% of the UI work.
 
 **M0 as built** (see `crates/axiond/README.md`):
 - Darkmatter logs in, reads, posts, replies, edits and deletes. Unreads, mentions, DMs, joining and leaving work, and live events resume after a drop.
 - Plus a CLI (`setup`, `user add`, `user password`, `channel add`, `ping`) and a `FROM scratch` Docker image.
 - Two changes from the plan:
   - **Queries are checked at runtime, not compile time.** `sqlx::query!` needs a live database or a committed `.sqlx` cache at build time. The integration tests drive every query through Darkmatter's own client (`tests/darkmatter_client.rs`), and that catches the same mistakes.
-  - **The shared-crate split is partial.** `mm-api`'s HTTP client is now a default feature, so axiond uses only its models. `dm-crypto` and `dm-plugin` get created when M3 and the server plugins need them.
+  - **The shared-crate split is partial.** `mm-api`'s HTTP client is now a default feature, so axiond uses only its models. `dm-crypto` and `dm-plugin` get created when M2 (E2EE) and the server plugins need them.
 
-**Order note:** E2EE (M3) comes after the team switch (M2) so the switch isn't blocked on crypto. The **wire format and API reserve space for E2EE from M0**: `props.dm_e2ee`, device IDs on sessions, and an `encrypted` flag on channels. That way M3 doesn't need a migration of the data model.
+**Order note:** the **wire format and API reserve space for E2EE from M0**: `props.dm_e2ee`, device IDs on sessions, and an `encrypted` flag on channels. That way M2 doesn't need a migration of the data model.
 
 ## Open questions
 
@@ -285,11 +349,14 @@ Sizes are rough and assume the current pace: one person plus Claude.
 2. **History on new devices:** is the optional encrypted server backup with a recovery key OK? The alternative is device-to-device transfer only, which is more private but easier to lose.
 3. **Push relay:** are you OK with Karst & Sons running a small public relay for the store apps, given it sees only device tokens and pings?
 4. **License:** ~~AGPL-3.0-or-later for axiond?~~ Decided 2026-10-19: AGPL-3.0-or-later. Still open: CLA or DCO? Will you ever want to sell commercial licenses or a hosted version?
-5. **Mattermost edition:** which edition and version is the team's server on? That decides whether bulk export works or we use the REST importer.
-6. **Slack:** what plan is the workspace on? Do private channels and DMs need to come across?
-7. **Scale:** how many users does the largest install need, both the team and the biggest friends' server? That decides when Postgres matters.
-8. **SSO:** does the team need OIDC (Google, GitLab, Authentik…) at M2, or are passwords plus passkeys enough?
-9. **Calls:** how soon do you need voice and video, and are they part of the Slack replacement?
+5. **Mattermost edition:** which edition and version is the friend's server on? That decides whether bulk export works, or we read its database directly. (Needed by M4.)
+6. **Slack:** is Slack still in use? If so, what plan, and do private channels and DMs need to come across?
+7. **Scale:** how many people are in the group? That decides when Postgres matters.
+8. **SSO:** does anyone need OIDC (Google, GitLab, Authentik…), or are passwords plus passkeys enough?
+9. **Calls:** how soon do you need voice and video?
+10. **Which phone first** in M3, Android or iPhone?
+11. **Encryption library:** openmls or mls-rs, decided by their audit status at the start of M2.
+12. **Review without a paid audit (decided):** no paid audit; we rely on reviewed libraries, our own testing and community review.
 
 ---
 
