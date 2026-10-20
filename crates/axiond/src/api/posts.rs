@@ -62,6 +62,20 @@ pub async fn create(State(app): State<App>, me: Me, Json(body): Json<Create>) ->
     if db::member(&app.db, &channel.id, &me.user_id).await?.is_none() {
         return Err(Error::forbidden());
     }
+    // A retry of a message that already arrived (the app never heard back):
+    // the same message, not a second one.
+    if !body.pending_post_id.is_empty() {
+        let existing: Option<String> = sqlx::query_scalar("SELECT id FROM posts WHERE user_id = ? AND pending_post_id = ?")
+            .bind(&me.user_id)
+            .bind(&body.pending_post_id)
+            .fetch_optional(&app.db)
+            .await?;
+        if let Some(id) = existing {
+            let mut post = db::post(&app.db, &id).await?.ok_or_else(Error::internal)?;
+            post.pending_post_id = body.pending_post_id;
+            return Ok((StatusCode::CREATED, Json(post)));
+        }
+    }
     if channel.kind == "D"
         && let Some(other) = channel.name.split("__").find(|id| *id != me.user_id)
         && super::safety::blocked_between(&app, &me.user_id, other).await?
@@ -87,8 +101,8 @@ pub async fn insert(app: &App, channel: &ChannelRow, user_id: &str, new: New) ->
 
     let mut tx = app.db.begin().await?;
     sqlx::query(
-        "INSERT INTO posts (id, channel_id, user_id, root_id, create_at, update_at, message, type, file_ids) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8)",
+        "INSERT INTO posts (id, channel_id, user_id, root_id, create_at, update_at, message, type, file_ids, pending_post_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9)",
     )
     .bind(&id)
     .bind(&channel.id)
@@ -98,6 +112,7 @@ pub async fn insert(app: &App, channel: &ChannelRow, user_id: &str, new: New) ->
     .bind(&new.message)
     .bind(new.kind)
     .bind(serde_json::to_string(&new.file_ids).unwrap_or_else(|_| "[]".into()))
+    .bind(&new.pending_post_id)
     .execute(&mut *tx)
     .await?;
     for file in &new.file_ids {

@@ -998,3 +998,22 @@ async fn databases_from_older_versions_open() {
         assert!(alice.search_posts(&team, "reply").await.unwrap().order.len() == 1, "{version}: search index");
     }
 }
+
+#[tokio::test]
+async fn a_retried_message_is_written_once() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let new = NewPost { channel_id: town.clone(), message: "once".into(), pending_post_id: "me:123".into(), ..Default::default() };
+    let first = alice.create_post(&new).await.unwrap();
+    let again = alice.create_post(&new).await.unwrap();
+    assert_eq!(first.id, again.id);
+    assert_eq!(again.pending_post_id, "me:123");
+    let page = alice.posts(&town, PostsQuery::Page { page: 0, per_page: 10 }, false).await.unwrap();
+    assert_eq!(page.posts.values().filter(|p| p.message == "once").count(), 1);
+    // Someone else's id never collides with yours.
+    let bob = login(&s, "bob").await;
+    let bobs = bob.create_post(&new).await.unwrap();
+    assert_ne!(bobs.id, first.id);
+}
