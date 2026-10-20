@@ -710,8 +710,11 @@ impl Chat {
             Kind::Thread => entries.first().map_or(("", "-"), |e| (e.post.channel_id.as_str(), e.post.id.as_str())),
             Kind::Inbox => ("", "-"),
         };
+        // They follow on from your own last message, like any other run.
+        let mut mine = prev.is_some_and(|p| p.user_id == self.store.me.id);
         for q in self.outbox.waiting(channel, root) {
-            col = col.push(self.queued_view(q, c));
+            col = col.push(self.queued_view(q, mine, c));
+            mine = true;
         }
         let id = match kind {
             Kind::Channel | Kind::Inbox => pv.timeline(),
@@ -757,8 +760,15 @@ impl Chat {
             _ => replies = replies.push(text("Loading replies…").size(12).color(c.muted)),
         }
         let channel_id = self.store.post(root_id).map_or("", |p| p.channel_id.as_str());
+        let mut mine = self
+            .store
+            .threads
+            .get(root_id)
+            .and_then(|t| t.entries.iter().rfind(|e| e.post.is_reply()))
+            .is_some_and(|e| e.post.user_id == self.store.me.id);
         for q in self.outbox.waiting(channel_id, root_id) {
-            replies = replies.push(self.queued_view(q, c));
+            replies = replies.push(self.queued_view(q, mine, c));
+            mine = true;
         }
         let mut col = column![replies];
         if pv.thread.as_deref() == Some(root_id) {
@@ -794,10 +804,12 @@ impl Chat {
     }
 
     /// A message waiting in the outbox: its text, dimmed, and how it's going.
-    fn queued_view<'a>(&'a self, q: &'a crate::outbox::Queued, c: Colors) -> Element<'a, Message> {
+    /// A message of yours the server doesn't have yet, laid out like your
+    /// others (under your name unless it continues your last one).
+    fn queued_view<'a>(&'a self, q: &'a crate::outbox::Queued, continued: bool, c: Colors) -> Element<'a, Message> {
         let status = match &q.problem {
             None => "Sending…".to_string(),
-            Some(why) => format!("Not sent yet ({why}). It will be sent when the server can be reached."),
+            Some(why) => format!("Not sent yet: {why}. It will go as soon as it can."),
         };
         let mut lines = column![text(&q.post.message).size(14).color(c.muted)].spacing(2);
         if !q.post.file_ids.is_empty() {
@@ -805,7 +817,28 @@ impl Chat {
             lines = lines.push(text(format!("{n} file{}", if n == 1 { "" } else { "s" })).size(12).color(c.muted));
         }
         lines = lines.push(text(status).size(11).color(if q.problem.is_some() { c.yellow } else { c.muted }));
-        container(lines).padding(iced::Padding { top: 4.0, bottom: 4.0, left: GUTTER, right: 0.0 }).width(Length::Fill).into()
+        let me = Post { user_id: self.store.me.id.clone(), ..Default::default() };
+        if self.compact {
+            let name: Element<'_, Message> = if continued {
+                space().width(NAME_COLUMN).into()
+            } else {
+                container(text(self.store.display_name(&me)).font(bold()).size(13).color(c.name_color(&me.user_id)).wrapping(iced::widget::text::Wrapping::None))
+                    .width(NAME_COLUMN)
+                    .align_right(NAME_COLUMN)
+                    .clip(true)
+                    .into()
+            };
+            let time = text("…").size(11).color(c.muted).width(TIME_COLUMN);
+            return container(row![time, name, lines].spacing(10)).width(Length::Fill).padding([1, 0]).into();
+        }
+        if continued {
+            return container(lines).padding(iced::Padding { top: 4.0, bottom: 4.0, left: GUTTER, right: 0.0 }).width(Length::Fill).into();
+        }
+        let name = text(self.store.display_name(&me)).font(bold()).size(14).color(c.name_color(&me.user_id));
+        container(row![self.avatar(&me, c), column![name, lines].spacing(2)].spacing(GUTTER - AVATAR))
+            .padding(iced::Padding { top: 8.0, ..iced::Padding::ZERO })
+            .width(Length::Fill)
+            .into()
     }
 
     fn post_view<'a>(

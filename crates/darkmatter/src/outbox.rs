@@ -151,6 +151,16 @@ pub fn retryable(e: &mm_api::Error) -> bool {
     }
 }
 
+/// What went wrong, in words for under the message.
+pub fn problem(e: &mm_api::Error) -> String {
+    match e {
+        mm_api::Error::Http(_) => "can't reach the server".into(),
+        mm_api::Error::Api(api) if api.status_code == 429 => "sending too fast".into(),
+        mm_api::Error::Api(api) if api.status_code == 0 || api.status_code >= 500 => "the server is having trouble".into(),
+        e => e.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +191,7 @@ mod tests {
         let offline = mm_api::Client::new("http://127.0.0.1:9").unwrap().with_token("t");
         let e = offline.create_post(&post("p")).await.unwrap_err();
         assert!(retryable(&e), "{e}");
+        assert_eq!(problem(&e), "can't reach the server");
         let refused = mm_api::Error::Api(mm_api::ApiError { status_code: 400, ..Default::default() });
         assert!(!retryable(&refused));
         let busy = mm_api::Error::Api(mm_api::ApiError { status_code: 503, ..Default::default() });

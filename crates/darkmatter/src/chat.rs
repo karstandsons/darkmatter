@@ -232,7 +232,7 @@ impl Chat {
             let client = self.client.clone();
             let id = post.pending_post_id.clone();
             Task::perform(
-                async move { client.create_post(&post).await.map_err(|e| (e.to_string(), crate::outbox::retryable(&e))) },
+                async move { client.create_post(&post).await.map_err(|e| (crate::outbox::problem(&e), crate::outbox::retryable(&e))) },
                 move |r| Message::Delivered(id.clone(), r),
             )
         });
