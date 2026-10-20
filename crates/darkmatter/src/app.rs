@@ -959,7 +959,9 @@ impl LoginForm {
                 let mfa = (!self.mfa.is_empty()).then(|| self.mfa.clone());
                 Task::perform(
                     async move {
-                        let mut client = Client::new(&server).map_err(|e| (e.to_string(), false))?;
+                        let mut client = Client::new(&server)
+                            .and_then(|c| c.user_agent(&crate::session::user_agent()))
+                            .map_err(|e| (e.to_string(), false))?;
                         let user = client.login(&login, &password, mfa.as_deref()).await.map_err(|e| {
                             let msg = match &e {
                                 mm_api::Error::Http(h) if h.is_connect() || h.is_timeout() => {

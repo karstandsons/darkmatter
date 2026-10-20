@@ -39,6 +39,8 @@ pub struct User {
     pub locale: String,
     pub last_picture_update: Millis,
     pub is_bot: bool,
+    /// Two-factor codes on (sent only for yourself).
+    pub mfa_active: bool,
     #[serde(deserialize_with = "nullable")]
     pub props: HashMap<String, String>,
     #[serde(deserialize_with = "nullable")]
@@ -345,6 +347,61 @@ pub struct Status {
 pub struct UploadResult {
     pub file_infos: Vec<FileInfo>,
     pub client_ids: Vec<String>,
+}
+
+/// A signed-in app (`GET users/{id}/sessions`). The token is never sent.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct Session {
+    pub id: Id,
+    pub user_id: Id,
+    pub device_id: String,
+    pub create_at: Millis,
+    pub last_activity_at: Millis,
+    pub expires_at: Millis,
+    /// Mattermost puts the browser and OS here; axiond the User-Agent and
+    /// `is_current`.
+    #[serde(deserialize_with = "nullable")]
+    pub props: HashMap<String, Value>,
+}
+
+impl Session {
+    /// The session making the request (axiond says; Mattermost doesn't).
+    pub fn is_current(&self) -> bool {
+        self.props.get("is_current").and_then(Value::as_bool).unwrap_or(false)
+    }
+
+    /// What app this is, as well as the server knows.
+    pub fn app(&self) -> String {
+        let s = |k: &str| self.props.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        let agent = s("user_agent");
+        if !agent.is_empty() {
+            return agent;
+        }
+        [s("browser"), s("os"), s("platform")].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ")
+    }
+}
+
+/// A new two-factor secret (`users/{id}/mfa/generate`).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MfaSecret {
+    pub secret: String,
+    /// `otpauth://` link for authenticator apps (axiond).
+    pub url: String,
+    /// A PNG QR code, base64 (Mattermost).
+    #[serde(deserialize_with = "nullable")]
+    pub qr_code: String,
+}
+
+/// What `GET e2ee/config` says on axiond. Plain Mattermost has no such path.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AxiondInfo {
+    pub server: String,
+    pub version: String,
+    /// End-to-end encryption is on.
+    pub enabled: bool,
 }
 
 /// Body for `POST /posts`.

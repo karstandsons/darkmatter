@@ -148,7 +148,7 @@ impl Session {
     }
 
     pub fn client(&self) -> Result<mm_api::Client, mm_api::Error> {
-        Ok(mm_api::Client::new(&self.server)?.with_token(&self.token).read_only(read_only()))
+        Ok(mm_api::Client::new(&self.server)?.user_agent(&user_agent())?.with_token(&self.token).read_only(read_only()))
     }
 }
 
@@ -157,6 +157,11 @@ fn write_file(path: &Path, file: &SessionFile) -> std::io::Result<()> {
     let body = toml::to_string(file).map_err(std::io::Error::other)?;
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
     f.write_all(body.as_bytes())
+}
+
+/// How Darkmatter names itself to servers, e.g. `Darkmatter/0.4.0 (linux)`.
+pub fn user_agent() -> String {
+    format!("Darkmatter/{} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS)
 }
 
 #[cfg(test)]

@@ -38,7 +38,7 @@ async fn server_with(change: impl FnOnce(&mut Config)) -> Server {
 }
 
 async fn login(s: &Server, name: &str) -> Client {
-    let mut c = Client::new(&s.url).unwrap();
+    let mut c = Client::new(&s.url).unwrap().user_agent("Darkmatter/test (linux)").unwrap();
     c.login(name, PASSWORD, None).await.unwrap();
     c
 }
@@ -885,4 +885,43 @@ async fn backup_and_restore() {
     let target = out.path().join("target");
     assert!(axiond::backup::restore(&evil, &target).is_err());
     assert!(!out.path().join("escaped").exists());
+}
+
+/// The account calls Darkmatter's settings use, through its own client.
+#[tokio::test]
+async fn account_calls_from_darkmatter() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    assert_eq!(alice.axiond().await.unwrap().map(|i| i.server), Some("axiond".to_string()));
+    let me = alice.me().await.unwrap();
+    assert!(!me.mfa_active);
+
+    let (code, _) = admin::invite(&s.app, 1, 7, "").await.unwrap();
+    let anon = Client::new(&s.url).unwrap();
+    let carol = anon.sign_up(&code, "carol", "carol@example.com", PASSWORD).await.unwrap();
+    assert_eq!(carol.username, "carol");
+    assert!(anon.sign_up(&code, "dave", "dave@example.com", PASSWORD).await.is_err());
+    let carol_client = login(&s, "carol").await;
+
+    let sessions = alice.sessions(&me.id).await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert!(sessions[0].is_current());
+    assert_eq!(sessions[0].app(), "Darkmatter/test (linux)");
+
+    let secret = alice.mfa_generate(&me.id).await.unwrap();
+    assert!(secret.url.starts_with("otpauth://") && !secret.secret.is_empty());
+    assert!(alice.mfa_activate(&me.id, true, "000000").await.is_err());
+
+    alice.set_blocked(&carol.id, true).await.unwrap();
+    assert_eq!(alice.blocked().await.unwrap(), std::slice::from_ref(&carol.id));
+    alice.set_blocked(&carol.id, false).await.unwrap();
+    assert!(alice.blocked().await.unwrap().is_empty());
+    alice.report("", &carol.id, "testing").await.unwrap();
+    assert_eq!(admin::open_reports(&s.app).await.unwrap().len(), 1);
+
+    assert!(carol_client.delete_account("wrong", false).await.is_err());
+    carol_client.delete_account(PASSWORD, false).await.unwrap();
+    assert!(carol_client.me().await.unwrap_err().is_unauthorized());
+    let _ = alice.revoke_session(&me.id, &sessions[0].id).await;
+    assert!(alice.me().await.unwrap_err().is_unauthorized());
 }

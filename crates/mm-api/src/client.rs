@@ -43,7 +43,15 @@ impl Client {
         if !base.path().ends_with('/') {
             base.set_path(&format!("{}/", base.path()));
         }
-        Ok(Client { http: reqwest::Client::new(), base: base.join("api/v4/")?, token: None, read_only: false })
+        let http = reqwest::Client::builder().user_agent(concat!("mm-api/", env!("CARGO_PKG_VERSION"))).build()?;
+        Ok(Client { http, base: base.join("api/v4/")?, token: None, read_only: false })
+    }
+
+    /// How the app names itself to the server, e.g. `Darkmatter/0.4.0 (linux)`.
+    /// Servers show it in your list of signed-in apps.
+    pub fn user_agent(mut self, agent: &str) -> Result<Self, Error> {
+        self.http = reqwest::Client::builder().user_agent(agent).build()?;
+        Ok(self)
     }
 
     /// Use an existing session or personal access token.
@@ -290,6 +298,68 @@ impl Client {
 
     pub async fn profile_image(&self, user_id: &str) -> Result<Vec<u8>, Error> {
         self.bytes(&format!("users/{user_id}/image")).await
+    }
+
+    /// Makes an account with an invite code (axiond; Mattermost calls the code `t`).
+    /// Doesn't log in.
+    pub async fn sign_up(&self, invite: &str, username: &str, email: &str, password: &str) -> Result<User, Error> {
+        let body = json!({ "username": username, "email": email, "password": password });
+        let req = self.request(Method::POST, "users")?.query(&[("t", invite)]).json(&body);
+        decode("users", check(req.send().await?).await?).await
+    }
+
+    /// `Some` on axiond, `None` on plain Mattermost (which has no such path).
+    pub async fn axiond(&self) -> Result<Option<AxiondInfo>, Error> {
+        match self.get::<AxiondInfo>("e2ee/config").await {
+            Ok(info) if info.server == "axiond" => Ok(Some(info)),
+            Ok(_) => Ok(None),
+            Err(Error::Api(e)) if matches!(e.status_code, 400 | 404 | 405 | 501) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Your signed-in apps.
+    pub async fn sessions(&self, user_id: &str) -> Result<Vec<Session>, Error> {
+        self.get(&format!("users/{user_id}/sessions")).await
+    }
+
+    /// Signs one app out.
+    pub async fn revoke_session(&self, user_id: &str, session_id: &str) -> Result<(), Error> {
+        let body = json!({ "session_id": session_id });
+        self.send_unit(Method::POST, &format!("users/{user_id}/sessions/revoke"), Some(&body)).await
+    }
+
+    /// Starts setting up two-factor codes: a secret to put in an authenticator app.
+    pub async fn mfa_generate(&self, user_id: &str) -> Result<MfaSecret, Error> {
+        self.send(Method::POST, &format!("users/{user_id}/mfa/generate"), None::<&()>).await
+    }
+
+    /// Turns two-factor codes on (a code from the new secret) or off (a current code).
+    pub async fn mfa_activate(&self, user_id: &str, on: bool, code: &str) -> Result<(), Error> {
+        let body = json!({ "activate": on, "code": code });
+        self.send_unit(Method::PUT, &format!("users/{user_id}/mfa"), Some(&body)).await
+    }
+
+    /// People you've blocked (axiond).
+    pub async fn blocked(&self) -> Result<Vec<Id>, Error> {
+        self.get("users/me/blocked").await
+    }
+
+    pub async fn set_blocked(&self, user_id: &str, blocked: bool) -> Result<(), Error> {
+        let method = if blocked { Method::PUT } else { Method::DELETE };
+        self.send_unit(method, &format!("users/me/blocked/{user_id}"), None::<&()>).await
+    }
+
+    /// Reports a message, or a person if `post_id` is empty, to the server's admins (axiond).
+    pub async fn report(&self, post_id: &str, user_id: &str, reason: &str) -> Result<(), Error> {
+        let body = json!({ "post_id": post_id, "user_id": user_id, "reason": reason });
+        self.send_unit(Method::POST, "reports", Some(&body)).await
+    }
+
+    /// Deletes your own account for good (axiond).
+    pub async fn delete_account(&self, password: &str, delete_messages: bool) -> Result<(), Error> {
+        let body = json!({ "password": password, "delete_messages": delete_messages });
+        self.send_unit(Method::DELETE, "users/me", Some(&body)).await
     }
 
     /// Headers for opening the WebSocket with the same credentials.

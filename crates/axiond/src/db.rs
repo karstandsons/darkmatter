@@ -70,16 +70,19 @@ pub struct UserRow {
     pub roles: String,
     pub locale: String,
     pub last_picture_update: i64,
+    pub mfa_active: bool,
 }
 
 pub const USER_COLUMNS: &str =
-    "id, create_at, update_at, delete_at, username, email, first_name, last_name, nickname, roles, locale, last_picture_update";
+    "id, create_at, update_at, delete_at, username, email, first_name, last_name, nickname, roles, locale, last_picture_update, mfa_active";
 
 impl UserRow {
-    /// Email addresses only go to their owner.
+    /// Email addresses (and whether two-factor codes are on) only go to their owner.
     pub fn into_user(self, viewer: &str) -> User {
+        let own = self.id == viewer;
         User {
-            email: if self.id == viewer { self.email } else { String::new() },
+            mfa_active: own && self.mfa_active,
+            email: if own { self.email } else { String::new() },
             id: self.id,
             create_at: self.create_at,
             update_at: self.update_at,
