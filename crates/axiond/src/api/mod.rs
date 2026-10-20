@@ -4,6 +4,7 @@ mod channels;
 pub(crate) mod files;
 mod posts;
 mod reactions;
+mod search;
 mod threads;
 mod users;
 mod ws;
@@ -41,6 +42,7 @@ pub fn router(app: App) -> Router {
         .route("/reactions", post(reactions::add))
         .route("/posts/{id}/reactions", get(reactions::of_post))
         .route("/teams/{team}/channels/search", post(channels::search))
+        .route("/teams/{team}/posts/search", post(search::posts))
         .route("/teams/{team}/commands/autocomplete_suggestions", get(no_commands))
         .route("/channels/direct", post(channels::direct))
         .route("/channels/members/me/view", post(channels::view))

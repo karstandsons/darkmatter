@@ -13,6 +13,7 @@ const PASSWORD: &str = "correct horse battery";
 
 struct Server {
     url: String,
+    app: App,
     _dir: tempfile::TempDir,
 }
 
@@ -32,8 +33,8 @@ async fn server_with(change: impl FnOnce(&mut Config)) -> Server {
     admin::add_channel(&app, "home", "rust", "Rust").await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(app.serve(listener));
-    Server { url, _dir: dir }
+    tokio::spawn(app.clone().serve(listener));
+    Server { url, app, _dir: dir }
 }
 
 async fn login(s: &Server, name: &str) -> Client {
@@ -360,4 +361,65 @@ async fn uploads_stop_at_the_size_limit() {
     alice.upload_file(&rust, "ok.bin", vec![7; 1024 * 1024]).await.unwrap();
     let err = alice.upload_file(&rust, "big.bin", vec![7; 1024 * 1024 + 1]).await.unwrap_err();
     assert!(format!("{err:?}").contains("413") || format!("{err}").contains("at most 1 MB"), "{err:?}");
+}
+
+#[tokio::test]
+async fn search() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let channels = alice.my_channels(&team).await.unwrap();
+    let id = |name: &str| channels.iter().find(|c| c.name == name).unwrap().id.clone();
+    let (rust, town, off) = (id("rust"), id("town-square"), id("off-topic"));
+    let say = |c: &Client, channel: &str, message: &str| {
+        let new = NewPost { channel_id: channel.into(), message: message.into(), ..Default::default() };
+        let c = c.clone();
+        async move { c.create_post(&new).await.unwrap() }
+    };
+    let borrow = say(&alice, &rust, "The borrow checker says no").await;
+    let lunch = say(&bob, &town, "Lunch at noon? Café downstairs").await;
+    let cake = say(&bob, &town, "lunch cake later").await;
+    say(&alice, &off, "a secret plan").await;
+    let found = |terms: &'static str| {
+        let alice = alice.clone();
+        let team = team.clone();
+        async move {
+            let mut ids = alice.search_posts(&team, terms).await.unwrap().order;
+            ids.sort();
+            ids
+        }
+    };
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+
+    assert_eq!(found("borrow").await, std::slice::from_ref(&borrow.id));
+    assert_eq!(found("BORR*").await, std::slice::from_ref(&borrow.id));
+    assert_eq!(found("lunch").await, sorted(vec![lunch.id.clone(), cake.id.clone()]));
+    assert_eq!(found("cafe").await, std::slice::from_ref(&lunch.id), "accents don't matter");
+    assert_eq!(found("lunch -cake").await, std::slice::from_ref(&lunch.id));
+    assert_eq!(found("\"lunch cake\"").await, std::slice::from_ref(&cake.id));
+    assert_eq!(found("from:alice").await.len(), 2);
+    assert_eq!(found("lunch from:@bob in:~town-square").await.len(), 2);
+    assert!(found("lunch in:rust").await.is_empty());
+    assert!(found("before:2000-01-01").await.is_empty());
+    assert!(found("\" AND OR NOT ( * :").await.is_empty(), "odd input is no results, not an error");
+
+    // Only channels you're in.
+    bob.leave_channel(&off, &bob.me().await.unwrap().id).await.ok();
+    assert!(bob.search_posts(&team, "secret").await.unwrap().order.is_empty());
+    assert_eq!(found("secret").await.len(), 1);
+
+    // Edits and deletes keep the index right.
+    alice.edit_post(&borrow.id, "The compiler says yes").await.unwrap();
+    assert!(found("borrow").await.is_empty());
+    assert_eq!(found("compiler").await, std::slice::from_ref(&borrow.id));
+    bob.delete_post(&cake.id).await.unwrap();
+    assert!(found("cake").await.is_empty());
+
+    // Never encrypted channels, whatever is stored there.
+    sqlx::query("UPDATE channels SET encrypted = 1 WHERE id = ?").bind(&town).execute(&s.app.db).await.unwrap();
+    assert!(found("lunch").await.is_empty());
 }

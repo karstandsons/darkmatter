@@ -386,7 +386,7 @@ async fn slice(app: &App, channel: &str, only_roots: &str, key: &(i64, String), 
 }
 
 /// Rows into a `PostList`, newest first, with reactions.
-async fn list(app: &App, rows: Vec<PostRow>) -> Result<PostList> {
+pub(super) async fn list(app: &App, rows: Vec<PostRow>) -> Result<PostList> {
     let mut posts: Vec<Post> = rows.into_iter().map(Into::into).collect();
     posts.sort_by(|a, b| (b.create_at, &b.id).cmp(&(a.create_at, &a.id)));
     db::with_metadata(&app.db, &mut posts).await?;

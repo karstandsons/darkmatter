@@ -19,6 +19,9 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
   served as downloads.
 - The Threads list: you follow a thread when you start it, reply or are
   mentioned, with unread replies and mentions per thread.
+- Search, with Mattermost's syntax: words, `"phrases"`, `prefix*`, `-word`,
+  `from:`, `in:`, `before:`, `after:` and `on:`. Encrypted channels are never
+  searched on the server.
 - Unread counts and mentions (`@name`, `@channel`, `@all`, `@here`),
   marking a channel read, and "mark as unread".
 - Live events, so new posts, edits, deletes, typing and read changes show up
@@ -28,7 +31,6 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
 
 Anything else Darkmatter asks for gets a clear "axiond doesn't support that
 yet". That includes:
-- search;
 - custom emoji;
 - slash commands on the server;
 - invites;
