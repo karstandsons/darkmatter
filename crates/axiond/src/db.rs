@@ -24,7 +24,17 @@ pub async fn open(data_dir: &Path) -> anyhow::Result<Db> {
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
     let db = SqlitePoolOptions::new().max_connections(8).connect_with(options).await?;
-    sqlx::migrate!("./migrations").run(&db).await?;
+    let migrator = sqlx::migrate!("./migrations");
+    // Before an upgrade changes an existing database, keep a copy of it.
+    let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = 1").fetch_all(&db).await.unwrap_or_default();
+    if !applied.is_empty() && migrator.iter().any(|m| !applied.contains(&m.version)) {
+        let dir = data_dir.join("backups");
+        std::fs::create_dir_all(&dir)?;
+        let copy = dir.join(format!("before-upgrade-{}.db", crate::ids::now()));
+        crate::backup::snapshot_db(&db, &copy).await?;
+        tracing::info!("upgrading the database; the old one is kept at {}", copy.display());
+    }
+    migrator.run(&db).await?;
     Ok(db)
 }
 

@@ -32,6 +32,10 @@ pub struct Config {
     /// `domain`, if set).
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    /// Take a backup into `data_dir/backups` this often (0 = never).
+    pub backup_hours: u64,
+    /// How many of those backups to keep.
+    pub backup_keep: usize,
 }
 
 impl Default for Config {
@@ -47,6 +51,8 @@ impl Default for Config {
             acme_staging: false,
             tls_cert: None,
             tls_key: None,
+            backup_hours: 24,
+            backup_keep: 7,
         }
     }
 }
@@ -96,6 +102,12 @@ impl Config {
         }
         if let Some(v) = var("AXIOND_TLS_KEY") {
             self.tls_key = some(v).map(Into::into);
+        }
+        if let Some(v) = var("AXIOND_BACKUP_HOURS") {
+            self.backup_hours = v.parse().with_context(|| format!("AXIOND_BACKUP_HOURS={v}"))?;
+        }
+        if let Some(v) = var("AXIOND_BACKUP_KEEP") {
+            self.backup_keep = v.parse().with_context(|| format!("AXIOND_BACKUP_KEEP={v}"))?;
         }
         if let Some(v) = var("AXIOND_MAX_FILE_MB") {
             self.max_file_mb = v.parse().with_context(|| format!("AXIOND_MAX_FILE_MB={v}"))?;

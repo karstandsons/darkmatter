@@ -85,6 +85,8 @@ Settings live in `axiond.toml` (in the working directory, or pass
 | `acme_email` | `AXIOND_ACME_EMAIL` | | Where Let's Encrypt sends certificate notices |
 | `acme_staging` | `AXIOND_ACME_STAGING` | `false` | Use Let's Encrypt's test service |
 | `tls_cert`, `tls_key` | `AXIOND_TLS_CERT`, `AXIOND_TLS_KEY` | | Serve HTTPS with your own PEM files |
+| `backup_hours` | `AXIOND_BACKUP_HOURS` | `24` | Back up into `data_dir/backups` this often (0 = never) |
+| `backup_keep` | `AXIOND_BACKUP_KEEP` | `7` | How many of those to keep |
 
 ### HTTPS
 
@@ -111,6 +113,19 @@ Either way, responses carry `Strict-Transport-Security`, so apps and browsers
 never fall back to plain HTTP.
 
 `AXIOND_LOG=axiond=debug` logs more. Logs never include message text.
+
+## Backups
+
+`axiond backup` writes a `.tar.gz` of the database and every stored file
+(uploads, emoji, pictures, certificates), safe to take while the server runs.
+The server also does this by itself every `backup_hours`, and keeps a copy of
+the database before any upgrade changes it.
+
+Backups on the same disk don't survive losing the server. Copy them
+somewhere else too, encrypted (restic does both).
+
+To restore, stop axiond and run `axiond restore <file>` with an empty (or
+new) data folder. It never writes over an existing database.
 
 ## Docker
 

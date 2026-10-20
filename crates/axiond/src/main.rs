@@ -65,6 +65,14 @@ enum Command {
     },
     /// Check the running server answers (for health checks).
     Ping,
+    /// Back up the database and stored files to a .tar.gz (safe while running).
+    Backup {
+        /// Where to write it (default: the data folder's `backups`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Restore a backup into an empty data folder (with axiond stopped).
+    Restore { file: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -162,6 +170,20 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Ping => ping(&config).await,
+        Command::Backup { out } => {
+            let out = out.unwrap_or_else(|| config.data_dir.join("backups"));
+            let app = App::open(config).await?;
+            let path = axiond::backup::create(&app.db, &app.config.data_dir, &out).await?;
+            println!("Backed up to {}", path.display());
+            Ok(())
+        }
+        Command::Restore { file } => {
+            axiond::backup::restore(&file, &config.data_dir)?;
+            // Opening it checks it and brings an older backup up to date.
+            App::open(config).await?;
+            println!("Restored. Start the server with `axiond`.");
+            Ok(())
+        }
         Command::User(UserCommand::Picture { username, file }) => {
             let app = App::open(config).await?;
             let bytes = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;

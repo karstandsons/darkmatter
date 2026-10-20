@@ -830,3 +830,59 @@ async fn https_with_certificate_files() {
         .unwrap();
     assert!(ping.status.success(), "{}", String::from_utf8_lossy(&ping.stderr));
 }
+
+#[tokio::test]
+async fn backup_and_restore() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let picture = png(64, 48);
+    let file = alice.upload_file(&town, "cat.png", picture.clone()).await.unwrap().file_infos.remove(0);
+    let post = alice
+        .create_post(&NewPost { channel_id: town.clone(), message: "keep this".into(), file_ids: vec![file.id.clone()], ..Default::default() })
+        .await
+        .unwrap();
+
+    // Backed up while the server runs.
+    let out = tempfile::tempdir().unwrap();
+    let archive = axiond::backup::create(&s.app.db, &s.app.config.data_dir, out.path()).await.unwrap();
+    assert!(archive.file_name().unwrap().to_string_lossy().starts_with("axiond-"));
+    #[cfg(unix)]
+    assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&archive).unwrap().permissions()) & 0o777, 0o600);
+
+    // Restored somewhere new, it serves the same messages and files.
+    let restored = tempfile::tempdir().unwrap();
+    let data = restored.path().join("data");
+    axiond::backup::restore(&archive, &data).unwrap();
+    assert!(axiond::backup::restore(&archive, &data).is_err(), "never over an existing database");
+    let app = App::open(Config { data_dir: data.clone(), ..Config::default() }).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(app.serve(listener));
+    let mut again = Client::new(&url).unwrap();
+    again.login("alice", PASSWORD, None).await.unwrap();
+    let thread = again.thread(&post.id).await.unwrap();
+    assert_eq!(thread.posts[&post.id].message, "keep this");
+    assert_eq!(again.file(&file.id).await.unwrap(), picture);
+    assert!(again.file_thumbnail(&file.id).await.is_ok());
+
+    // A backup that tries to write outside the data folder is refused.
+    let evil = out.path().join("evil.tar.gz");
+    {
+        let gz = flate2::write::GzEncoder::new(std::fs::File::create(&evil).unwrap(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        let name = b"files/../../escaped";
+        header.as_old_mut().name[..name.len()].copy_from_slice(name);
+        header.set_size(4);
+        header.set_mode(0o600);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        tar.append(&header, &b"evil"[..]).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+    let target = out.path().join("target");
+    assert!(axiond::backup::restore(&evil, &target).is_err());
+    assert!(!out.path().join("escaped").exists());
+}

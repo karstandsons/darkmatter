@@ -36,6 +36,9 @@ axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
+# Backups: a .tar.gz of the database snapshot and the stored files.
+tar = "0.4"
+flate2 = "1"
 rustls-pki-types = { version = "1", features = ["std"] }
 # Thumbnails and previews of uploaded pictures (never of encrypted files).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }

@@ -8,6 +8,7 @@ pub mod admin;
 mod api;
 pub mod audit;
 mod auth;
+pub mod backup;
 pub mod config;
 mod db;
 mod error;
@@ -57,6 +58,7 @@ impl App {
     pub async fn serve(self, listener: TcpListener) -> anyhow::Result<()> {
         let db = self.db.clone();
         let tls = self.config.tls()?;
+        self.schedule_backups();
         let data_dir = self.config.data_dir.clone();
         let (email, staging) = (self.config.acme_email.clone(), self.config.acme_staging);
         let service = api::router(self).into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -79,6 +81,35 @@ impl App {
         }
         db.close().await;
         Ok(())
+    }
+}
+
+impl App {
+    /// Backs up into `data_dir/backups` every `backup_hours`, keeping the
+    /// newest `backup_keep`.
+    fn schedule_backups(&self) {
+        let hours = self.config.backup_hours;
+        if hours == 0 {
+            return;
+        }
+        let (db, data, keep) = (self.db.clone(), self.config.data_dir.clone(), self.config.backup_keep.max(1));
+        tokio::spawn(async move {
+            let every = std::time::Duration::from_secs(hours * 3600);
+            let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            loop {
+                tick.tick().await;
+                let dir = data.join("backups");
+                match backup::create(&db, &data, &dir).await {
+                    Ok(path) => {
+                        tracing::info!("backed up to {}", path.display());
+                        if let Err(e) = backup::prune(&dir, keep) {
+                            tracing::warn!("couldn't remove old backups: {e}");
+                        }
+                    }
+                    Err(e) => tracing::error!("backup failed: {e:#}"),
+                }
+            }
+        });
     }
 }
 
