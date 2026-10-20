@@ -43,8 +43,18 @@ async fn login(s: &Server, name: &str) -> Client {
     c
 }
 
-/// The next event that isn't a connection notice.
+/// The next event that isn't a connection notice or someone coming and going.
 async fn next_event(stream: &mut ws::EventStream) -> Event {
+    loop {
+        match next_any(stream).await {
+            Event::StatusChange { .. } => continue,
+            e => return e,
+        }
+    }
+}
+
+/// The next event that isn't a connection notice.
+async fn next_any(stream: &mut ws::EventStream) -> Event {
     loop {
         match tokio::time::timeout(Duration::from_secs(5), stream.next()).await.expect("an event").expect("stream open") {
             Message::Event(Event::Hello { .. }) | Message::Connected { .. } => continue,
@@ -484,4 +494,104 @@ async fn emoji_and_pictures() {
     assert_eq!((pic.width(), pic.height()), (256, 256));
     assert!(alice.users_by_ids(std::slice::from_ref(&bob_id)).await.unwrap()[0].last_picture_update > 0);
     assert_eq!(upload(&s, &carol, &path, vec![("image", Part::bytes(png(10, 10)).file_name("x.png"))]).await.status(), 403);
+}
+
+#[tokio::test]
+async fn statuses_and_server_commands() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let channels = alice.my_channels(&team).await.unwrap();
+    let id = |name: &str| channels.iter().find(|c| c.name == name).unwrap().id.clone();
+    let (town, rust) = (id("town-square"), id("rust"));
+    let status = |c: &Client, who: &str| {
+        let (c, who) = (c.clone(), who.to_string());
+        async move { c.statuses_by_ids(&[who]).await.unwrap().pop().unwrap().status }
+    };
+
+    // Online while an app is connected; others hear about it.
+    let mut alice_events = ws::connect(&alice).unwrap();
+    assert!(matches!(next_any(&mut alice_events).await, Event::StatusChange { user_id, status } if user_id == alice_id && status == "online"));
+    assert_eq!(status(&bob, &alice_id).await, "online");
+    assert_eq!(status(&alice, &bob_id).await, "offline");
+    let bob_events = ws::connect(&bob).unwrap();
+    assert!(matches!(next_any(&mut alice_events).await, Event::StatusChange { user_id, status } if user_id == bob_id && status == "online"));
+
+    // /away sticks while connected, and /online goes back to automatic.
+    let run = |c: &Client, channel: &str, command: &str| {
+        let (c, channel, command, team) = (c.clone(), channel.to_string(), command.to_string(), team.clone());
+        async move { c.execute_command(&team, &channel, "", &command).await }
+    };
+    let said = run(&bob, &town, "/away").await.unwrap();
+    assert_eq!(said.text, "You are now away.");
+    assert!(matches!(next_any(&mut alice_events).await, Event::StatusChange { status, .. } if status == "away"));
+    assert_eq!(status(&alice, &bob_id).await, "away");
+    run(&bob, &town, "/online").await.unwrap();
+    assert_eq!(status(&alice, &bob_id).await, "online");
+    drop(bob_events);
+    loop {
+        if let Event::StatusChange { user_id, status } = next_any(&mut alice_events).await
+            && user_id == bob_id
+            && status == "offline"
+        {
+            break;
+        }
+    }
+
+    // Replies only you see arrive as ephemeral messages.
+    run(&alice, &town, "/dnd").await.unwrap();
+    loop {
+        if let Event::Ephemeral(p) = next_event(&mut alice_events).await {
+            assert!(p.message.starts_with("Do not disturb") && p.channel_id == town);
+            break;
+        }
+    }
+
+    // /me and /shrug post as you.
+    run(&alice, &town, "/me waves").await.unwrap();
+    run(&alice, &town, "/shrug fine").await.unwrap();
+    let page = alice.posts(&town, PostsQuery::Page { page: 0, per_page: 2 }, false).await.unwrap();
+    let texts: Vec<_> = page.chronological().iter().map(|p| p.message.clone()).collect();
+    assert_eq!(texts, ["*waves*", "fine ¯\\\\\\_(ツ)\\_/¯"]);
+
+    // /leave and /join answer with where to go.
+    let left = run(&bob, &rust, "/leave").await.unwrap();
+    assert_eq!(left.goto_location, "/home/channels/town-square");
+    let joined = run(&bob, &town, "/join ~rust").await.unwrap();
+    assert_eq!(joined.goto_location, "/home/channels/rust");
+    assert!(bob.my_channels(&team).await.unwrap().iter().any(|c| c.id == rust));
+
+    // /msg opens a DM (and says something, if asked).
+    let dm = run(&alice, &town, "/msg @bob psst").await.unwrap();
+    let dm_name = dm.goto_location.rsplit('/').next().unwrap().to_string();
+    let dm_channel = bob.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == dm_name).unwrap();
+    assert_eq!(bob.posts(&dm_channel.id, PostsQuery::Page { page: 0, per_page: 5 }, false).await.unwrap().chronological()[0].message, "psst");
+
+    // /header changes the channel for everyone, with a note in the channel.
+    run(&bob, &rust, "/header Rust talk").await.unwrap();
+    assert_eq!(alice.channel(&rust).await.unwrap().header, "Rust talk");
+
+    // /invite and /kick (the second only for admins and the channel's creator).
+    admin::add_user(&s.app, NewUser { username: "carol".into(), email: "carol@example.com".into(), password: PASSWORD.into() }, false).await.unwrap();
+    let carol = login(&s, "carol").await;
+    let carol_id = carol.me().await.unwrap().id;
+    run(&carol, &town, "/leave").await.unwrap_err();
+    carol.leave_channel(&rust, &carol_id).await.unwrap();
+    run(&bob, &rust, "/invite @carol").await.unwrap();
+    assert!(carol.my_channels(&team).await.unwrap().iter().any(|c| c.id == rust));
+    assert!(run(&bob, &rust, "/kick @carol").await.is_err());
+    run(&alice, &rust, "/kick @carol").await.unwrap();
+    assert!(!carol.my_channels(&team).await.unwrap().iter().any(|c| c.id == rust));
+
+    // /mute toggles the channel's notifications.
+    run(&alice, &rust, "/mute").await.unwrap();
+    let member = alice.my_channel_members(&team).await.unwrap().into_iter().find(|m| m.channel_id == rust).unwrap();
+    assert!(member.is_muted());
+
+    // Unknown commands are an error; completions list matches.
+    assert!(run(&alice, &town, "/nope").await.is_err());
+    let s2 = alice.command_suggestions(&team, &town, "/m").await.unwrap();
+    assert_eq!(s2.iter().map(|x| x.complete.as_str()).collect::<Vec<_>>(), ["me", "msg", "mute"]);
 }

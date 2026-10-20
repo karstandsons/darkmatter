@@ -115,7 +115,7 @@ impl From<TeamRow> for Team {
     }
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Clone, sqlx::FromRow)]
 pub struct ChannelRow {
     pub id: String,
     pub team_id: String,

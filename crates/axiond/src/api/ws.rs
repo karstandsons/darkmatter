@@ -30,14 +30,18 @@ pub async fn websocket(State(app): State<App>, me: Me, Query(resume): Query<Resu
 async fn run(app: App, me: Me, resume: Resume, socket: WebSocket) {
     let previous = (!resume.connection_id.is_empty()).then_some((resume.connection_id.as_str(), resume.sequence_number));
     let version = format!("axiond {}", crate::VERSION);
+    let was_online = app.hub.online(&me.user_id);
     let mut attached = app.hub.attach(&me.user_id, &me.session_id, previous, &version);
+    if !was_online {
+        let _ = super::status::announce(&app, &me.user_id).await;
+    }
     let (mut out, mut incoming) = socket.split();
     let mut ping = tokio::time::interval(PING);
     ping.tick().await;
 
     for frame in std::mem::take(&mut attached.first) {
         if out.send(Message::Text(frame.as_ref().into())).await.is_err() {
-            app.hub.detach(&attached.connection_id, attached.generation);
+            gone(&app, &me, &attached).await;
             return;
         }
     }
@@ -62,7 +66,15 @@ async fn run(app: App, me: Me, resume: Resume, socket: WebSocket) {
             break;
         }
     }
+    gone(&app, &me, &attached).await;
+}
+
+/// The socket closed: if it was this person's last app, they're offline now.
+async fn gone(app: &App, me: &Me, attached: &crate::hub::Attached) {
     app.hub.detach(&attached.connection_id, attached.generation);
+    if !app.hub.online(&me.user_id) {
+        let _ = super::status::announce(app, &me.user_id).await;
+    }
 }
 
 /// Something the app sent, e.g. `{"action":"user_typing","seq":3,"data":{…}}`.

@@ -376,7 +376,7 @@ pub struct CommandResponse {
 
 /// One completion for a partly typed slash command. The server sends these
 /// with Go's field names.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct CommandSuggestion {
     /// The whole input once completed, without the leading slash.
     #[serde(default, rename = "Complete", alias = "complete")]

@@ -110,6 +110,12 @@ pub async fn direct(State(app): State<App>, me: Me, Json(pair): Json<Vec<String>
         return Err(Error::forbidden());
     }
     let other = if *a == me.user_id { b } else { a };
+    Ok(Json(direct_channel(&app, &me.user_id, other).await?.into()))
+}
+
+/// The direct-message channel between `me` and `other`, made the first time.
+pub async fn direct_channel(app: &App, me: &str, other: &str) -> Result<ChannelRow> {
+    let (a, b) = (me, other);
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ? AND delete_at = 0").bind(other).fetch_one(&app.db).await?;
     if exists == 0 {
         return Err(Error::not_found("User"));
@@ -118,7 +124,7 @@ pub async fn direct(State(app): State<App>, me: Me, Json(pair): Json<Vec<String>
     let name = format!("{lo}__{hi}");
     let find = format!("SELECT {CHANNEL_COLUMNS} FROM channels c WHERE c.team_id = '' AND c.type = 'D' AND c.name = ?");
     if let Some(row) = sqlx::query_as::<_, ChannelRow>(&find).bind(&name).fetch_optional(&app.db).await? {
-        return Ok(Json(row.into()));
+        return Ok(row);
     }
     let (id, now) = (ids::new_id(), ids::now());
     let mut tx = app.db.begin().await?;
@@ -127,7 +133,7 @@ pub async fn direct(State(app): State<App>, me: Me, Json(pair): Json<Vec<String>
         .bind(&name)
         .bind(now)
         .bind(now)
-        .bind(&me.user_id)
+        .bind(me)
         .execute(&mut *tx)
         .await?;
     for user in if a == b { vec![a] } else { vec![a, b] } {
@@ -140,7 +146,7 @@ pub async fn direct(State(app): State<App>, me: Me, Json(pair): Json<Vec<String>
             .await?;
     }
     tx.commit().await?;
-    Ok(Json(db::channel(&app.db, &id).await?.ok_or_else(Error::internal)?.into()))
+    db::channel(&app.db, &id).await?.ok_or_else(Error::internal)
 }
 
 #[derive(Deserialize)]
@@ -155,16 +161,22 @@ pub async fn join(State(app): State<App>, me: Me, Path(id): Path<String>, Json(b
         return Err(Error::not_yet());
     }
     let channel = db::channel(&app.db, &id).await?.ok_or_else(|| Error::not_found("Channel"))?;
-    if let Some(member) = db::member(&app.db, &id, &me.user_id).await? {
-        return Ok(Json(member));
+    join_channel(&app, &me.user_id, &channel).await?;
+    Ok(Json(db::member(&app.db, &id, &me.user_id).await?.ok_or_else(Error::internal)?))
+}
+
+/// Joins a public channel in one of the user's teams (nothing if already in it).
+pub async fn join_channel(app: &App, user_id: &str, channel: &ChannelRow) -> Result<()> {
+    if db::member(&app.db, &channel.id, user_id).await?.is_some() {
+        return Ok(());
     }
-    if channel.kind != "O" || !db::in_team(&app.db, &channel.team_id, &me.user_id).await? {
+    if channel.kind != "O" || !db::in_team(&app.db, &channel.team_id, user_id).await? {
         return Err(Error::forbidden());
     }
-    add_member(&app.db, &channel, &me.user_id).await?;
-    let user = db::user(&app.db, &me.user_id, &me.user_id).await?;
-    posts::insert(&app, &channel, &me.user_id, posts::New::system("system_join_channel", format!("@{} joined the channel.", user.username))).await?;
-    Ok(Json(db::member(&app.db, &id, &me.user_id).await?.ok_or_else(Error::internal)?))
+    add_member(&app.db, channel, user_id).await?;
+    let user = db::user(&app.db, user_id, user_id).await?;
+    posts::insert(app, channel, user_id, posts::New::system("system_join_channel", format!("@{} joined the channel.", user.username))).await?;
+    Ok(())
 }
 
 /// A new member starts with everything read.
@@ -188,13 +200,19 @@ pub async fn leave(State(app): State<App>, me: Me, Path((id, user)): Path<(Strin
         return Err(Error::not_yet());
     }
     let channel = db::channel(&app.db, &id).await?.ok_or_else(|| Error::not_found("Channel"))?;
+    leave_channel(&app, &me.user_id, &channel).await?;
+    super::ok()
+}
+
+/// Leaves a channel. Not direct or group messages, and not Town Square.
+pub async fn leave_channel(app: &App, user_id: &str, channel: &ChannelRow) -> Result<()> {
     if matches!(channel.kind.as_str(), "D" | "G") || channel.name == "town-square" {
         return Err(Error::bad_request("You can't leave this channel."));
     }
-    let left = sqlx::query("DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?").bind(&id).bind(&me.user_id).execute(&app.db).await?;
+    let left = sqlx::query("DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?").bind(&channel.id).bind(user_id).execute(&app.db).await?;
     if left.rows_affected() > 0 {
-        let user = db::user(&app.db, &me.user_id, &me.user_id).await?;
-        posts::insert(&app, &channel, &me.user_id, posts::New::system("system_leave_channel", format!("@{} left the channel.", user.username))).await?;
+        let user = db::user(&app.db, user_id, user_id).await?;
+        posts::insert(app, channel, user_id, posts::New::system("system_leave_channel", format!("@{} left the channel.", user.username))).await?;
     }
-    super::ok()
+    Ok(())
 }

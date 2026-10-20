@@ -1,11 +1,13 @@
 //! The HTTP API, under `/api/v4/` as in Mattermost.
 
 mod channels;
+mod commands;
 pub(crate) mod images;
 pub(crate) mod files;
 mod posts;
 mod reactions;
 mod search;
+pub(crate) mod status;
 mod threads;
 mod users;
 mod ws;
@@ -18,7 +20,6 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 
 use crate::App;
-use crate::auth::Me;
 use crate::error::{Error, Result};
 
 pub fn router(app: App) -> Router {
@@ -29,7 +30,8 @@ pub fn router(app: App) -> Router {
         .route("/users/logout", post(users::logout))
         .route("/users/me", get(users::me))
         .route("/users/ids", post(users::by_ids))
-        .route("/users/status/ids", post(users::statuses))
+        .route("/users/status/ids", post(status::by_ids))
+        .route("/users/{id}/status", get(status::get_one).put(status::put))
         .route("/users/autocomplete", get(users::autocomplete))
         .route("/users/{id}/image", get(images::picture).post(images::upload_picture).delete(images::remove_picture))
         .route("/users/me/teams", get(users::my_teams))
@@ -44,7 +46,8 @@ pub fn router(app: App) -> Router {
         .route("/posts/{id}/reactions", get(reactions::of_post))
         .route("/teams/{team}/channels/search", post(channels::search))
         .route("/teams/{team}/posts/search", post(search::posts))
-        .route("/teams/{team}/commands/autocomplete_suggestions", get(no_commands))
+        .route("/teams/{team}/commands/autocomplete_suggestions", get(commands::suggestions))
+        .route("/commands/execute", post(commands::execute))
         .route("/channels/direct", post(channels::direct))
         .route("/channels/members/me/view", post(channels::view))
         .route("/channels/{id}", get(channels::get_one))
@@ -91,11 +94,6 @@ async fn client_config(State(app): State<App>) -> Json<Value> {
         "EnableCustomEmoji": "true",
         "MaxFileSize": (app.config.max_file_mb * 1024 * 1024).to_string(),
     }))
-}
-
-/// No server slash commands yet; Darkmatter's own still work.
-async fn no_commands(_: Me) -> Json<Value> {
-    Json(json!([]))
 }
 
 async fn not_yet() -> Error {

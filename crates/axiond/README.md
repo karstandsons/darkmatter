@@ -30,11 +30,14 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
 - Live events, so new posts, edits, deletes, typing and read changes show up
   in Darkmatter as they happen. After a dropped connection, Darkmatter picks
   up where it left off.
-- Online and offline status.
+- Online and offline status, plus away, do not disturb and appear offline
+  set by hand.
+- Slash commands on the server: `/join`, `/leave`, `/msg`, `/me`, `/shrug`,
+  `/away`, `/online`, `/dnd`, `/offline`, `/header`, `/purpose`, `/invite`,
+  `/kick`, `/mute` and `/help`, with completion as you type.
 
 Anything else Darkmatter asks for gets a clear "axiond doesn't support that
 yet". That includes:
-- slash commands on the server;
 - invites;
 - TLS.
 

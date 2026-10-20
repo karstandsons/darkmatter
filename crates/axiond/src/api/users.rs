@@ -1,7 +1,7 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue};
-use mm_api::models::{Status, Team, User};
+use mm_api::models::{Team, User};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -78,19 +78,6 @@ pub async fn by_ids(State(app): State<App>, me: Me, Json(ids): Json<Vec<String>>
         }
     }
     Ok(Json(users))
-}
-
-/// Online while the user has an app connected; there's no away or busy yet.
-pub async fn statuses(State(app): State<App>, _: Me, Json(ids): Json<Vec<String>>) -> Result<Json<Vec<Status>>> {
-    Ok(Json(
-        ids.into_iter()
-            .take(1000)
-            .map(|user_id| {
-                let status = if app.hub.online(&user_id) { "online" } else { "offline" };
-                Status { status: status.into(), user_id, ..Default::default() }
-            })
-            .collect(),
-    ))
 }
 
 #[derive(Deserialize)]
