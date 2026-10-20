@@ -147,8 +147,8 @@ pub struct Chat {
     pub layout_dirty: bool,
     /// Unsent text per composer: channel id, or `thread:<root id>`.
     pub drafts: HashMap<String, String>,
-    /// The last message handed to the server, restored to its composer if sending fails.
-    sending: Option<(String, String)>,
+    /// Messages sent but not yet confirmed by the server, kept on disk.
+    pub outbox: crate::outbox::Outbox,
     pub online: bool,
     /// (channel id, user id, thread root or "") -> when they last typed.
     pub typing: HashMap<(String, String, String), Instant>,
@@ -226,6 +226,19 @@ fn thread_key(root: &str) -> String {
 }
 
 impl Chat {
+    /// Sends what's due from the outbox.
+    pub fn flush(&mut self) -> Task<Message> {
+        let sends = self.outbox.due().into_iter().map(|post| {
+            let client = self.client.clone();
+            let id = post.pending_post_id.clone();
+            Task::perform(
+                async move { client.create_post(&post).await.map_err(|e| (e.to_string(), crate::outbox::retryable(&e))) },
+                move |r| Message::Delivered(id.clone(), r),
+            )
+        });
+        Task::batch(sends)
+    }
+
     /// The pane the current message is for.
     pub fn pv(&self) -> &PaneView {
         self.panes.get(self.cur).expect("current pane exists")
@@ -409,6 +422,7 @@ impl Chat {
             }
             None => pane_grid::State::new(PaneView::new(0, String::new())),
         };
+        let outbox = crate::outbox::Outbox::load(&b.session.server);
         let chat = Chat {
             session: b.session,
             client,
@@ -426,7 +440,7 @@ impl Chat {
             updating: UpdateState::Idle,
             pending_g: false,
             drafts: HashMap::new(),
-            sending: None,
+            outbox,
             online: false,
             typing: HashMap::new(),
             inline_threads: true,
@@ -466,7 +480,9 @@ impl Chat {
         let statuses = chat.load_statuses();
         let threads = chat.load_user_threads();
         let emoji = chat.load_custom_emoji();
-        Some((chat, Task::batch([statuses, threads, emoji])))
+        // Messages left from last time go now.
+        let resend = chat.flush();
+        Some((chat, Task::batch([statuses, threads, emoji, resend])))
     }
 
     /// Every custom emoji on the server, a page of 200 at a time.
@@ -1402,10 +1418,22 @@ impl Chat {
                 tracing::warn!("couldn't load statuses: {e}");
                 Task::none()
             }
-            Message::Sent(Err(e)) => {
-                // Put the text back so nothing typed is lost (unless they've started a new one).
-                if let Some((key, text)) = self.sending.take() {
-                    self.drafts.entry(key).or_insert(text);
+            Message::Delivered(id, Err((e, true))) => {
+                // Offline or the server's trouble: it stays queued and shows why.
+                tracing::info!("message not sent yet: {e}");
+                self.outbox.failed(&id, e);
+                Task::none()
+            }
+            Message::Delivered(id, Err((e, false))) => {
+                // Refused for good: back into its box (unless a new message
+                // is being typed there), with the reason.
+                if let Some(q) = self.outbox.remove(&id) {
+                    let key = if q.post.root_id.is_empty() { q.post.channel_id.clone() } else { thread_key(&q.post.root_id) };
+                    let draft = self.drafts.entry(key.clone()).or_default();
+                    if draft.trim().is_empty() {
+                        *draft = q.post.message;
+                        self.editors.remove(&key);
+                    }
                 }
                 self.error = Some(e);
                 Task::none()
@@ -1460,8 +1488,7 @@ impl Chat {
                     return Task::none();
                 }
                 let channel = self.pv().channel.clone();
-                let text = self.drafts.remove(&channel).unwrap_or_default();
-                self.sending = Some((self.pv().channel.clone(), text));
+                self.drafts.remove(&channel);
                 self.error = None;
                 let channel = self.pv().channel.clone();
                 self.attachments.retain(|a| a.key != channel);
@@ -1472,11 +1499,11 @@ impl Chat {
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
                     ..Default::default()
                 };
-                let client = self.client.clone();
-                Task::perform(async move { client.create_post(&post).await.map_err(err) }, Message::Sent)
+                self.outbox.push(post);
+                Task::batch([self.flush(), to_latest(self.pv().timeline())])
             }
-            Message::Sent(Ok(post)) => {
-                self.sending = None;
+            Message::Delivered(id, Ok(post)) => {
+                self.outbox.remove(&id);
                 let in_thread = post.is_reply();
                 self.store.sent(post);
                 if !in_thread && self.store.timelines.get(&self.pv().channel).is_some_and(|t| t.has_newer) {
@@ -1851,8 +1878,7 @@ impl Chat {
                     return Task::none();
                 }
                 self.attachments.retain(|a| a.key != key);
-                let text = self.drafts.remove(&key).unwrap_or_default();
-                self.sending = Some((key, text));
+                self.drafts.remove(&key);
                 let post = NewPost {
                     channel_id,
                     message,
@@ -1860,8 +1886,8 @@ impl Chat {
                     root_id: root,
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
                 };
-                let client = self.client.clone();
-                Task::perform(async move { client.create_post(&post).await.map_err(err) }, Message::Sent)
+                self.outbox.push(post);
+                Task::batch([self.flush(), to_latest(THREAD)])
             }
             Message::Media(key, result) => {
                 self.media.loaded(key, result);
@@ -2402,6 +2428,7 @@ impl Chat {
             }
             Message::Ws(msg) => self.on_ws(msg),
             Message::Tick => {
+                let resend = if self.outbox.is_empty() { Task::none() } else { self.flush() };
                 self.typing.retain(|_, at| at.elapsed() < TYPING_TTL);
                 for (_, p) in self.panes.iter_mut() {
                     if p.highlight.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
@@ -2409,7 +2436,7 @@ impl Chat {
                         p.jump_target = None;
                     }
                 }
-                Task::none()
+                resend
             }
             // Vim-style keys: only reach here when no text box took them.
             Message::Key(keyboard::Event::KeyPressed { key: Key::Character(k), modifiers, .. })
@@ -2432,12 +2459,15 @@ impl Chat {
         match msg {
             M::Connected { .. } => {
                 self.online = true;
+                // Back online: anything waiting goes now.
+                self.outbox.retry_now();
+                let resend = self.flush();
                 // Our own status may have been fetched before the socket was up.
                 let mine = self.store.statuses.entry(self.store.me.id.clone()).or_insert_with(|| "online".into());
                 if mine == "offline" {
                     *mine = "online".into();
                 }
-                Task::none()
+                resend
             }
             M::Disconnected => {
                 self.online = false;
@@ -2454,6 +2484,10 @@ impl Chat {
                 Task::batch([bootstrap(session)].into_iter().chain(loads))
             }
             M::Event(Event::Posted { post, mentions, .. }) => {
+                // Ours, arriving before the reply to the send (or instead of it).
+                if post.user_id == self.store.me.id && !post.pending_post_id.is_empty() {
+                    self.outbox.remove(&post.pending_post_id);
+                }
                 let viewing = self.showing(&post.channel_id);
                 if viewing && let Some(m) = self.store.members.get_mut(&post.channel_id) {
                     // Seen as it arrives, so it doesn't land in the inbox.
@@ -2729,7 +2763,7 @@ mod tests {
     }
 
     #[test]
-    fn drafts_are_per_channel_and_survive_failed_sends() {
+    fn drafts_are_per_channel_and_messages_wait_in_the_outbox() {
         let mut chat = chat();
         let _ = chat.handle(Message::Draft("for c1".into()));
         chat.pv_mut().channel = "c2".into();
@@ -2738,14 +2772,32 @@ mod tests {
         chat.pv_mut().channel = "c1".into();
         assert_eq!(chat.draft(), "for c1");
 
+        // Sent: out of the box and into the outbox, which keeps it through
+        // failures that are worth retrying.
         let _ = chat.handle(Message::Send);
         assert_eq!(chat.draft(), "");
-        let _ = chat.handle(Message::Sent(Err("offline".into())));
-        assert_eq!(chat.draft(), "for c1", "failed send restores the text");
+        let id = chat.outbox.items[0].post.pending_post_id.clone();
+        assert_eq!(chat.outbox.items[0].post.message, "for c1");
+        let _ = chat.handle(Message::Delivered(id.clone(), Err(("offline".into(), true))));
+        assert_eq!(chat.outbox.items.len(), 1, "still waiting");
+        assert_eq!(chat.draft(), "", "not put back: it will be sent");
 
+        // The server has it: gone from the outbox.
+        let post = mm_api::models::Post { id: "p1".into(), channel_id: "c1".into(), message: "for c1".into(), ..Default::default() };
+        let _ = chat.handle(Message::Delivered(id, Ok(post)));
+        assert!(chat.outbox.is_empty());
+
+        // Refused for good: back into its box, unless something new is there.
+        let _ = chat.handle(Message::Draft("refused".into()));
         let _ = chat.handle(Message::Send);
+        let id = chat.outbox.items[0].post.pending_post_id.clone();
+        let _ = chat.handle(Message::Delivered(id, Err(("too long".into(), false))));
+        assert!(chat.outbox.is_empty());
+        assert_eq!(chat.draft(), "refused");
+        let _ = chat.handle(Message::Send);
+        let id = chat.outbox.items[0].post.pending_post_id.clone();
         let _ = chat.handle(Message::Draft("newer".into()));
-        let _ = chat.handle(Message::Sent(Err("offline".into())));
+        let _ = chat.handle(Message::Delivered(id, Err(("too long".into(), false))));
         assert_eq!(chat.draft(), "newer", "a new draft isn't overwritten");
     }
 

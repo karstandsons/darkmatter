@@ -8,6 +8,7 @@ mod emoji_picker;
 mod layout;
 mod lightbox;
 mod media;
+mod outbox;
 mod pane;
 mod panels;
 mod plugin_picker;

@@ -704,6 +704,15 @@ impl Chat {
                 prev = None;
             }
         }
+        // Messages still on their way, below everything the server has.
+        let (channel, root) = match kind {
+            Kind::Channel => (pv.channel.as_str(), ""),
+            Kind::Thread => entries.first().map_or(("", "-"), |e| (e.post.channel_id.as_str(), e.post.id.as_str())),
+            Kind::Inbox => ("", "-"),
+        };
+        for q in self.outbox.waiting(channel, root) {
+            col = col.push(self.queued_view(q, c));
+        }
         let id = match kind {
             Kind::Channel | Kind::Inbox => pv.timeline(),
             Kind::Thread => iced::widget::Id::from(THREAD),
@@ -747,6 +756,10 @@ impl Chat {
             }
             _ => replies = replies.push(text("Loading replies…").size(12).color(c.muted)),
         }
+        let channel_id = self.store.post(root_id).map_or("", |p| p.channel_id.as_str());
+        for q in self.outbox.waiting(channel_id, root_id) {
+            replies = replies.push(self.queued_view(q, c));
+        }
         let mut col = column![replies];
         if pv.thread.as_deref() == Some(root_id) {
             let composer = self.composer(&format!("thread:{root_id}"), pv.thread_composer(), "Reply…".into(), true, 10.0, c);
@@ -778,6 +791,21 @@ impl Chat {
         container(stack![body, bar])
             .padding(iced::Padding { left: GUTTER, top: 2.0, bottom: 6.0, right: 0.0 })
             .into()
+    }
+
+    /// A message waiting in the outbox: its text, dimmed, and how it's going.
+    fn queued_view<'a>(&'a self, q: &'a crate::outbox::Queued, c: Colors) -> Element<'a, Message> {
+        let status = match &q.problem {
+            None => "Sending…".to_string(),
+            Some(why) => format!("Not sent yet ({why}). It will be sent when the server can be reached."),
+        };
+        let mut lines = column![text(&q.post.message).size(14).color(c.muted)].spacing(2);
+        if !q.post.file_ids.is_empty() {
+            let n = q.post.file_ids.len();
+            lines = lines.push(text(format!("{n} file{}", if n == 1 { "" } else { "s" })).size(12).color(c.muted));
+        }
+        lines = lines.push(text(status).size(11).color(if q.problem.is_some() { c.yellow } else { c.muted }));
+        container(lines).padding(iced::Padding { top: 4.0, bottom: 4.0, left: GUTTER, right: 0.0 }).width(Length::Fill).into()
     }
 
     fn post_view<'a>(

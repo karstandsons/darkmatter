@@ -405,7 +405,8 @@ pub struct AxiondInfo {
 }
 
 /// Body for `POST /posts`.
-#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct NewPost {
     pub channel_id: Id,
     pub message: String,

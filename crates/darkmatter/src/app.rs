@@ -113,7 +113,9 @@ pub enum Message {
     Statuses(Result<Vec<mm_api::models::Status>, String>),
     Draft(String),
     Send,
-    Sent(Result<Post, String>),
+    /// The server's answer to a message from the outbox: (its pending id,
+    /// the post, or the problem and whether to try again).
+    Delivered(String, Result<Post, (String, bool)>),
     OpenThread(String),
     /// Expand or collapse a thread under its message (inline layout).
     ToggleThread(String),
@@ -905,7 +907,7 @@ impl App {
             if chat.layout_dirty {
                 subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::SaveLayout));
             }
-            if !chat.typing.is_empty() || chat.panes.iter().any(|(_, p)| p.highlight.is_some()) {
+            if !chat.typing.is_empty() || chat.panes.iter().any(|(_, p)| p.highlight.is_some()) || !chat.outbox.is_empty() {
                 subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
             }
         }
