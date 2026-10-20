@@ -4,7 +4,10 @@ The Darkmatter chat server. It speaks the part of the Mattermost API that
 Darkmatter uses, so Darkmatter logs in to it unchanged. The plan, and why it
 exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
 
-**Status: M0, an early skeleton.** Don't use it for anything you need yet.
+**Status: M1, a foundation to try out.** Everything Darkmatter does on
+Mattermost works, plus HTTPS, invites, two-factor codes, backups and the
+deploy kit. Messages aren't end-to-end encrypted yet (that's M2), so don't
+use it for anything secret yet.
 
 ## What works
 

@@ -387,6 +387,18 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
   - **Queries are checked at runtime, not compile time.** `sqlx::query!` needs a live database or a committed `.sqlx` cache at build time. The integration tests drive every query through Darkmatter's own client (`tests/darkmatter_client.rs`), and that catches the same mistakes.
   - **The shared-crate split is partial.** `mm-api`'s HTTP client is now a default feature, so axiond uses only its models. `dm-crypto` and `dm-plugin` get created when M2 (E2EE) and the server plugins need them.
 
+**M1 as built** (2026-10-20):
+- **Done:**
+  - The E2EE design ([E2EE.md](E2EE.md)), so files, search, mentions, reactions and devices are built the way encryption needs.
+  - All of Appendix A, plus custom emoji, profile pictures and statuses set by hand.
+  - Security: HTTPS (Let's Encrypt or your own files) with HSTS, rate limits, signed-in apps, two-factor codes, invite-only sign-up, deactivating, report and block, deleting accounts, the audit log, hourly housekeeping that deletes old deleted files.
+  - Reliability: Darkmatter's outbox (no lost messages, no doubles: posts are idempotent by `pending_post_id`), backups and restore, a pre-upgrade copy of the database, upgrade tests from older databases, a crash soak test (SIGKILL every few seconds, nothing lost or doubled), and Darkmatter's client tested against Mattermost 11.7.12 and 12.0.0 in CI.
+  - Running it: the VPS deploy kit (`deploy/axiond`) and a release workflow for multi-arch images.
+  - Darkmatter: invite sign-up, the Account window (signed-in apps, two-factor codes with a QR code, blocked people, deleting the account), ⚑ report or block, and telling axiond from plain Mattermost.
+- **Changes from the plan:**
+  - **The outbox is a JSON file** (state dir, mode 0600), not the SQLCipher database. That database arrives in M2 with the MLS state that needs it; the outbox moves into it then.
+- **Not checked yet:** Let's Encrypt against a real domain, the release workflow's first run (arm64 under emulation), and the outbox in the running app (only through tests). The two of you running it on a VPS is the real test of M1.
+
 **Order note:** the **wire format and API reserve space for E2EE from M0**: `props.dm_e2ee`, device IDs on sessions, and an `encrypted` flag on channels. That way M2 doesn't need a migration of the data model.
 
 ## Open questions
