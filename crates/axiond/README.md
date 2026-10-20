@@ -14,6 +14,9 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
 - Teams, public channels and direct messages: joining, leaving, and finding
   channels by name.
 - Messages: posting, threads, editing, deleting and reactions.
+- Files and pictures, up to 100 MB each (`max_file_mb`). Pictures get a
+  thumbnail and a preview. Files are stored under random names and only ever
+  served as downloads.
 - The Threads list: you follow a thread when you start it, reply or are
   mentioned, with unread replies and mentions per thread.
 - Unread counts and mentions (`@name`, `@channel`, `@all`, `@here`),
@@ -25,7 +28,6 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
 
 Anything else Darkmatter asks for gets a clear "axiond doesn't support that
 yet". That includes:
-- files and pictures;
 - search;
 - custom emoji;
 - slash commands on the server;
@@ -58,9 +60,10 @@ Settings live in `axiond.toml` (in the working directory, or pass
 | Setting | Env | Default | |
 |---|---|---|---|
 | `listen` | `AXIOND_LISTEN` | `127.0.0.1:8065` | Address and port |
-| `data_dir` | `AXIOND_DATA_DIR` | `data` | The database lives here; only axiond's user can read it |
+| `data_dir` | `AXIOND_DATA_DIR` | `data` | The database and uploaded files live here; only axiond's user can read it |
 | `behind_proxy` | `AXIOND_BEHIND_PROXY` | `false` | A TLS proxy is in front |
 | `site_name` | `AXIOND_SITE_NAME` | `axiond` | The name apps show |
+| `max_file_mb` | `AXIOND_MAX_FILE_MB` | `100` | The largest upload, in MB |
 
 axiond doesn't serve TLS yet, so it **refuses to listen anywhere but
 localhost** unless `behind_proxy` is on. Never send passwords over plain HTTP

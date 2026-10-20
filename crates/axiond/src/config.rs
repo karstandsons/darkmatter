@@ -12,12 +12,14 @@ pub struct Config {
     /// Where to listen. Anything but localhost needs `behind_proxy` until
     /// axiond serves TLS itself.
     pub listen: SocketAddr,
-    /// The database and, later, uploaded files.
+    /// The database and uploaded files.
     pub data_dir: PathBuf,
     /// A TLS proxy (Caddy, Traefik, nginx) is in front.
     pub behind_proxy: bool,
     /// The name apps show for this server.
     pub site_name: String,
+    /// The largest file someone can upload, in megabytes.
+    pub max_file_mb: u64,
 }
 
 impl Default for Config {
@@ -27,6 +29,7 @@ impl Default for Config {
             data_dir: PathBuf::from("data"),
             behind_proxy: false,
             site_name: "axiond".into(),
+            max_file_mb: 100,
         }
     }
 }
@@ -60,6 +63,9 @@ impl Config {
         }
         if let Some(v) = var("AXIOND_SITE_NAME") {
             self.site_name = v;
+        }
+        if let Some(v) = var("AXIOND_MAX_FILE_MB") {
+            self.max_file_mb = v.parse().with_context(|| format!("AXIOND_MAX_FILE_MB={v}"))?;
         }
         Ok(())
     }

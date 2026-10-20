@@ -15,7 +15,7 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "signal", "fs", "io-std", "io-util"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "multipart", "query", "tokio", "ws"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "derive", "macros"] }
 argon2 = "0.5"
 sha2 = "0.11"
@@ -25,7 +25,12 @@ rpassword = "7"
 toml = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 anyhow = "1"
+tokio-util = { version = "0.7", features = ["io"] }
+percent-encoding = "2"
+# Thumbnails and previews of uploaded pictures (never of encrypted files).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [dev-dependencies]
 mm-api = { path = "../mm-api" }
+reqwest = { version = "0.13", default-features = false }
 tempfile = "3"

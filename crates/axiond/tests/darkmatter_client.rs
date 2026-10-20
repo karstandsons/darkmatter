@@ -17,9 +17,14 @@ struct Server {
 }
 
 async fn server() -> Server {
+    server_with(|_| {}).await
+}
+
+async fn server_with(change: impl FnOnce(&mut Config)) -> Server {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let dir = tempfile::tempdir().unwrap();
-    let config = Config { data_dir: dir.path().into(), ..Config::default() };
+    let mut config = Config { data_dir: dir.path().into(), ..Config::default() };
+    change(&mut config);
     let app = App::open(config).await.unwrap();
     let user = |name: &str| NewUser { username: name.into(), email: format!("{name}@example.com"), password: PASSWORD.into() };
     admin::setup(&app, user("alice"), "home", "Home").await.unwrap();
@@ -277,4 +282,82 @@ async fn reactions_threads_and_unread() {
     let from_root = alice.set_unread(&alice_id, &root.id).await.unwrap();
     assert_eq!((ch.total_msg_count - from_root.msg_count, ch.total_msg_count_root - from_root.msg_count_root), (3, 1));
     assert!(bob.set_unread(&alice_id, &root.id).await.is_err(), "only for yourself");
+}
+
+/// A small PNG, `w` by `h`.
+fn png(w: u32, h: u32) -> Vec<u8> {
+    let img = image::RgbImage::from_fn(w, h, |x, y| image::Rgb([x as u8, y as u8, 128]));
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+#[tokio::test]
+async fn files_and_pictures() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let rust = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "rust").unwrap().id;
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+
+    // A picture gets its size, a thumbnail and a preview.
+    let picture = png(300, 200);
+    let up = alice.upload_file(&rust, "../cat.png", picture.clone()).await.unwrap();
+    let info = &up.file_infos[0];
+    assert_eq!((info.name.as_str(), info.extension.as_str(), info.mime_type.as_str()), ("cat.png", "png", "image/png"));
+    assert_eq!((info.width, info.height, info.size, info.has_preview_image), (300, 200, picture.len() as i64, true));
+    assert!(bob.file(&info.id).await.is_err(), "nobody else sees it before it's posted");
+
+    // Posted with no text, it shows in the post for everyone in the channel.
+    let post = alice
+        .create_post(&NewPost { channel_id: rust.clone(), file_ids: vec![info.id.clone()], ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(post.file_ids, std::slice::from_ref(&info.id));
+    let page = bob.posts(&rust, PostsQuery::Page { page: 0, per_page: 10 }, true).await.unwrap();
+    assert_eq!(page.posts[&post.id].metadata.files[0].id, info.id);
+    assert_eq!(bob.file(&info.id).await.unwrap(), picture);
+    let thumb = image::load_from_memory(&bob.file_thumbnail(&info.id).await.unwrap()).unwrap();
+    assert!(thumb.width() <= 120 && thumb.height() <= 100);
+    assert_eq!(image::load_from_memory(&bob.file_preview(&info.id).await.unwrap()).unwrap().width(), 300);
+
+    // Downloads are attachments a browser won't run.
+    let resp = reqwest::Client::new()
+        .get(format!("{}/api/v4/files/{}", s.url, info.id))
+        .bearer_auth(bob.token().unwrap())
+        .send()
+        .await
+        .unwrap();
+    let h = resp.headers();
+    assert_eq!(h["content-disposition"], "attachment; filename*=UTF-8''cat%2Epng");
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    assert!(h["content-security-policy"].to_str().unwrap().contains("sandbox"));
+
+    // An upload goes in one post, in its own channel, by whoever uploaded it.
+    assert!(alice.create_post(&NewPost { channel_id: rust.clone(), file_ids: vec![info.id.clone()], ..Default::default() }).await.is_err());
+    let notes = alice.upload_file(&rust, "notes.txt", b"plain text".to_vec()).await.unwrap().file_infos[0].clone();
+    assert!(!notes.has_preview_image && notes.mime_type == "text/plain");
+    assert!(bob.file_thumbnail(&notes.id).await.is_err());
+    assert!(bob.create_post(&NewPost { channel_id: rust.clone(), file_ids: vec![notes.id.clone()], ..Default::default() }).await.is_err());
+    assert!(alice.create_post(&NewPost { channel_id: town, file_ids: vec![notes.id.clone()], ..Default::default() }).await.is_err());
+
+    // Deleting the post takes its files with it.
+    alice.delete_post(&post.id).await.unwrap();
+    assert!(bob.file(&info.id).await.is_err());
+
+    // Something that only looks like a picture is just a file.
+    let fake = alice.upload_file(&rust, "fake.png", b"not really a png".to_vec()).await.unwrap().file_infos[0].clone();
+    assert!(!fake.has_preview_image);
+}
+
+#[tokio::test]
+async fn uploads_stop_at_the_size_limit() {
+    let s = server_with(|c| c.max_file_mb = 1).await;
+    let alice = login(&s, "alice").await;
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let rust = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "rust").unwrap().id;
+    alice.upload_file(&rust, "ok.bin", vec![7; 1024 * 1024]).await.unwrap();
+    let err = alice.upload_file(&rust, "big.bin", vec![7; 1024 * 1024 + 1]).await.unwrap_err();
+    assert!(format!("{err:?}").contains("413") || format!("{err}").contains("at most 1 MB"), "{err:?}");
 }

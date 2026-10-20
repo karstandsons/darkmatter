@@ -133,10 +133,12 @@ pub struct ChannelRow {
     pub total_msg_count: i64,
     pub total_msg_count_root: i64,
     pub creator_id: String,
+    /// End-to-end encrypted: the server can't read what's posted.
+    pub encrypted: bool,
 }
 
 pub const CHANNEL_COLUMNS: &str = "c.id, c.team_id, c.type, c.name, c.display_name, c.header, c.purpose, c.create_at, \
-     c.update_at, c.delete_at, c.last_post_at, c.last_root_post_at, c.total_msg_count, c.total_msg_count_root, c.creator_id";
+     c.update_at, c.delete_at, c.last_post_at, c.last_root_post_at, c.total_msg_count, c.total_msg_count_root, c.creator_id, c.encrypted";
 
 pub fn channel_type(code: &str) -> ChannelType {
     match code {
@@ -285,16 +287,22 @@ pub async fn post(db: &Db, id: &str) -> sqlx::Result<Option<Post>> {
     let sql = format!("SELECT {POST_COLUMNS} FROM posts p WHERE p.id = ?");
     let Some(row) = sqlx::query_as::<_, PostRow>(&sql).bind(id).fetch_optional(db).await? else { return Ok(None) };
     let mut posts = vec![row.into()];
-    with_reactions(db, &mut posts).await?;
+    with_metadata(db, &mut posts).await?;
     Ok(posts.pop())
 }
 
-/// Fills in `metadata.reactions`, oldest first, as Mattermost sends them.
-pub async fn with_reactions(db: &Db, posts: &mut [Post]) -> sqlx::Result<()> {
+/// Fills in `metadata.reactions` and `metadata.files`, oldest first, as
+/// Mattermost sends them.
+pub async fn with_metadata(db: &Db, posts: &mut [Post]) -> sqlx::Result<()> {
     if posts.is_empty() {
         return Ok(());
     }
     let ids = serde_json::to_string(&posts.iter().map(|p| &p.id).collect::<Vec<_>>()).unwrap_or_default();
+    for file in crate::api::files::of_posts(db, &ids).await? {
+        if let Some(post) = posts.iter_mut().find(|p| p.id == file.post_id) {
+            post.metadata.files.push(file);
+        }
+    }
     let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
         "SELECT post_id, user_id, emoji_name, create_at FROM reactions \
          WHERE post_id IN (SELECT value FROM json_each(?1)) ORDER BY create_at, user_id",

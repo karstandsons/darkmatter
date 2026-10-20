@@ -24,11 +24,13 @@ pub struct New {
     /// Empty for people's messages; `system_*` for joins, leaves and the like.
     pub kind: &'static str,
     pub pending_post_id: String,
+    /// Uploads to attach, already checked with `files::check_unattached`.
+    pub file_ids: Vec<String>,
 }
 
 impl New {
     pub fn system(kind: &'static str, message: String) -> Self {
-        New { root_id: String::new(), message, kind, pending_post_id: String::new() }
+        New { root_id: String::new(), message, kind, pending_post_id: String::new(), file_ids: Vec::new() }
     }
 }
 
@@ -46,11 +48,8 @@ pub struct Create {
 }
 
 pub async fn create(State(app): State<App>, me: Me, Json(body): Json<Create>) -> Result<(StatusCode, Json<Post>)> {
-    if !body.file_ids.is_empty() {
-        return Err(Error::not_yet());
-    }
     let message = body.message.trim_end().to_string();
-    if message.trim().is_empty() {
+    if message.trim().is_empty() && body.file_ids.is_empty() {
         return Err(Error::bad_request("A message can't be empty."));
     }
     if message.chars().count() > MAX_MESSAGE {
@@ -66,7 +65,8 @@ pub async fn create(State(app): State<App>, me: Me, Json(body): Json<Create>) ->
             return Err(Error::bad_request("That thread isn't in this channel."));
         }
     }
-    let new = New { root_id: body.root_id, message, kind: "", pending_post_id: body.pending_post_id };
+    super::files::check_unattached(&app, &me.user_id, &channel.id, &body.file_ids).await?;
+    let new = New { root_id: body.root_id, message, kind: "", pending_post_id: body.pending_post_id, file_ids: body.file_ids };
     Ok((StatusCode::CREATED, Json(insert(&app, &channel, &me.user_id, new).await?)))
 }
 
@@ -77,17 +77,33 @@ pub async fn insert(app: &App, channel: &ChannelRow, user_id: &str, new: New) ->
     let mentioned = if new.kind.is_empty() { mentions(app, channel, user_id, &new.message).await? } else { Vec::new() };
 
     let mut tx = app.db.begin().await?;
-    sqlx::query("INSERT INTO posts (id, channel_id, user_id, root_id, create_at, update_at, message, type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(&id)
-        .bind(&channel.id)
-        .bind(user_id)
-        .bind(&new.root_id)
-        .bind(now)
-        .bind(now)
-        .bind(&new.message)
-        .bind(new.kind)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO posts (id, channel_id, user_id, root_id, create_at, update_at, message, type, file_ids) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8)",
+    )
+    .bind(&id)
+    .bind(&channel.id)
+    .bind(user_id)
+    .bind(&new.root_id)
+    .bind(now)
+    .bind(&new.message)
+    .bind(new.kind)
+    .bind(serde_json::to_string(&new.file_ids).unwrap_or_else(|_| "[]".into()))
+    .execute(&mut *tx)
+    .await?;
+    for file in &new.file_ids {
+        // Only if still unattached, in case two posts race for one upload.
+        let done = sqlx::query("UPDATE files SET post_id = ?1, update_at = ?2 WHERE id = ?3 AND post_id = '' AND user_id = ?4")
+            .bind(&id)
+            .bind(now)
+            .bind(file)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        if done.rows_affected() == 0 {
+            return Err(Error::bad_request("One of the files is already in another message."));
+        }
+    }
     sqlx::query(
         "UPDATE channels SET last_post_at = ?1, total_msg_count = total_msg_count + 1, \
            last_root_post_at = CASE WHEN ?2 THEN ?1 ELSE last_root_post_at END, \
@@ -268,6 +284,14 @@ pub async fn remove(State(app): State<App>, me: Me, Path(id): Path<String>) -> R
         .bind(&id)
         .execute(&app.db)
         .await?;
+    sqlx::query(
+        "UPDATE files SET delete_at = ?1, update_at = ?1 WHERE delete_at = 0 \
+         AND post_id IN (SELECT id FROM posts WHERE id = ?2 OR root_id = ?2)",
+    )
+    .bind(now)
+    .bind(&id)
+    .execute(&app.db)
+    .await?;
     for gone in std::iter::once(id).chain(replies) {
         if let Some(p) = db::post(&app.db, &gone).await? {
             tell(&app, "post_deleted", &p).await?;
@@ -365,7 +389,7 @@ async fn slice(app: &App, channel: &str, only_roots: &str, key: &(i64, String), 
 async fn list(app: &App, rows: Vec<PostRow>) -> Result<PostList> {
     let mut posts: Vec<Post> = rows.into_iter().map(Into::into).collect();
     posts.sort_by(|a, b| (b.create_at, &b.id).cmp(&(a.create_at, &a.id)));
-    db::with_reactions(&app.db, &mut posts).await?;
+    db::with_metadata(&app.db, &mut posts).await?;
     Ok(PostList {
         order: posts.iter().map(|p| p.id.clone()).collect(),
         posts: posts.into_iter().map(|p| (p.id.clone(), p)).collect::<HashMap<_, _>>(),

@@ -1,6 +1,7 @@
 //! The HTTP API, under `/api/v4/` as in Mattermost.
 
 mod channels;
+pub(crate) mod files;
 mod posts;
 mod reactions;
 mod threads;
@@ -51,10 +52,21 @@ pub fn router(app: App) -> Router {
         .route("/posts/{id}", delete(posts::remove))
         .route("/posts/{id}/patch", put(posts::edit))
         .route("/posts/{id}/thread", get(posts::thread))
+        .route("/files", post(files::upload).layer(axum::extract::DefaultBodyLimit::max(upload_limit(&app))))
+        .route("/files/{id}", get(files::download))
+        .route("/files/{id}/thumbnail", get(files::thumbnail))
+        .route("/files/{id}/preview", get(files::preview))
+        .route("/files/{id}/info", get(files::info))
         .route("/emoji", get(no_emoji))
         .route("/websocket", get(ws::websocket))
         .fallback(not_yet);
     Router::new().nest("/api/v4", api).with_state(app)
+}
+
+/// The largest upload request: a post's worth of files at the size limit.
+fn upload_limit(app: &App) -> usize {
+    let file = app.config.max_file_mb.saturating_mul(1024 * 1024) as usize;
+    file.saturating_mul(files::MAX_PER_POST).saturating_add(1024 * 1024)
 }
 
 async fn ping() -> Json<Value> {
@@ -69,6 +81,8 @@ async fn client_config(State(app): State<App>) -> Json<Value> {
         "Version": format!("axiond {}", crate::VERSION),
         "BuildNumber": crate::VERSION,
         "EnableGifPicker": "false",
+        "EnableFileAttachments": "true",
+        "MaxFileSize": (app.config.max_file_mb * 1024 * 1024).to_string(),
     }))
 }
 
