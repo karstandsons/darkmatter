@@ -67,7 +67,16 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(100));
         std::fs::write(dir.path().join("theme.name"), "gruvbox").unwrap();
-        let name = rx.recv_timeout(Duration::from_secs(5)).expect("no theme event");
-        assert_eq!(name, "gruvbox");
+        // macOS can report the setup writes above late, as the old theme:
+        // the switch has to arrive, after whatever came first.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let name = rx.recv_timeout(left).expect("no event for the switch");
+            if name == "gruvbox" {
+                break;
+            }
+            assert_eq!(name, "tokyo-night", "only the old theme may come first");
+        }
     }
 }

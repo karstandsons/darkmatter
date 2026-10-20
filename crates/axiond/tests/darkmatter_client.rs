@@ -761,12 +761,14 @@ async fn rate_limits() {
     };
     // Ten tries from one address (one was Alice's login), then it has to
     // wait. Not behind a proxy, a made-up X-Forwarded-For changes nothing.
-    for i in 0..9 {
-        let status = try_login(format!("nobody{i}"), if i % 2 == 0 { "1.2.3.4" } else { "5.6.7.8" }).await.unwrap().status();
-        assert_eq!(status, 401, "try {i}");
-    }
-    let blocked = try_login("someone".into(), "9.9.9.9").await.unwrap();
-    assert_eq!(blocked.status(), 429);
+    // All at once: checking each password is slow on purpose, and one try
+    // comes back every 6 s, so tries one after another could earn a new one.
+    let forwarded = ["1.2.3.4", "5.6.7.8", "9.9.9.9"];
+    let tries = futures_util::future::join_all((0..12).map(|i| try_login(format!("nobody{i}"), forwarded[i % 3]))).await;
+    let statuses: Vec<u16> = tries.iter().map(|r| r.as_ref().unwrap().status().as_u16()).collect();
+    assert_eq!(statuses.iter().filter(|s| **s == 401).count(), 9, "{statuses:?}");
+    assert_eq!(statuses.iter().filter(|s| **s == 429).count(), 3, "{statuses:?}");
+    let blocked = tries.iter().map(|r| r.as_ref().unwrap()).find(|r| r.status() == 429).unwrap();
     assert!(blocked.headers()["retry-after"].to_str().unwrap().parse::<u64>().unwrap() >= 1);
 
     // Posting too fast is refused until it slows down.
