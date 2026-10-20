@@ -124,7 +124,8 @@ pub async fn setup(app: &App, admin: NewUser, team: &str, team_display: &str) ->
         .await?;
     add_channel(app, team, "town-square", "Town Square").await?;
     add_channel(app, team, "off-topic", "Off-Topic").await?;
-    add_user(app, admin, true).await?;
+    let id = add_user(app, admin, true).await?;
+    crate::audit::record(&app.db, "", "server.setup", &id, &format!("team {team}; first admin")).await?;
     Ok(())
 }
 

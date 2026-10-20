@@ -134,7 +134,7 @@ pub async fn signup(State(app): State<App>, Query(q): Query<SignupQuery>, Json(b
             return Err(Error::bad_request(e.to_string()));
         }
     };
-    audit::record(&app.db, &id, "user.signup", &id, &format!("invite {invite} from {inviter}")).await?;
+    audit::record(&app.db, &id, "user.signup", &id, &format!("invite {invite} from {}", if inviter.is_empty() { "the command line".to_string() } else { inviter })).await?;
     Ok((StatusCode::CREATED, Json(db::user(&app.db, &id, &id).await?)))
 }
 

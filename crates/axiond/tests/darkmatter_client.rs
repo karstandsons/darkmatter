@@ -741,8 +741,9 @@ async fn invites_blocking_reports_and_deleting() {
     // The audit log shows who did what.
     let log = axiond::audit::recent(&s.app.db, 50).await.unwrap();
     let actions: Vec<&str> = log.iter().rev().map(|e| e.action.as_str()).collect();
-    assert_eq!(actions, ["invite.create", "user.signup", "report.resolve", "user.deactivate", "user.activate", "user.delete"]);
-    assert_eq!(log.last().unwrap().actor, "alice");
+    assert_eq!(actions, ["server.setup", "invite.create", "user.signup", "report.resolve", "user.deactivate", "user.activate", "user.delete"]);
+    assert_eq!(log[log.len() - 2].actor, "alice");
+    assert_eq!(log.last().unwrap().target, "alice", "the first admin");
     let _ = dm;
 }
 

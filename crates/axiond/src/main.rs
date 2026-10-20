@@ -144,7 +144,11 @@ async fn main() -> anyhow::Result<()> {
             if users == 0 {
                 tracing::warn!("no one can log in yet: run `axiond setup` to make the first admin");
             }
-            tracing::info!("axiond {} listening on http://{}", axiond::VERSION, listener.local_addr()?);
+            let scheme = match app.config.tls()? {
+                axiond::config::Tls::None => "http",
+                _ => "https",
+            };
+            tracing::info!("axiond {} listening on {scheme}://{}", axiond::VERSION, listener.local_addr()?);
             app.serve(listener).await
         }
         Command::Setup { admin, email, team, team_name } => {
@@ -158,7 +162,8 @@ async fn main() -> anyhow::Result<()> {
         Command::User(UserCommand::Add { username, email, admin }) => {
             let app = App::open(config).await?;
             let password = new_password(&username)?;
-            admin::add_user(&app, NewUser { username: username.clone(), email, password }, admin).await?;
+            let id = admin::add_user(&app, NewUser { username: username.clone(), email, password }, admin).await?;
+            axiond::audit::record(&app.db, "", "user.add", &id, if admin { "as an admin" } else { "" }).await?;
             println!("Added {username}.");
             Ok(())
         }
@@ -233,7 +238,8 @@ async fn main() -> anyhow::Result<()> {
             let app = App::open(config).await?;
             for e in axiond::audit::recent(&app.db, limit).await? {
                 let who = if e.actor_id.is_empty() { "(command line)".to_string() } else { format!("@{}", e.actor) };
-                println!("{}  {who:<20} {:<18} {} {}", e.create_at, e.action, e.target_id, e.detail);
+                let target = if e.target.is_empty() { e.target_id } else { format!("@{}", e.target) };
+                println!("{} UTC  {who:<16} {:<16} {target} {}", e.at, e.action, e.detail);
             }
             Ok(())
         }
@@ -286,9 +292,15 @@ async fn ping(config: &Config) -> anyhow::Result<()> {
                 let expected = rustls_pki_types::CertificateDer::from_pem_file(cert)?;
                 rustls::ClientConfig::builder()
                     .dangerous()
-                    .with_custom_certificate_verifier(std::sync::Arc::new(Pinned(expected.into_owned())))
+                    .with_custom_certificate_verifier(std::sync::Arc::new(Pinned(Some(expected.into_owned()))))
                     .with_no_client_auth()
             }
+            // A test certificate (Let's Encrypt staging, Pebble) that nothing
+            // trusts: answering at all is healthy.
+            axiond::config::Tls::Acme(_) if config.acme_staging || config.acme_directory.is_some() => rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(Pinned(None)))
+                .with_no_client_auth(),
             _ => {
                 let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
                 rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()
@@ -315,7 +327,8 @@ fn new_password(username: &str) -> anyhow::Result<String> {
     if let Ok(p) = std::env::var("AXIOND_PASSWORD") {
         return Ok(p);
     }
-    let first = rpassword::prompt_password(format!("Password for {username}: "))?;
+    let first = rpassword::prompt_password(format!("Password for {username}: "))
+        .context("no terminal to ask for a password on (for scripts, set AXIOND_PASSWORD; with Docker, `exec -it`)")?;
     let again = rpassword::prompt_password("Again: ")?;
     if first != again {
         bail!("the passwords didn't match");
@@ -325,7 +338,8 @@ fn new_password(username: &str) -> anyhow::Result<String> {
 
 /// Accepts only one exact certificate, with valid handshake signatures.
 #[derive(Debug)]
-struct Pinned(rustls_pki_types::CertificateDer<'static>);
+/// Accepts exactly this certificate, or (None) any.
+struct Pinned(Option<rustls_pki_types::CertificateDer<'static>>);
 
 impl rustls::client::danger::ServerCertVerifier for Pinned {
     fn verify_server_cert(
@@ -336,7 +350,7 @@ impl rustls::client::danger::ServerCertVerifier for Pinned {
         _ocsp: &[u8],
         _now: rustls_pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if end_entity.as_ref() == self.0.as_ref() {
+        if self.0.as_ref().is_none_or(|c| c.as_ref() == end_entity.as_ref()) {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General("the server's certificate isn't the one in tls_cert".into()))

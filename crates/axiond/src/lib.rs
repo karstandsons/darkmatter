@@ -61,8 +61,7 @@ impl App {
         let tls = self.config.tls()?;
         self.schedule_backups();
         housekeeping::start(&self);
-        let data_dir = self.config.data_dir.clone();
-        let (email, staging) = (self.config.acme_email.clone(), self.config.acme_staging);
+        let config = self.config.clone();
         let service = api::router(self).into_make_service_with_connect_info::<std::net::SocketAddr>();
         match tls {
             config::Tls::None => axum::serve(listener, service).with_graceful_shutdown(shutdown()).await?,
@@ -76,7 +75,7 @@ impl App {
             }
             config::Tls::Acme(domain) => {
                 tls::install_provider();
-                let acceptor = tls::acme(&domain, email.as_deref(), staging, &data_dir.join("acme"));
+                let acceptor = tls::acme(&domain, &config)?;
                 let server = axum_server::from_tcp(listener.into_std()?)?.acceptor(acceptor);
                 server.handle(tls::shutdown_handle()).serve(service).await?;
             }

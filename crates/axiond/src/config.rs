@@ -28,6 +28,10 @@ pub struct Config {
     pub acme_email: Option<String>,
     /// Use Let's Encrypt's staging service (for trying things out).
     pub acme_staging: bool,
+    /// Another ACME server instead of Let's Encrypt, and a CA certificate
+    /// (PEM) to trust when talking to it. For testing against Pebble.
+    pub acme_directory: Option<String>,
+    pub acme_ca: Option<PathBuf>,
     /// Serve HTTPS with these PEM files instead of Let's Encrypt's (for
     /// `domain`, if set).
     pub tls_cert: Option<PathBuf>,
@@ -49,6 +53,8 @@ impl Default for Config {
             domain: None,
             acme_email: None,
             acme_staging: false,
+            acme_directory: None,
+            acme_ca: None,
             tls_cert: None,
             tls_key: None,
             backup_hours: 24,
@@ -96,6 +102,12 @@ impl Config {
         }
         if let Some(v) = var("AXIOND_ACME_STAGING") {
             self.acme_staging = matches!(v.as_str(), "1" | "true" | "yes");
+        }
+        if let Some(v) = var("AXIOND_ACME_DIRECTORY") {
+            self.acme_directory = some(v);
+        }
+        if let Some(v) = var("AXIOND_ACME_CA") {
+            self.acme_ca = some(v).map(Into::into);
         }
         if let Some(v) = var("AXIOND_TLS_CERT") {
             self.tls_cert = some(v).map(Into::into);
