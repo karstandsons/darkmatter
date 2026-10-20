@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue};
 use mm_api::models::{Status, Team, User};
 use serde::Deserialize;
@@ -121,11 +121,6 @@ pub async fn autocomplete(State(app): State<App>, me: Me, Query(q): Query<Autoco
         .await?;
     let users: Vec<User> = rows.into_iter().map(|r| r.into_user(&me.user_id)).collect();
     Ok(Json(json!({ "users": users, "out_of_channel": [] })))
-}
-
-/// No profile pictures yet; apps show initials.
-pub async fn image(_: Me, Path(_id): Path<String>) -> Error {
-    Error::not_found("Picture")
 }
 
 pub async fn my_teams(State(app): State<App>, me: Me) -> Result<Json<Vec<Team>>> {

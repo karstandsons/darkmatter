@@ -33,6 +33,27 @@ pub fn check_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Adds a custom emoji from a picture file, as the first admin.
+pub async fn add_emoji(app: &App, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    let admin: String = sqlx::query_scalar("SELECT id FROM users WHERE roles LIKE '%system_admin%' AND delete_at = 0 ORDER BY create_at LIMIT 1")
+        .fetch_optional(&app.db)
+        .await?
+        .context("set up the server first")?;
+    crate::api::images::add_emoji(app, &admin, name, bytes).await?;
+    Ok(())
+}
+
+/// Sets someone's profile picture from a picture file.
+pub async fn set_picture(app: &App, username: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+    let id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+        .bind(username)
+        .fetch_optional(&app.db)
+        .await?
+        .with_context(|| format!("there's no {username}"))?;
+    crate::api::images::set_picture(app, &id, bytes).await?;
+    Ok(())
+}
+
 /// Makes the first admin and their team, with Town Square and Off-Topic.
 /// Only on an empty server.
 pub async fn setup(app: &App, admin: NewUser, team: &str, team_display: &str) -> anyhow::Result<()> {

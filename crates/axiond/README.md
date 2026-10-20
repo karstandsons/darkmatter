@@ -19,6 +19,9 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
   served as downloads.
 - The Threads list: you follow a thread when you start it, reply or are
   mentioned, with unread replies and mentions per thread.
+- Custom emoji (anyone can add one; `axiond emoji add name file.png` too)
+  and profile pictures, redrawn as a 256-pixel PNG so nothing hidden in the
+  original (like where a photo was taken) is kept.
 - Search, with Mattermost's syntax: words, `"phrases"`, `prefix*`, `-word`,
   `from:`, `in:`, `before:`, `after:` and `on:`. Encrypted channels are never
   searched on the server.
@@ -31,7 +34,6 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
 
 Anything else Darkmatter asks for gets a clear "axiond doesn't support that
 yet". That includes:
-- custom emoji;
 - slash commands on the server;
 - invites;
 - TLS.

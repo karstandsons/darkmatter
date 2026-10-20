@@ -41,6 +41,9 @@ enum Command {
     /// Manage channels.
     #[command(subcommand)]
     Channel(ChannelCommand),
+    /// Manage custom emoji.
+    #[command(subcommand)]
+    Emoji(EmojiCommand),
     /// Check the running server answers (for health checks).
     Ping,
 }
@@ -58,6 +61,14 @@ enum UserCommand {
     },
     /// Set someone's password (they're signed out everywhere).
     Password { username: String },
+    /// Set someone's profile picture (PNG, JPEG, GIF or WebP).
+    Picture { username: String, file: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum EmojiCommand {
+    /// Add a custom emoji, used as :name: (a picture of at most 1 MB).
+    Add { name: String, file: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -119,6 +130,20 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Ping => ping(config.listen).await,
+        Command::User(UserCommand::Picture { username, file }) => {
+            let app = App::open(config).await?;
+            let bytes = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
+            admin::set_picture(&app, &username, bytes).await?;
+            println!("Changed {username}'s picture.");
+            Ok(())
+        }
+        Command::Emoji(EmojiCommand::Add { name, file }) => {
+            let app = App::open(config).await?;
+            let bytes = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
+            admin::add_emoji(&app, &name, &bytes).await?;
+            println!("Added :{name}:.");
+            Ok(())
+        }
         Command::Channel(ChannelCommand::Add { team, name, display_name }) => {
             let app = App::open(config).await?;
             admin::add_channel(&app, &team, &name, display_name.as_deref().unwrap_or(&name)).await?;

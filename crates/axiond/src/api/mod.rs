@@ -1,6 +1,7 @@
 //! The HTTP API, under `/api/v4/` as in Mattermost.
 
 mod channels;
+pub(crate) mod images;
 pub(crate) mod files;
 mod posts;
 mod reactions;
@@ -30,7 +31,7 @@ pub fn router(app: App) -> Router {
         .route("/users/ids", post(users::by_ids))
         .route("/users/status/ids", post(users::statuses))
         .route("/users/autocomplete", get(users::autocomplete))
-        .route("/users/{id}/image", get(users::image))
+        .route("/users/{id}/image", get(images::picture).post(images::upload_picture).delete(images::remove_picture))
         .route("/users/me/teams", get(users::my_teams))
         .route("/users/me/teams/{team}/channels", get(channels::mine))
         .route("/users/me/teams/{team}/channels/members", get(channels::my_members))
@@ -59,7 +60,10 @@ pub fn router(app: App) -> Router {
         .route("/files/{id}/thumbnail", get(files::thumbnail))
         .route("/files/{id}/preview", get(files::preview))
         .route("/files/{id}/info", get(files::info))
-        .route("/emoji", get(no_emoji))
+        .route("/emoji", get(images::list).post(images::create))
+        .route("/emoji/name/{name}", get(images::by_name))
+        .route("/emoji/{id}", delete(images::delete))
+        .route("/emoji/{id}/image", get(images::emoji_image))
         .route("/websocket", get(ws::websocket))
         .fallback(not_yet);
     Router::new().nest("/api/v4", api).with_state(app)
@@ -84,13 +88,9 @@ async fn client_config(State(app): State<App>) -> Json<Value> {
         "BuildNumber": crate::VERSION,
         "EnableGifPicker": "false",
         "EnableFileAttachments": "true",
+        "EnableCustomEmoji": "true",
         "MaxFileSize": (app.config.max_file_mb * 1024 * 1024).to_string(),
     }))
-}
-
-/// No custom emoji yet.
-async fn no_emoji(_: Me) -> Json<Value> {
-    Json(json!([]))
 }
 
 /// No server slash commands yet; Darkmatter's own still work.

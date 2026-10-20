@@ -423,3 +423,65 @@ async fn search() {
     sqlx::query("UPDATE channels SET encrypted = 1 WHERE id = ?").bind(&town).execute(&s.app.db).await.unwrap();
     assert!(found("lunch").await.is_empty());
 }
+
+/// A multipart upload the way Mattermost's web app sends it.
+async fn upload(s: &Server, c: &Client, path: &str, parts: Vec<(&'static str, reqwest::multipart::Part)>) -> reqwest::Response {
+    let mut form = reqwest::multipart::Form::new();
+    for (name, part) in parts {
+        form = form.part(name, part);
+    }
+    reqwest::Client::new()
+        .post(format!("{}/api/v4/{path}", s.url))
+        .bearer_auth(c.token().unwrap())
+        .multipart(form)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn emoji_and_pictures() {
+    use reqwest::multipart::Part;
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let bob_id = bob.me().await.unwrap().id;
+    let emoji = |name: &str, bytes: Vec<u8>| {
+        vec![("image", Part::bytes(bytes).file_name("e.png")), ("emoji", Part::text(format!(r#"{{"name":"{name}"}}"#)))]
+    };
+
+    // Anyone can add an emoji; everyone sees it.
+    let resp = upload(&s, &bob, "emoji", emoji("party", png(32, 32))).await;
+    assert_eq!(resp.status(), 201);
+    let list = alice.custom_emoji(0, 200).await.unwrap();
+    assert_eq!(list.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["party"]);
+    let picture = image::load_from_memory(&alice.emoji_image(&list[0].id).await.unwrap()).unwrap();
+    assert_eq!(picture.width(), 32);
+
+    // Names are unique and tidy, and only small real pictures pass.
+    assert_eq!(upload(&s, &alice, "emoji", emoji("party", png(8, 8))).await.status(), 400);
+    assert_eq!(upload(&s, &alice, "emoji", emoji("Party Time", png(8, 8))).await.status(), 400);
+    assert_eq!(upload(&s, &alice, "emoji", emoji("svg", b"<svg onload=alert(1)/>".to_vec())).await.status(), 400);
+    assert_eq!(upload(&s, &alice, "emoji", emoji("huge", png(2000, 10))).await.status(), 400);
+
+    // Only its creator or an admin removes it.
+    let id = list[0].id.clone();
+    let del = |c: &Client| reqwest::Client::new().delete(format!("{}/api/v4/emoji/{id}", s.url)).bearer_auth(c.token().unwrap().to_string()).send();
+    let carol = {
+        admin::add_user(&s.app, NewUser { username: "carol".into(), email: "carol@example.com".into(), password: PASSWORD.into() }, false).await.unwrap();
+        login(&s, "carol").await
+    };
+    assert_eq!(del(&carol).await.unwrap().status(), 403);
+    assert_eq!(del(&alice).await.unwrap().status(), 200);
+    assert!(alice.custom_emoji(0, 200).await.unwrap().is_empty());
+    assert!(alice.emoji_image(&id).await.is_err());
+
+    // Profile pictures become a 256-pixel square; until then, 404 for initials.
+    assert!(alice.profile_image(&bob_id).await.is_err());
+    let path = format!("users/{bob_id}/image");
+    assert_eq!(upload(&s, &bob, &path, vec![("image", Part::bytes(png(400, 300)).file_name("me.png"))]).await.status(), 200);
+    let pic = image::load_from_memory(&alice.profile_image(&bob_id).await.unwrap()).unwrap();
+    assert_eq!((pic.width(), pic.height()), (256, 256));
+    assert!(alice.users_by_ids(std::slice::from_ref(&bob_id)).await.unwrap()[0].last_picture_update > 0);
+    assert_eq!(upload(&s, &carol, &path, vec![("image", Part::bytes(png(10, 10)).file_name("x.png"))]).await.status(), 403);
+}
