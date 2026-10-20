@@ -222,7 +222,7 @@ impl Vault {
     pub async fn clear_device(&self) -> sqlx::Result<()> {
         self.writer.flush().await;
         sqlx::query("DELETE FROM mls").execute(&self.pool).await?;
-        sqlx::query("DELETE FROM kv WHERE k LIKE 'device.%' OR k LIKE 'seq.%' OR k LIKE 'joined.%'").execute(&self.pool).await?;
+        sqlx::query("DELETE FROM kv WHERE k LIKE 'device.%' OR k LIKE 'seq.%' OR k LIKE 'joined.%' OR k LIKE 'updated.%'").execute(&self.pool).await?;
         Ok(())
     }
 }

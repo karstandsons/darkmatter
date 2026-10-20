@@ -340,11 +340,22 @@ impl Chat {
             .spacing(12)
             .align_y(iced::Center);
         if channel.encrypted {
-            header = header.push(tooltip(
-                text("🔒").size(13),
-                container(text("End-to-end encrypted: only the people here can read it").size(11)).padding([2, 6]).style(c.panel(c.surface)),
-                tooltip::Position::Bottom,
-            ));
+            // Who it's encrypted for, as the group itself says.
+            let who = match self.group_members.get(&channel.id) {
+                Some(members) if !members.is_empty() => {
+                    let names: Vec<String> = members
+                        .iter()
+                        .map(|(user, devices)| {
+                            let name = self.store.users.get(user).map_or_else(|| user.clone(), |u| u.username.clone());
+                            if *devices > 1 { format!("@{name} ({devices} devices)") } else { format!("@{name}") }
+                        })
+                        .collect();
+                    format!("End-to-end encrypted for {}", names.join(", "))
+                }
+                _ if self.crypto.is_none() => "End-to-end encrypted. This device isn't set up to read it (see Account).".into(),
+                _ => "End-to-end encrypted: the first message sets it up for everyone here".into(),
+            };
+            header = header.push(tooltip(text("🔒").size(13), container(text(who).size(11)).padding([2, 6]).style(c.panel(c.surface)), tooltip::Position::Bottom));
         }
         // The title bar hides a title that doesn't fit beside the controls,
         // so keep the topic short.

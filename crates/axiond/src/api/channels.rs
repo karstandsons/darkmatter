@@ -1,5 +1,6 @@
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use mm_api::models::{Channel, ChannelMember};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -159,7 +160,110 @@ pub async fn direct_channel(app: &App, me: &str, other: &str) -> Result<ChannelR
             .await?;
     }
     tx.commit().await?;
+    // Both people's apps add it to their list.
+    let users: Vec<String> = if a == b { vec![a.into()] } else { vec![a.into(), b.into()] };
+    for user in &users {
+        let teammate = users.iter().find(|u| *u != user).unwrap_or(user);
+        app.hub.send(std::slice::from_ref(user), &Event::new("direct_added", json!({ "teammate_id": teammate })).channel(&id));
+    }
     db::channel(&app.db, &id).await?.ok_or_else(Error::internal)
+}
+
+#[derive(Deserialize)]
+pub struct NewChannel {
+    team_id: String,
+    name: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    purpose: String,
+    #[serde(default)]
+    header: String,
+}
+
+/// `POST /channels`: a public (`O`) or private (`P`) channel, with its
+/// creator in it. Private channels are end-to-end encrypted.
+pub async fn create(State(app): State<App>, me: Me, Json(body): Json<NewChannel>) -> Result<(StatusCode, Json<Channel>)> {
+    team_member(&app, &me, &body.team_id).await?;
+    if !matches!(body.kind.as_str(), "O" | "P") {
+        return Err(Error::bad_request("A channel is public (O) or private (P)."));
+    }
+    let name = body.name.trim().to_lowercase();
+    crate::admin::check_name(&name).map_err(|e| Error::bad_request(e.to_string()))?;
+    let display = if body.display_name.trim().is_empty() { name.clone() } else { body.display_name.trim().chars().take(64).collect() };
+    let (id, now) = (ids::new_id(), ids::now());
+    let created = sqlx::query(
+        "INSERT INTO channels (id, team_id, type, name, display_name, purpose, header, create_at, update_at, creator_id, encrypted) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&body.team_id)
+    .bind(&body.kind)
+    .bind(&name)
+    .bind(&display)
+    .bind(body.purpose.trim())
+    .bind(body.header.trim())
+    .bind(now)
+    .bind(now)
+    .bind(&me.user_id)
+    .bind(body.kind == "P")
+    .execute(&app.db)
+    .await;
+    match created {
+        Err(sqlx::Error::Database(d)) if d.is_unique_violation() => return Err(Error::bad_request(format!("~{name} already exists."))),
+        other => other?,
+    };
+    let channel = db::channel(&app.db, &id).await?.ok_or_else(Error::internal)?;
+    add_member(&app.db, &channel, &me.user_id).await?;
+    app.hub.send(std::slice::from_ref(&me.user_id), &Event::new("channel_created", json!({ "channel_id": id, "team_id": body.team_id })).channel(&id));
+    Ok((StatusCode::CREATED, Json(channel.into())))
+}
+
+/// One member of a channel you can read.
+pub async fn member(State(app): State<App>, me: Me, Path((id, user)): Path<(String, String)>) -> Result<Json<ChannelMember>> {
+    readable(&app, &me, &id).await?;
+    Ok(Json(db::member(&app.db, &id, &user).await?.ok_or_else(|| Error::not_found("Member"))?))
+}
+
+/// Turns end-to-end encryption on for a public channel (an admin's choice;
+/// private channels and DMs always have it). It applies to new messages;
+/// it can't be turned off yet.
+pub async fn set_encrypted(app: &App, actor: &str, channel: &ChannelRow) -> Result<()> {
+    if channel.encrypted {
+        return Ok(());
+    }
+    if channel.kind != "O" {
+        return Err(Error::bad_request("Only public channels can have encryption switched on."));
+    }
+    sqlx::query("UPDATE channels SET encrypted = 1, update_at = ? WHERE id = ?").bind(ids::now()).bind(&channel.id).execute(&app.db).await?;
+    let text = "End-to-end encryption is on: new messages here can only be read by the people in the channel.";
+    let mut on = channel.clone();
+    on.encrypted = true;
+    posts::insert(app, &on, actor, posts::New::system("system_encryption_on", text.into())).await?;
+    crate::audit::record(&app.db, actor, "channel.encrypt", &channel.id, &channel.name).await?;
+    let members = db::member_ids(&app.db, &channel.id).await?;
+    app.hub.send(&members, &Event::new("channel_updated", json!({ "channel_id": channel.id })).channel(&channel.id));
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct Encrypted {
+    encrypted: bool,
+}
+
+/// `PUT e2ee/channels/{id}/encrypted` (admins).
+pub async fn put_encrypted(State(app): State<App>, me: Me, Path(id): Path<String>, Json(body): Json<Encrypted>) -> Result<Json<Value>> {
+    if !me.is_admin() {
+        return Err(Error::forbidden());
+    }
+    if !body.encrypted {
+        return Err(Error::bad_request("Encryption can't be turned off."));
+    }
+    let channel = db::channel(&app.db, &id).await?.ok_or_else(|| Error::not_found("Channel"))?;
+    set_encrypted(&app, &me.user_id, &channel).await?;
+    super::ok()
 }
 
 #[derive(Deserialize)]
@@ -189,6 +293,8 @@ pub async fn join_channel(app: &App, user_id: &str, channel: &ChannelRow) -> Res
     add_member(&app.db, channel, user_id).await?;
     let user = db::user(&app.db, user_id, user_id).await?;
     posts::insert(app, channel, user_id, posts::New::system("system_join_channel", format!("@{} joined the channel.", user.username))).await?;
+    let members = db::member_ids(&app.db, &channel.id).await?;
+    app.hub.send(&members, &Event::new("user_added", json!({ "user_id": user_id, "team_id": channel.team_id })).channel(&channel.id));
     Ok(())
 }
 

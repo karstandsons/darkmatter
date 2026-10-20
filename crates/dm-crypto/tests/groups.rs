@@ -162,15 +162,15 @@ fn a_device_without_a_valid_certificate_is_refused() {
     let forged = UserIdentity::generate().certify("bob", "evil", fake.signature_key(), 1);
     w.keys.certificates.borrow_mut().insert(("bob".into(), "evil".into()), forged);
     let err = alice.add("c1", &[fake.key_package(false).unwrap()], &w.keys).unwrap_err();
-    assert!(matches!(err, Error::Untrusted(_)), "{err}");
+    assert!(matches!(err, Error::Untrusted(_) | Error::UnknownDevice { .. }), "{err}");
 
     // No certificate at all.
     let stranger = Device::create("bob", "unknown", MemoryStorage::default()).unwrap();
-    assert!(matches!(alice.add("c1", &[stranger.key_package(false).unwrap()], &w.keys), Err(Error::Untrusted(_))));
+    assert!(matches!(alice.add("c1", &[stranger.key_package(false).unwrap()], &w.keys), Err(Error::Untrusted(_) | Error::UnknownDevice { .. })));
 
     // A certificate for another key than the one the device uses.
     let other = Device::create("bob", "desktop", MemoryStorage::default()).unwrap();
-    assert!(matches!(alice.add("c1", &[other.key_package(false).unwrap()], &w.keys), Err(Error::Untrusted(_))));
+    assert!(matches!(alice.add("c1", &[other.key_package(false).unwrap()], &w.keys), Err(Error::Untrusted(_) | Error::UnknownDevice { .. })));
 
     // A client that skips the check (or lies) is stopped by the server.
     let lying = Keys::default();
@@ -180,18 +180,18 @@ fn a_device_without_a_valid_certificate_is_refused() {
     lying.certificates.borrow_mut().insert(("bob".into(), "desktop".into()), w.keys.certificate("bob", "desktop").unwrap());
     let h = alice.add("c1", &[fake.key_package(false).unwrap()], &lying).unwrap();
     let refused = w.server.commit("c1", &name(&alice), &h.commit, &h.group_info, |_| true, &w.keys).unwrap_err();
-    assert!(matches!(refused, Refusal::Invalid(Error::Untrusted(_))), "{refused}");
+    assert!(matches!(refused, Refusal::Invalid(Error::Untrusted(_) | Error::UnknownDevice { .. })), "{refused}");
     alice.discard("c1").unwrap();
 
     // And a Welcome into a group holding such a device isn't accepted.
     let h = alice.add("c1", &[fake.key_package(false).unwrap(), bob.key_package(false).unwrap()], &lying).unwrap();
-    assert!(matches!(bob.join(h.welcome.as_ref().unwrap(), &w.server_key(), &w.keys), Err(Error::Untrusted(_))));
+    assert!(matches!(bob.join(h.welcome.as_ref().unwrap(), &w.server_key(), &w.keys), Err(Error::Untrusted(_) | Error::UnknownDevice { .. })));
     alice.discard("c1").unwrap();
 
     // Users who aren't in the channel can't be added, even with valid keys.
     let h = alice.add("c1", &[bob.key_package(false).unwrap()], &w.keys).unwrap();
     let refused = w.server.commit("c1", &name(&alice), &h.commit, &h.group_info, |user| user != "bob", &w.keys).unwrap_err();
-    assert!(matches!(refused, Refusal::Invalid(Error::Untrusted(_))));
+    assert!(matches!(refused, Refusal::Invalid(Error::Untrusted(_) | Error::UnknownDevice { .. })));
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn the_server_removes_a_device_and_it_reads_nothing_after() {
     // hasn't seen the proposal yet.)
     let skip = alice_phone.update("c1").unwrap();
     let refused = w.server.commit("c1", &name(&alice_phone), &skip.commit, &skip.group_info, |_| true, &w.keys).unwrap_err();
-    assert!(matches!(refused, Refusal::Invalid(Error::Untrusted(_))), "{refused}");
+    assert!(matches!(refused, Refusal::Invalid(Error::Untrusted(_) | Error::UnknownDevice { .. })), "{refused}");
     alice_phone.discard("c1").unwrap();
 
     let h = alice.commit_pending("c1").unwrap().expect("a commit");
@@ -277,7 +277,7 @@ fn someone_joins_a_public_encrypted_channel_by_themselves() {
     // Not allowed in the channel: refused.
     let (_, h) = dave.join_external(&latest.group_info, &w.server_key(), &w.keys).unwrap();
     let refused = w.server.commit("town", &name(&dave), &h.commit, &h.group_info, |user| user != "dave", &w.keys).unwrap_err();
-    assert!(matches!(refused, Refusal::Invalid(Error::Untrusted(_))));
+    assert!(matches!(refused, Refusal::Invalid(Error::Untrusted(_) | Error::UnknownDevice { .. })));
 
     // A fresh device joins properly once allowed.
     let dave = w.device("dave", "desktop2");
@@ -295,7 +295,7 @@ fn someone_joins_a_public_encrypted_channel_by_themselves() {
     // A group info naming another external sender is refused.
     let other = Server::create(MemoryStorage::default()).unwrap();
     let eve = w.device("eve", "desktop");
-    assert!(matches!(eve.join_external(&latest.group_info, &other.key(), &w.keys), Err(Error::Untrusted(_))));
+    assert!(matches!(eve.join_external(&latest.group_info, &other.key(), &w.keys), Err(Error::Untrusted(_) | Error::UnknownDevice { .. })));
 }
 
 #[test]
@@ -311,7 +311,7 @@ fn a_message_moved_or_replayed_elsewhere_is_caught() {
     let sent = Aad::post("c1", "", "p1");
     let ct = alice.encrypt("c1", &post("for c1"), &sent).unwrap();
     // Delivered into the other channel's group: refused outright.
-    assert!(matches!(bob.process("c2", &ct.ciphertext().unwrap(), &w.keys), Err(Error::Untrusted(_))));
+    assert!(matches!(bob.process("c2", &ct.ciphertext().unwrap(), &w.keys), Err(Error::Untrusted(_) | Error::UnknownDevice { .. })));
     // Delivered where it belongs but presented as a reply, an edit or another
     // post: the authenticated data says otherwise.
     let Incoming::Message { aad, .. } = bob.process("c1", &ct.ciphertext().unwrap(), &w.keys).unwrap() else { panic!() };
@@ -337,7 +337,7 @@ fn a_group_must_name_this_server_and_only_it() {
     assert!(w.server.register("c1", &info, &name(&alice), &w.keys).is_err());
     // Bob won't join it either.
     let h = alice.add("c1", &[bob.key_package(false).unwrap()], &w.keys).unwrap();
-    assert!(matches!(bob.join(h.welcome.as_ref().unwrap(), &w.server_key(), &w.keys), Err(Error::Untrusted(_))));
+    assert!(matches!(bob.join(h.welcome.as_ref().unwrap(), &w.server_key(), &w.keys), Err(Error::Untrusted(_) | Error::UnknownDevice { .. })));
     // Nor can someone register a group in another device's name.
     let info = bob.create_group("c2", &w.server_key()).unwrap();
     assert!(w.server.register("c2", &info, &name(&alice), &w.keys).is_err());

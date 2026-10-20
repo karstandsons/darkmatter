@@ -428,7 +428,7 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
    - sending and receiving;
    - the "🔒 Encrypted message" fallback for other clients;
    - axiond refusing plaintext in encrypted channels.
-5. **Private channels and membership:** adds, removes (server-proposed), external commits for public encrypted channels, regular leaf updates, a member list taken from the group.
+5. **Private channels and membership:** *(built 2026-10-20; tested end to end through axiond, the in-app check still to do)* adds, removes (server-proposed), external commits for public encrypted channels, regular leaf updates, a member list taken from the group. Also: `POST /channels` (private ones encrypted), an admin switch to encrypt a public channel (`axiond channel encrypt`), `/create [private] <name>` in Darkmatter, and Darkmatter following channel events (added to a channel, a new DM, removed). Catching up fetches the keys of people who have since left, and a device that can't apply a handshake rejoins instead of drifting out of step.
 6. **Encrypted files**, with thumbnails made on the client.
 7. **Edits, reactions** (encrypted events) **and mentions** (`dm_mentions`).
 8. **Local search** over decrypted messages, merged with the server's results.

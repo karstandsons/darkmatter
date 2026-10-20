@@ -241,7 +241,7 @@ async fn a_group_through_axiond_from_creation_to_removal() {
     assert!(matches!(got.as_slice(), [Incoming::Proposal { removed }] if removed == &vec![(alice.user_id.clone(), "alice-phone".to_string())]));
     let identity = alice.api.identity(&alice.user_id).await.unwrap();
     assert_eq!(identity.revoked, vec!["alice-phone"]);
-    assert_eq!(identity.devices.len(), 1);
+    assert_eq!(identity.devices.len(), 2, "still listed, for checking history");
 }
 
 #[tokio::test]

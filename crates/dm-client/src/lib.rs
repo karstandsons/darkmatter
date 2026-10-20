@@ -34,6 +34,10 @@ const KEY_PACKAGES: u64 = 20;
 const KEY_PACKAGES_LOW: u64 = 10;
 /// How often a commit is retried when someone else's gets there first.
 const RETRIES: usize = 5;
+/// Each device refreshes its key in every group this often, and after it
+/// has been away this long (post-compromise security, E2EE.md §4).
+const REFRESH_EVERY_MS: i64 = 7 * 24 * 3_600_000;
+const AWAY_MS: i64 = 24 * 3_600_000;
 
 /// What the store keys these under.
 const IDENTITY: &str = "identity.secret";
@@ -63,7 +67,22 @@ pub enum Decrypted {
 #[derive(Default)]
 struct Keys {
     identities: HashMap<String, IdentityKey>,
+    /// Revoked devices' certificates too: they check old commits.
     certificates: HashMap<(String, String), DeviceCertificate>,
+    revoked: HashSet<(String, String)>,
+}
+
+impl Keys {
+    /// Devices that may be added to groups now.
+    fn active(&self) -> impl Iterator<Item = &(String, String)> {
+        self.certificates.keys().filter(|d| !self.revoked.contains(*d))
+    }
+
+    fn extend(&mut self, other: Keys) {
+        self.identities.extend(other.identities);
+        self.certificates.extend(other.certificates);
+        self.revoked.extend(other.revoked);
+    }
 }
 
 impl Directory for Keys {
@@ -143,6 +162,11 @@ pub async fn setup<S: LocalStore>(api: Client, user_id: &str, store: S, info: &A
         tracing::info!("encryption set up for this device ({device_id})");
         e2ee
     };
+    // Away for more than a day: refresh every group's key as it syncs.
+    let last_seen = e2ee.store.get("last_seen").await.and_then(|v| String::from_utf8(v).ok()).and_then(|v| v.parse::<i64>().ok());
+    let mut e2ee = e2ee;
+    e2ee.away = last_seen.is_some_and(|t| now() - t > AWAY_MS);
+    e2ee.store.set("last_seen", now().to_string().into_bytes());
     e2ee.top_up().await?;
     Ok(Setup::Ready(Box::new(e2ee)))
 }
@@ -164,11 +188,13 @@ pub struct E2ee<S> {
     saved: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
     /// Held by everything that touches a group, so changes don't interleave.
     lock: tokio::sync::Mutex<()>,
+    /// This device was away for more than a day before this start.
+    away: bool,
 }
 
 impl<S: LocalStore> E2ee<S> {
     fn new(api: Client, user_id: &str, device: Device<MemoryStorage>, identity: IdentityKey, server: ServerKey, store: S, saved: HashMap<Vec<u8>, Vec<u8>>) -> Self {
-        E2ee { api, user_id: user_id.into(), device, identity, server, store, saved: Mutex::new(saved), lock: Default::default() }
+        E2ee { api, user_id: user_id.into(), device, identity, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false }
     }
 
     /// Gives the store whatever openmls changed since the last time.
@@ -227,8 +253,12 @@ impl<S: LocalStore> E2ee<S> {
                 keys.identities.insert(user.clone(), key);
             }
             for cert in id.devices.into_iter().filter_map(|c| serde_json::from_value::<DeviceCertificate>(c).ok()) {
+                if cert.user_id != *user {
+                    continue;
+                }
                 keys.certificates.insert((cert.user_id.clone(), cert.device_id.clone()), cert);
             }
+            keys.revoked.extend(id.revoked.into_iter().map(|d| (user.clone(), d)));
         }
         Ok(keys)
     }
@@ -260,14 +290,13 @@ impl<S: LocalStore> E2ee<S> {
     /// Takes in the Welcomes waiting for this device.
     async fn take_welcomes(&self) -> Result<(), String> {
         for w in self.api.welcomes().await.map_err(s)? {
-            let keys = self.keys(&self.members(&w.channel_id).await.unwrap_or_default()).await?;
-            let joined = B64.decode(&w.welcome).map_err(s).and_then(|bytes| {
+            let mut keys = self.keys(&self.members(&w.channel_id).await.unwrap_or_default()).await?;
+            let joined = match B64.decode(&w.welcome) {
                 // A group we already hold (say, rejoined meanwhile) is left alone.
-                if self.device.has_group(&w.channel_id) {
-                    return Err("already in the group".into());
-                }
-                self.device.join(&bytes, &self.server, &keys).map_err(s)
-            });
+                Ok(_) if self.device.has_group(&w.channel_id) => Err("already in the group".to_string()),
+                Ok(bytes) => self.join_with_keys(&bytes, &mut keys).await,
+                Err(e) => Err(s(e)),
+            };
             match joined {
                 Ok(channel) => {
                     self.set_cursor(&channel, w.seq);
@@ -296,17 +325,21 @@ impl<S: LocalStore> E2ee<S> {
             }
             for h in &page {
                 let bytes = B64.decode(&h.data).map_err(s)?;
-                let result = self.device.process(channel_id, &bytes, keys.as_ref().unwrap());
+                let result = self.process_with_keys(channel_id, &bytes, keys.as_mut().unwrap()).await;
                 self.persist();
                 if let Err(e) = result {
-                    if !self.device.is_member(channel_id) {
-                        // Removed, or too far behind: join again from scratch.
-                        tracing::info!("not in {channel_id}'s group any more: {e}");
+                    let behind = self.device.epoch(channel_id).is_ok_and(|now| h.epoch < now);
+                    if self.device.is_member(channel_id) && behind {
+                        // Already past it (our own commit, say).
+                        tracing::debug!("skipping handshake {} in {channel_id}: {e}", h.seq);
+                    } else {
+                        // Can't follow the group from here: rather than drift
+                        // out of step, drop this copy and join afresh.
+                        tracing::warn!("can't apply handshake {} in {channel_id} ({e}); joining again", h.seq);
                         self.device.forget(channel_id).map_err(s)?;
                         self.persist();
                         return Ok(());
                     }
-                    tracing::warn!("a handshake in {channel_id} (seq {}) was refused: {e}", h.seq);
                 }
                 self.set_cursor(channel_id, h.seq);
             }
@@ -314,6 +347,35 @@ impl<S: LocalStore> E2ee<S> {
                 self.device.forget(channel_id).map_err(s)?;
                 self.persist();
                 return Ok(());
+            }
+        }
+    }
+
+    /// Joins from a Welcome, fetching the keys of members the directory
+    /// didn't have.
+    async fn join_with_keys(&self, welcome: &[u8], keys: &mut Keys) -> Result<String, String> {
+        let mut fetched = HashSet::new();
+        loop {
+            match self.device.join(welcome, &self.server, keys) {
+                Err(dm_crypto::Error::UnknownDevice { user, .. }) if fetched.insert(user.clone()) => keys.extend(self.keys(std::slice::from_ref(&user)).await?),
+                other => return other.map_err(s),
+            }
+        }
+    }
+
+    /// Processes a handshake, fetching the keys of anyone it names that the
+    /// directory didn't have (someone added, then gone from the channel).
+    async fn process_with_keys(&self, channel_id: &str, bytes: &[u8], keys: &mut Keys) -> Result<Incoming, dm_crypto::Error> {
+        let mut fetched = HashSet::new();
+        loop {
+            match self.device.process(channel_id, bytes, keys) {
+                Err(dm_crypto::Error::UnknownDevice { user, device }) if fetched.insert(user.clone()) => {
+                    match self.keys(std::slice::from_ref(&user)).await {
+                        Ok(more) => keys.extend(more),
+                        Err(e) => return Err(dm_crypto::Error::Untrusted(format!("couldn't fetch {user}:{device}'s keys: {e}"))),
+                    }
+                }
+                other => return other,
             }
         }
     }
@@ -348,7 +410,7 @@ impl<S: LocalStore> E2ee<S> {
         // has never set up encryption has no device to encrypt for.
         let members = self.members(channel_id).await?;
         let keys = self.keys(&members).await?;
-        let unable: Vec<String> = members.iter().filter(|u| !keys.certificates.keys().any(|(cu, _)| cu == *u)).cloned().collect();
+        let unable: Vec<String> = members.iter().filter(|u| !keys.active().any(|(cu, _)| cu == *u)).cloned().collect();
         if !unable.is_empty() {
             let names: Vec<String> = match self.api.users_by_ids(&unable).await {
                 Ok(users) => users.into_iter().map(|u| format!("@{}", u.username)).collect(),
@@ -392,7 +454,7 @@ impl<S: LocalStore> E2ee<S> {
     async fn add_missing(&self, channel_id: &str, keys: &Keys) -> Result<(), String> {
         for _ in 0..RETRIES {
             let in_group: HashSet<(String, String)> = self.device.members(channel_id).map_err(s)?.into_iter().collect();
-            let mut users: Vec<String> = keys.certificates.keys().filter(|d| !in_group.contains(*d)).map(|(u, _)| u.clone()).collect();
+            let mut users: Vec<String> = keys.active().filter(|d| !in_group.contains(*d)).map(|(u, _)| u.clone()).collect();
             users.dedup();
             if users.is_empty() {
                 return Ok(());
@@ -564,7 +626,8 @@ impl<S: LocalStore> E2ee<S> {
             self.take_welcomes().await?;
         }
         if self.device.has_group(channel_id) {
-            return self.catch_up(channel_id).await;
+            self.catch_up(channel_id).await?;
+            return self.refresh_if_due(channel_id).await;
         }
         match self.api.group_state(channel_id).await {
             // No group yet: the first message makes it.
@@ -572,6 +635,53 @@ impl<S: LocalStore> E2ee<S> {
             Err(e) => Err(s(e)),
             Ok(_) => self.join_external(channel_id).await,
         }
+    }
+
+    /// Commits a fresh key for this device in the group, if a week has
+    /// passed since the last one (or this device was away for a day).
+    async fn refresh_if_due(&self, channel_id: &str) -> Result<(), String> {
+        let key = format!("updated.{channel_id}");
+        let last = self.store.get(&key).await.and_then(|v| String::from_utf8(v).ok()).and_then(|v| v.parse::<i64>().ok());
+        let Some(last) = last else {
+            // First seen: joining gave it a fresh key.
+            self.store.set(&key, now().to_string().into_bytes());
+            return Ok(());
+        };
+        if !self.away && now() - last < REFRESH_EVERY_MS {
+            return Ok(());
+        }
+        for _ in 0..RETRIES {
+            let h = self.device.update(channel_id).map_err(s)?;
+            self.persist();
+            if self.send(channel_id, &h).await? {
+                self.store.set(&key, now().to_string().into_bytes());
+                tracing::info!("refreshed this device's key in {channel_id}");
+                return Ok(());
+            }
+            self.catch_up(channel_id).await?;
+        }
+        Err("couldn't refresh the conversation's keys".into())
+    }
+
+    /// This device's user left the channel, or was removed: forget its group.
+    pub async fn left(&self, channel_id: &str) -> Result<(), String> {
+        let _held = self.lock.lock().await;
+        self.device.forget(channel_id).map_err(s)?;
+        self.persist();
+        Ok(())
+    }
+
+    /// The devices in a channel's group, as the group itself says (not the
+    /// server), by user.
+    pub fn group_members(&self, channel_id: &str) -> Option<Vec<(String, usize)>> {
+        let mut by_user: Vec<(String, usize)> = Vec::new();
+        for (user, _) in self.device.members(channel_id).ok()? {
+            match by_user.iter_mut().find(|(u, _)| *u == user) {
+                Some((_, n)) => *n += 1,
+                None => by_user.push((user, 1)),
+            }
+        }
+        Some(by_user)
     }
 
     /// The server's `mls_commit` event: catch up now, so the next message

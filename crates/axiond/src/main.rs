@@ -113,6 +113,14 @@ enum EmojiCommand {
 
 #[derive(Subcommand)]
 enum ChannelCommand {
+    /// Turn end-to-end encryption on for a public channel. It applies to new
+    /// messages; private channels and DMs always have it.
+    Encrypt {
+        /// The team's URL name.
+        team: String,
+        /// The channel's URL name.
+        name: String,
+    },
     /// Add a public channel to a team, with everyone in the team in it.
     Add {
         /// The team's URL name.
@@ -248,6 +256,12 @@ async fn main() -> anyhow::Result<()> {
             let bytes = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             admin::add_emoji(&app, &name, &bytes).await?;
             println!("Added :{name}:.");
+            Ok(())
+        }
+        Command::Channel(ChannelCommand::Encrypt { team, name }) => {
+            let app = App::open(config).await?;
+            admin::encrypt_channel(&app, &team, &name).await?;
+            println!("Encryption is on in ~{name}, for new messages.");
             Ok(())
         }
         Command::Channel(ChannelCommand::Add { team, name, display_name }) => {

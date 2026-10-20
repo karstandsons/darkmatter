@@ -55,6 +55,10 @@ pub enum Error {
     /// that claims to belong somewhere else.
     #[error("untrusted: {0}")]
     Untrusted(String),
+    /// A device whose keys the directory doesn't have (yet): fetch that
+    /// user's keys and try again.
+    #[error("no keys for {user}:{device}")]
+    UnknownDevice { user: String, device: String },
     /// No group for this channel on this device.
     #[error("not a member of {0}")]
     NoGroup(String),

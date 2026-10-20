@@ -371,6 +371,23 @@ impl Client {
     // End-to-end encryption on axiond (docs/axiond/E2EE.md §15). Binary data
     // is base64.
 
+    /// Makes a public or private channel in a team, with you in it.
+    pub async fn create_channel(&self, team_id: &str, name: &str, display_name: &str, private: bool) -> Result<Channel, Error> {
+        let body = json!({ "team_id": team_id, "name": name, "display_name": display_name, "type": if private { "P" } else { "O" } });
+        self.send(Method::POST, "channels", Some(&body)).await
+    }
+
+    /// One person's membership of a channel (yours, to add a channel you
+    /// were just added to).
+    pub async fn channel_member(&self, channel_id: &str, user_id: &str) -> Result<ChannelMember, Error> {
+        self.get(&format!("channels/{channel_id}/members/{user_id}")).await
+    }
+
+    /// Turns end-to-end encryption on for a public channel (axiond, admins).
+    pub async fn encrypt_channel(&self, channel_id: &str) -> Result<(), Error> {
+        self.send_unit(Method::PUT, &format!("e2ee/channels/{channel_id}/encrypted"), Some(&json!({ "encrypted": true }))).await
+    }
+
     /// Everyone in a channel.
     pub async fn channel_members(&self, channel_id: &str) -> Result<Vec<ChannelMember>, Error> {
         self.get(&format!("channels/{channel_id}/members?per_page=200")).await

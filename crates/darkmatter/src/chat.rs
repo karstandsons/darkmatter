@@ -203,6 +203,9 @@ pub struct Chat {
     /// End-to-end encryption on this device (axiond), and how it stands.
     pub crypto: crate::crypto::Shared,
     pub crypto_status: crate::crypto::Status,
+    /// Who each encrypted channel's group holds, as the group says: for the
+    /// lock's tooltip. Refreshed when the channel opens or the group changes.
+    pub group_members: HashMap<String, Vec<(String, usize)>>,
     /// Installed plugins (`~/.config/darkmatter/plugins`).
     pub plugins: std::sync::Arc<Plugins>,
     /// A plugin's picker, opened from the + menu.
@@ -366,6 +369,61 @@ impl Chat {
         Task::batch([self.update(Message::OpenThread(root)), locate(self.pv())])
     }
 
+    /// Reads who an encrypted channel's group holds, for the lock's tooltip.
+    fn refresh_group(&self, channel_id: &str) -> Task<Message> {
+        let Some(crypto) = self.crypto.clone().filter(|_| self.store.channels.get(channel_id).is_some_and(|c| c.encrypted)) else { return Task::none() };
+        let ch = channel_id.to_string();
+        Task::perform(async move { crypto.group_members(&ch) }, {
+            let ch = channel_id.to_string();
+            move |m| Message::GroupMembers(ch.clone(), m)
+        })
+    }
+
+    /// `/create [private] <name>`: makes the channel and opens it.
+    fn create_channel(&mut self, arg: &str) -> Task<Message> {
+        let (private, name) = match arg.trim().strip_prefix("private ") {
+            Some(rest) => (true, rest.trim()),
+            None => (false, arg.trim()),
+        };
+        let slug: String = name
+            .to_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join("-")
+            .chars()
+            .take(64)
+            .collect();
+        if slug.len() < 2 {
+            self.error = Some("Usage: /create [private] <name>".into());
+            return Task::none();
+        }
+        let (client, team, me) = (self.client.clone(), self.team.clone(), self.store.me.id.clone());
+        let display = name.to_string();
+        Task::perform(
+            async move {
+                let channel = client.create_channel(&team, &slug, &display, private).await.map_err(err)?;
+                let member = client.channel_member(&channel.id, &me).await.map_err(err)?;
+                Ok(Box::new((channel, member)))
+            },
+            |r| Message::ChannelAdded(r, true),
+        )
+    }
+
+    /// Fetches a channel this account was just added to (or is in, but
+    /// didn't know of), to add it to the list.
+    fn fetch_channel(&self, channel_id: String) -> Task<Message> {
+        let (client, me) = (self.client.clone(), self.store.me.id.clone());
+        Task::perform(
+            async move {
+                let channel = client.channel(&channel_id).await.map_err(err)?;
+                let member = client.channel_member(&channel_id, &me).await.map_err(err)?;
+                Ok(Box::new((channel, member)))
+            },
+            |r| Message::ChannelAdded(r, false),
+        )
+    }
+
     /// Fetch the page after the newest loaded post, while viewing an older stretch.
     fn load_newer(&mut self) -> Task<Message> {
         let id = self.pv().channel.clone();
@@ -497,6 +555,7 @@ impl Chat {
             vault: b.vault,
             crypto: b.crypto,
             crypto_status: b.crypto_status,
+            group_members: HashMap::new(),
             plugins: Default::default(),
             plugin_picker: None,
             editors: HashMap::new(),
@@ -723,6 +782,7 @@ impl Chat {
                 }
                 None => Task::none(),
             },
+            C::CreateChannel => self.create_channel(&arg),
             C::Attach => self.update(Message::PickFiles),
             C::ReactLatest => match self.latest_post().map(|p| p.id.clone()) {
                 Some(id) => self.update(Message::OpenEmoji(id)),
@@ -1134,6 +1194,7 @@ impl Chat {
             m.last_viewed_at = chrono::Utc::now().timestamp_millis();
         }
         self.store.mark_viewed(&id);
+        let group = self.refresh_group(&id);
         let client = self.client.clone();
         // Marking a channel read is a write; read-only mode skips it quietly.
         let view = if client.is_read_only() {
@@ -1152,7 +1213,7 @@ impl Chat {
         let loaded = self.store.timelines.get(&id).is_some_and(|t| t.loaded);
         // A jump loads its own stretch if the message isn't already here.
         let history = if loaded || jumping { Task::none() } else { self.load_history(id) };
-        Task::batch([view, history, to_latest(self.pv().timeline()), operation::focus(self.pv().composer())])
+        Task::batch([view, group, history, to_latest(self.pv().timeline()), operation::focus(self.pv().composer())])
     }
 
     fn load_history(&self, id: String) -> Task<Message> {
@@ -1533,12 +1594,14 @@ impl Chat {
             }
             Message::Delivered(id, Ok(post)) => {
                 self.outbox.remove(&id);
+                // Sending can add devices to an encrypted group.
+                let group = self.refresh_group(&post.channel_id);
                 let in_thread = post.is_reply();
                 self.store.sent(post);
                 if !in_thread && self.store.timelines.get(&self.pv().channel).is_some_and(|t| t.has_newer) {
-                    return self.reload_latest();
+                    return Task::batch([group, self.reload_latest()]);
                 }
-                if in_thread { to_latest(THREAD) } else { to_latest(self.pv().timeline()) }
+                Task::batch([group, if in_thread { to_latest(THREAD) } else { to_latest(self.pv().timeline()) }])
             }
             Message::JumpTo(channel, root, post) => {
                 // Set first: select_channel skips loading the newest page for it.
@@ -2396,11 +2459,60 @@ impl Chat {
                     |(id, r)| Message::Left(id, r),
                 )
             }
+            Message::GroupMembers(channel, members) => {
+                match members {
+                    Some(m) => self.group_members.insert(channel, m),
+                    None => self.group_members.remove(&channel),
+                };
+                Task::none()
+            }
+            Message::ChannelAdded(Ok(added), open) => {
+                let (channel, member) = *added;
+                let id = channel.id.clone();
+                // An encrypted channel: join its group (or catch up) now.
+                let sync = match (&self.crypto, channel.encrypted) {
+                    (Some(crypto), true) => {
+                        let (crypto, ch) = (crypto.clone(), id.clone());
+                        Task::future(async move {
+                            if let Err(e) = crypto.sync(&ch).await {
+                                tracing::warn!("couldn't sync the encryption of {ch}: {e}");
+                            }
+                        })
+                        .discard()
+                    }
+                    _ => Task::none(),
+                };
+                self.store.add_channels(vec![channel], vec![member]);
+                let open = if open { self.select_channel(id) } else { Task::none() };
+                Task::batch([sync, self.load_missing_users(), open])
+            }
+            Message::ChannelAdded(Err(e), open) => {
+                if open {
+                    self.error = Some(format!("Couldn't make the channel: {e}"));
+                } else {
+                    tracing::warn!("couldn't add a channel: {e}");
+                }
+                Task::none()
+            }
             Message::Left(id, Ok(())) => {
+                // Its encrypted group, if any, is no longer ours.
+                let forget = match self.crypto.clone() {
+                    Some(crypto) => {
+                        let ch = id.clone();
+                        Task::future(async move {
+                            if let Err(e) = crypto.left(&ch).await {
+                                tracing::warn!("couldn't forget {ch}'s group: {e}");
+                            }
+                        })
+                        .discard()
+                    }
+                    None => Task::none(),
+                };
                 self.store.channels.remove(&id);
                 self.store.members.remove(&id);
                 self.store.timelines.remove(&id);
-                if self.pv().channel == id { self.open_default_channel() } else { Task::none() }
+                let away = if self.pv().channel == id { self.open_default_channel() } else { Task::none() };
+                Task::batch([forget, away])
             }
             Message::Left(_, Err(e)) => {
                 self.error = Some(format!("Couldn't leave: {e}"));
@@ -2517,19 +2629,36 @@ impl Chat {
                 let loads = channels.into_iter().map(|c| self.load_history(c));
                 Task::batch([bootstrap(session)].into_iter().chain(loads))
             }
+            // The channel list changed: someone added this account to a
+            // channel, opened a DM with it, or a channel changed (encryption
+            // switched on, say). Removed from one: it goes.
+            M::Event(Event::Other(raw)) if matches!(raw.event.as_str(), "user_added" | "direct_added" | "channel_created" | "channel_updated") => {
+                let channel = if raw.broadcast.channel_id.is_empty() { raw.data["channel_id"].as_str().unwrap_or_default().to_string() } else { raw.broadcast.channel_id.clone() };
+                let about_me = raw.event != "user_added" || raw.data["user_id"].as_str() == Some(self.store.me.id.as_str());
+                if channel.is_empty() || !about_me { Task::none() } else { self.fetch_channel(channel) }
+            }
+            M::Event(Event::Other(raw)) if raw.event == "user_removed" => {
+                let channel = raw.data["channel_id"].as_str().unwrap_or_default().to_string();
+                let me = raw.broadcast.user_id.is_empty() || raw.broadcast.user_id == self.store.me.id || raw.data["user_id"].as_str() == Some(self.store.me.id.as_str());
+                if channel.is_empty() || !me || !self.store.channels.contains_key(&channel) { Task::none() } else { self.update(Message::Left(channel, Ok(()))) }
+            }
             // An encrypted group changed (someone joined, left or updated):
             // catch up now, so the next message reads without a wait.
             M::Event(Event::Other(raw)) if raw.event == "mls_commit" || raw.event == "mls_welcome" => {
                 let Some(crypto) = self.crypto.clone() else { return Task::none() };
                 let channel = raw.data["channel_id"].as_str().unwrap_or_default().to_string();
                 let welcome = raw.event == "mls_welcome";
-                Task::future(async move {
-                    let r = if welcome { crypto.on_welcome().await } else { crypto.on_handshake(&channel).await };
-                    if let Err(e) = r {
-                        tracing::warn!("couldn't catch up on {channel}'s encryption: {e}");
-                    }
-                })
-                .discard()
+                Task::perform(
+                    async move {
+                        let r = if welcome { crypto.on_welcome().await } else { crypto.on_handshake(&channel).await };
+                        if let Err(e) = r {
+                            tracing::warn!("couldn't catch up on {channel}'s encryption: {e}");
+                        }
+                        let members = crypto.group_members(&channel);
+                        (channel, members)
+                    },
+                    |(channel, members)| Message::GroupMembers(channel, members),
+                )
             }
             // An encrypted post: read it first, then handle it like any other.
             M::Event(Event::Posted { mut post, team_id, mentions }) if post.props.get("dm_e2ee").is_some() && post.props.get("dm_open").is_none() => {
@@ -2544,6 +2673,8 @@ impl Chat {
                 )
             }
             M::Event(Event::Posted { post, mentions, .. }) => {
+                // A channel we didn't know of (someone's first DM to us).
+                let unknown = if self.store.channels.contains_key(&post.channel_id) { Task::none() } else { self.fetch_channel(post.channel_id.clone()) };
                 // Ours, arriving before the reply to the send (or instead of it).
                 if post.user_id == self.store.me.id && !post.pending_post_id.is_empty() {
                     self.outbox.remove(&post.pending_post_id);
@@ -2576,7 +2707,7 @@ impl Chat {
                 }
                 // Bottom-anchored lists stay on the newest post by themselves, and
                 // someone reading further up isn't yanked down.
-                Task::batch([self.load_missing_users(), feed])
+                Task::batch([self.load_missing_users(), feed, unknown])
             }
             M::Event(Event::Ephemeral(post)) => {
                 // Shown where it was asked for, and only until the history reloads.

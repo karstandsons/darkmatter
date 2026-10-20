@@ -157,3 +157,75 @@ async fn nobody_is_sent_a_message_they_cant_read() {
     assert_eq!(text(read(&carol_laptop, &later).await), "both of yours");
     assert!(matches!(read(&carol_laptop, &sent).await, Decrypted::Unreadable(why) if why.contains("before this device joined")));
 }
+
+/// Runs a slash command in a channel.
+async fn run(api: &Client, channel: &str, command: &str) {
+    let team = api.my_teams().await.unwrap()[0].id.clone();
+    api.execute_command(&team, channel, "", command).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_private_channel_as_people_come_and_go() {
+    let s = server().await;
+    let (alice_api, alice) = device(&s, "alice", MemoryStore::default()).await;
+    let bob_store = MemoryStore::default();
+    let (bob_api, bob) = device(&s, "bob", bob_store.clone()).await;
+    let (carol_api, carol) = device(&s, "carol", MemoryStore::default()).await;
+    let team = alice_api.my_teams().await.unwrap()[0].id.clone();
+
+    // Private channels are encrypted from the start.
+    let plans = alice_api.create_channel(&team, "plans", "Plans", true).await.unwrap();
+    assert!(plans.encrypted);
+    let public = alice_api.create_channel(&team, "lobby", "Lobby", false).await.unwrap();
+    assert!(!public.encrypted);
+    let first = send(&alice_api, &alice, &plans.id, "just me so far").await;
+
+    // Bob is invited: the next message is encrypted for him too (the sender
+    // adds his device), but the one before wasn't.
+    run(&alice_api, &plans.id, "/invite @bob").await;
+    let second = send(&alice_api, &alice, &plans.id, "welcome bob").await;
+    assert_eq!(text(read(&bob, &second).await), "welcome bob");
+    assert!(matches!(read(&bob, &first).await, Decrypted::Unreadable(why) if why.contains("before this device joined")));
+
+    // Carol joins, then is removed: the next message is committed without
+    // her first, and she can't read it.
+    run(&alice_api, &plans.id, "/invite @carol").await;
+    let third = send(&alice_api, &alice, &plans.id, "hi carol").await;
+    assert_eq!(text(read(&carol, &third).await), "hi carol");
+    run(&alice_api, &plans.id, "/kick @carol").await;
+    let fourth = send(&bob_api, &bob, &plans.id, "carol's gone").await;
+    assert_eq!(text(read(&alice, &fourth).await), "carol's gone");
+    assert!(matches!(read(&carol, &fourth).await, Decrypted::Unreadable(_)));
+    // Bob caught up through carol's coming and going (her keys fetched for
+    // history), so his copy of the group is in step with alice's.
+    assert_eq!(bob.device.epoch(&plans.id).unwrap(), alice.device.epoch(&plans.id).unwrap());
+    carol.left(&plans.id).await.unwrap();
+    assert!(!carol.device.has_group(&plans.id));
+    let mut seen: Vec<String> = alice.group_members(&plans.id).unwrap().into_iter().map(|(u, _)| u).collect();
+    seen.sort();
+    let mut expected = vec![alice.user_id.clone(), bob.user_id.clone()];
+    expected.sort();
+    assert_eq!(seen, expected, "the group's own member list");
+    let _ = carol_api;
+
+    // A week on, bob's device refreshes its key as it syncs; the others
+    // follow.
+    let before = bob.device.epoch(&plans.id).unwrap();
+    bob_store.set(&format!("updated.{}", plans.id), b"0".to_vec());
+    bob.sync(&plans.id).await.unwrap();
+    assert_eq!(bob.device.epoch(&plans.id).unwrap(), before + 1);
+    let fifth = send(&alice_api, &alice, &plans.id, "after the refresh").await;
+    assert_eq!(text(read(&bob, &fifth).await), "after the refresh");
+
+    // An admin turns encryption on in a public channel: from then on only
+    // ciphertext is accepted there.
+    alice_api.encrypt_channel(&public.id).await.unwrap();
+    assert!(alice_api.channel(&public.id).await.unwrap().encrypted);
+    let plain = NewPost { channel_id: public.id.clone(), message: "in the clear".into(), ..Default::default() };
+    assert!(alice_api.create_post(&plain).await.is_err());
+    run(&bob_api, &public.id, "/join ~lobby").await;
+    bob_api.join_channel(&public.id, &bob.user_id).await.unwrap();
+    let sealed = send(&alice_api, &alice, &public.id, "lobby is encrypted now").await;
+    assert_eq!(text(read(&bob, &sealed).await), "lobby is encrypted now");
+    assert!(bob_api.encrypt_channel(&plans.id).await.is_err(), "only admins");
+}

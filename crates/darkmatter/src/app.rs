@@ -251,6 +251,11 @@ pub enum Message {
     ChannelReady(Result<(Channel, mm_api::models::ChannelMember), String>),
     LeaveChannel(String),
     Left(String, Result<(), String>),
+    /// Who an encrypted channel's group holds, by user and device count.
+    GroupMembers(String, Option<Vec<(String, usize)>>),
+    /// A channel to add to the list (made, joined, or someone else's DM);
+    /// `true` to open it.
+    ChannelAdded(Result<Box<(mm_api::models::Channel, mm_api::models::ChannelMember)>, String>, bool),
     React(String, String, bool),
     Ws(ws::Message),
     Link(markdown::Uri),

@@ -1,7 +1,7 @@
 //! The HTTP API, under `/api/v4/` as in Mattermost.
 
 pub(crate) mod accounts;
-mod channels;
+pub(crate) mod channels;
 mod commands;
 mod e2ee;
 pub(crate) mod images;
@@ -84,7 +84,9 @@ pub fn router(app: App) -> Router {
         .route("/channels/{id}", get(channels::get_one))
         .route("/channels/{id}/posts", get(posts::in_channel))
         .route("/channels/{id}/members", post(channels::join).get(channels::members))
-        .route("/channels/{id}/members/{user}", delete(channels::leave))
+        .route("/channels", post(channels::create))
+        .route("/channels/{id}/members/{user}", get(channels::member).delete(channels::leave))
+        .route("/e2ee/channels/{id}/encrypted", put(channels::put_encrypted))
         .route("/posts", post(posts::create))
         .route("/posts/{id}", delete(posts::remove))
         .route("/posts/{id}/patch", put(posts::edit))

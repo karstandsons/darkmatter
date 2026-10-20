@@ -195,6 +195,20 @@ pub async fn set_password(app: &App, username: &str, password: &str) -> anyhow::
     Ok(())
 }
 
+/// Turns end-to-end encryption on for a public channel (new messages only).
+pub async fn encrypt_channel(app: &App, team: &str, name: &str) -> anyhow::Result<()> {
+    let id: String = sqlx::query_scalar("SELECT c.id FROM channels c JOIN teams t ON t.id = c.team_id WHERE t.name = ? AND c.name = ? AND c.delete_at = 0")
+        .bind(team)
+        .bind(name)
+        .fetch_optional(&app.db)
+        .await?
+        .with_context(|| format!("no ~{name} in {team}"))?;
+    let channel = crate::db::channel(&app.db, &id).await?.context("the channel went away")?;
+    // System messages need an author: the first admin.
+    let admin: String = sqlx::query_scalar("SELECT id FROM users WHERE roles LIKE '%system_admin%' AND delete_at = 0 ORDER BY create_at LIMIT 1").fetch_one(&app.db).await?;
+    crate::api::channels::set_encrypted(app, &admin, &channel).await.map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 /// Adds a public channel to a team, with everyone in the team in it.
 pub async fn add_channel(app: &App, team: &str, name: &str, display: &str) -> anyhow::Result<String> {
     check_name(name)?;

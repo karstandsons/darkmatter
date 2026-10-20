@@ -421,9 +421,11 @@ pub struct E2eeIdentity {
     pub user_id: Id,
     /// Base64 Ed25519 public key, or empty if they haven't set up encryption.
     pub identity_key: String,
-    /// Certificates (JSON objects, as the device published them).
+    /// Certificates (JSON objects, as the device published them), revoked
+    /// devices' included.
     pub devices: Vec<serde_json::Value>,
-    /// Devices taken out (signed out, or revoked), by id.
+    /// Devices taken out (signed out, or revoked), by id: not to be added
+    /// to anything again, but their certificates still check old commits.
     pub revoked: Vec<String>,
 }
 

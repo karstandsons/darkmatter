@@ -81,10 +81,13 @@ pub async fn identity(State(app): State<App>, _me: Me, Path(user_id): Path<Strin
         .fetch_all(&app.db)
         .await?;
     let mut out = E2eeIdentity { user_id, identity_key: identity_key.unwrap_or_default(), ..Default::default() };
+    // Revoked devices' certificates stay listed: devices catching up on a
+    // group's history check the commits that once added them.
     for (device, cert, revoked_at) in rows {
         if revoked_at > 0 {
             out.revoked.push(device);
-        } else if let Ok(cert) = serde_json::from_str(&cert) {
+        }
+        if let Ok(cert) = serde_json::from_str(&cert) {
             out.devices.push(cert);
         }
     }

@@ -152,8 +152,9 @@ pub fn parse_credential(credential: &Credential) -> Result<(String, String)> {
 /// in the group. Returns `(user_id, device_id)`.
 pub fn verify_member(credential: &Credential, signature_key: &[u8], directory: &impl Directory) -> Result<(String, String)> {
     let (user, device) = parse_credential(credential)?;
-    let identity = directory.identity_key(&user).ok_or_else(|| Error::Untrusted(format!("no identity key for {user}")))?;
-    let cert = directory.certificate(&user, &device).ok_or_else(|| Error::Untrusted(format!("no certificate for {user}:{device}")))?;
+    let unknown = || Error::UnknownDevice { user: user.clone(), device: device.clone() };
+    let identity = directory.identity_key(&user).ok_or_else(unknown)?;
+    let cert = directory.certificate(&user, &device).ok_or_else(unknown)?;
     if cert.user_id != user || cert.device_id != device {
         return Err(Error::Untrusted(format!("the certificate for {user}:{device} names someone else")));
     }
