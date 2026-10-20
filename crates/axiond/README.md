@@ -14,6 +14,13 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
 - Two-factor login codes (any authenticator app), each usable once. If
   someone loses their phone, `axiond user mfa-off <name>` turns them off.
 - A list of your signed-in apps, with signing one or all of them out.
+- Joining by invite only: `axiond invite` makes a code (one use, a week, by
+  default). Admins can also deactivate people (`axiond user deactivate`),
+  and anyone can delete their own account; `axiond user delete` does it for
+  someone else.
+- Blocking someone (no direct messages either way, no notifications from
+  them) and reporting messages or people to the admins (`axiond reports`).
+- An audit log of what admins did (`axiond audit`).
 - Teams, public channels and direct messages: joining, leaving, and finding
   channels by name.
 - Messages: posting, threads, editing, deleting and reactions.
@@ -41,7 +48,6 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
 
 Anything else Darkmatter asks for gets a clear "axiond doesn't support that
 yet". That includes:
-- invites;
 - TLS.
 
 These come in M1.

@@ -662,3 +662,86 @@ async fn sessions_and_two_factor_codes() {
     let e2ee: serde_json::Value = http.get(api("e2ee/config")).send().await.unwrap().json().await.unwrap();
     assert_eq!((e2ee["server"].as_str(), e2ee["enabled"].as_bool()), (Some("axiond"), Some(false)));
 }
+
+#[tokio::test]
+async fn invites_blocking_reports_and_deleting() {
+    use serde_json::{Value, json};
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let bob_id = bob.me().await.unwrap().id;
+    let http = reqwest::Client::new();
+    let api = |path: &str| format!("{}/api/v4/{path}", s.url);
+    let as_user = |c: &Client, method: reqwest::Method, path: &str, body: Value| {
+        http.request(method, api(path)).bearer_auth(c.token().unwrap().to_string()).json(&body).send()
+    };
+    use reqwest::Method;
+
+    // Only admins make invites; a code works as many times as it says.
+    assert_eq!(as_user(&bob, Method::POST, "invites", json!({})).await.unwrap().status(), 403);
+    let made: Value = as_user(&alice, Method::POST, "invites", json!({ "max_uses": 1, "note": "for carol" })).await.unwrap().json().await.unwrap();
+    let code = made["code"].as_str().unwrap().to_string();
+    let signup = |code: &str, name: &str| {
+        http.post(api(&format!("users?t={code}")))
+            .json(&json!({ "username": name, "email": format!("{name}@example.com"), "password": PASSWORD }))
+            .send()
+    };
+    assert_eq!(signup("made-up", "mallory").await.unwrap().status(), 400);
+    assert_eq!(signup(&code, "Bad Name").await.unwrap().status(), 400, "a bad username doesn't spend the invite");
+    assert_eq!(signup(&code, "carol").await.unwrap().status(), 201);
+    assert_eq!(signup(&code, "dave").await.unwrap().status(), 400, "used up");
+    let carol = login(&s, "carol").await;
+    let carol_id = carol.me().await.unwrap().id;
+    let team = carol.my_teams().await.unwrap()[0].id.clone();
+    assert!(carol.my_channels(&team).await.unwrap().iter().any(|c| c.name == "town-square"));
+    assert!(http.post(api("users")).json(&json!({ "username": "eve", "email": "eve@example.com", "password": PASSWORD })).send().await.unwrap().status().is_client_error());
+
+    // Blocking: no DMs either way, and the blocked person's mentions don't count.
+    let dm = alice.create_direct(&alice.me().await.unwrap().id, &bob_id).await.unwrap();
+    assert_eq!(as_user(&bob, Method::PUT, &format!("users/me/blocked/{carol_id}"), json!({})).await.unwrap().status(), 200);
+    assert!(carol.create_direct(&carol_id, &bob_id).await.is_err());
+    assert!(bob.create_direct(&bob_id, &carol_id).await.is_err());
+    let town = carol.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    carol.create_post(&NewPost { channel_id: town.clone(), message: "@bob hello?".into(), ..Default::default() }).await.unwrap();
+    let member = bob.my_channel_members(&team).await.unwrap().into_iter().find(|m| m.channel_id == town).unwrap();
+    assert_eq!(member.mention_count, 0);
+    let list: Vec<String> = as_user(&bob, Method::GET, "users/me/blocked", json!({})).await.unwrap().json().await.unwrap();
+    assert_eq!(list, std::slice::from_ref(&carol_id));
+
+    // Reports go to admins, who see and resolve them (in the audit log).
+    let post = carol.create_post(&NewPost { channel_id: town.clone(), message: "something nasty".into(), ..Default::default() }).await.unwrap();
+    assert_eq!(as_user(&bob, Method::POST, "reports", json!({ "post_id": post.id, "reason": "rude" })).await.unwrap().status(), 201);
+    assert_eq!(as_user(&bob, Method::GET, "reports", json!({})).await.unwrap().status(), 403);
+    let open: Vec<Value> = as_user(&alice, Method::GET, "reports", json!({})).await.unwrap().json().await.unwrap();
+    assert_eq!((open.len(), open[0]["user_id"].as_str()), (1, Some(carol_id.as_str())));
+    let id = open[0]["id"].as_str().unwrap();
+    assert_eq!(as_user(&alice, Method::PUT, &format!("reports/{id}"), json!({ "resolution": "talked to carol" })).await.unwrap().status(), 200);
+    assert!(admin::open_reports(&s.app).await.unwrap().is_empty());
+
+    // Deactivating signs someone out; they can come back.
+    assert_eq!(as_user(&alice, Method::PUT, &format!("users/{carol_id}/active"), json!({ "active": false })).await.unwrap().status(), 200);
+    assert!(carol.me().await.unwrap_err().is_unauthorized());
+    assert!(Client::new(&s.url).unwrap().login("carol", PASSWORD, None).await.is_err());
+    admin::set_active(&s.app, "carol", true).await.unwrap();
+    let carol = login(&s, "carol").await;
+
+    // Deleting your own account needs your password, and leaves only "deleted-…".
+    assert_eq!(as_user(&carol, Method::DELETE, "users/me", json!({ "password": "nope" })).await.unwrap().status(), 400);
+    assert_eq!(as_user(&carol, Method::DELETE, "users/me", json!({ "password": PASSWORD })).await.unwrap().status(), 200);
+    assert!(carol.me().await.unwrap_err().is_unauthorized());
+    let gone = alice.users_by_ids(std::slice::from_ref(&carol_id)).await.unwrap().pop().unwrap();
+    assert!(gone.username.starts_with("deleted-") && gone.delete_at > 0);
+    assert_eq!(alice.thread(&post.id).await.unwrap().posts.len(), 1, "messages stay unless asked");
+    assert!(admin::set_active(&s.app, &gone.username, true).await.is_err(), "a deleted account stays deleted");
+
+    // The last admin can't be removed by accident.
+    assert_eq!(as_user(&alice, Method::DELETE, "users/me", json!({ "password": PASSWORD })).await.unwrap().status(), 400);
+    assert_eq!(as_user(&bob, Method::PUT, &format!("users/{bob_id}/active"), json!({ "active": false })).await.unwrap().status(), 403);
+
+    // The audit log shows who did what.
+    let log = axiond::audit::recent(&s.app.db, 50).await.unwrap();
+    let actions: Vec<&str> = log.iter().rev().map(|e| e.action.as_str()).collect();
+    assert_eq!(actions, ["invite.create", "user.signup", "report.resolve", "user.deactivate", "user.activate", "user.delete"]);
+    assert_eq!(log.last().unwrap().actor, "alice");
+    let _ = dm;
+}

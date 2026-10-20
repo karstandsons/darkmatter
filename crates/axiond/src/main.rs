@@ -44,6 +44,25 @@ enum Command {
     /// Manage custom emoji.
     #[command(subcommand)]
     Emoji(EmojiCommand),
+    /// Make an invite code someone can sign up with.
+    Invite {
+        /// How many people can use it.
+        #[arg(long, default_value_t = 1)]
+        uses: i64,
+        /// How many days it works for.
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+        /// A note for yourself, e.g. who it's for.
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// List reported messages and people that no one has dealt with yet.
+    Reports,
+    /// Show what admins did, newest first.
+    Audit {
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
     /// Check the running server answers (for health checks).
     Ping,
 }
@@ -65,6 +84,17 @@ enum UserCommand {
     Picture { username: String, file: PathBuf },
     /// Turn off someone's two-factor codes, if they lost their phone (they're signed out everywhere).
     MfaOff { username: String },
+    /// Stop someone signing in (they're signed out everywhere). Undo with `activate`.
+    Deactivate { username: String },
+    /// Let a deactivated person sign in again.
+    Activate { username: String },
+    /// Delete someone's account for good: profile, picture and memberships.
+    Delete {
+        username: String,
+        /// Delete their messages too, not just their name on them.
+        #[arg(long)]
+        delete_messages: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -143,6 +173,46 @@ async fn main() -> anyhow::Result<()> {
             let app = App::open(config).await?;
             admin::mfa_off(&app, &username).await?;
             println!("Turned off {username}'s two-factor codes and signed them out everywhere.");
+            Ok(())
+        }
+        Command::User(UserCommand::Deactivate { username }) => {
+            admin::set_active(&App::open(config).await?, &username, false).await?;
+            println!("Deactivated {username}.");
+            Ok(())
+        }
+        Command::User(UserCommand::Activate { username }) => {
+            admin::set_active(&App::open(config).await?, &username, true).await?;
+            println!("{username} can sign in again.");
+            Ok(())
+        }
+        Command::User(UserCommand::Delete { username, delete_messages }) => {
+            admin::delete_user(&App::open(config).await?, &username, delete_messages).await?;
+            println!("Deleted {username}'s account{}.", if delete_messages { " and messages" } else { "" });
+            Ok(())
+        }
+        Command::Invite { uses, days, note } => {
+            let (code, _) = admin::invite(&App::open(config).await?, uses, days, &note).await?;
+            println!("Invite code (works {uses} time{}, for {days} day{}):\n\n    {code}\n", if uses == 1 { "" } else { "s" }, if days == 1 { "" } else { "s" });
+            println!("It's shown only now. In Darkmatter, choose \"I have an invite\" on the sign-in screen.");
+            Ok(())
+        }
+        Command::Reports => {
+            let app = App::open(config).await?;
+            let reports = admin::open_reports(&app).await?;
+            if reports.is_empty() {
+                println!("No open reports.");
+            }
+            for r in reports {
+                println!("{r}");
+            }
+            Ok(())
+        }
+        Command::Audit { limit } => {
+            let app = App::open(config).await?;
+            for e in axiond::audit::recent(&app.db, limit).await? {
+                let who = if e.actor_id.is_empty() { "(command line)".to_string() } else { format!("@{}", e.actor) };
+                println!("{}  {who:<20} {:<18} {} {}", e.create_at, e.action, e.target_id, e.detail);
+            }
             Ok(())
         }
         Command::Emoji(EmojiCommand::Add { name, file }) => {

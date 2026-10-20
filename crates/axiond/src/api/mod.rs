@@ -1,11 +1,13 @@
 //! The HTTP API, under `/api/v4/` as in Mattermost.
 
+pub(crate) mod accounts;
 mod channels;
 mod commands;
 pub(crate) mod images;
 pub(crate) mod files;
 mod posts;
 mod reactions;
+mod safety;
 mod search;
 pub(crate) mod sessions;
 pub(crate) mod status;
@@ -29,7 +31,17 @@ pub fn router(app: App) -> Router {
         .route("/config/client", get(client_config))
         .route("/users/login", post(users::login))
         .route("/users/logout", post(users::logout))
-        .route("/users/me", get(users::me))
+        .route("/users", post(accounts::signup))
+        .route("/users/me", get(users::me).delete(accounts::delete_me))
+        .route("/users/{id}", delete(accounts::delete))
+        .route("/users/{id}/active", put(accounts::put_active))
+        .route("/users/me/blocked", get(safety::blocked))
+        .route("/users/me/blocked/{user}", put(safety::block).delete(safety::unblock))
+        .route("/reports", post(safety::report).get(safety::reports))
+        .route("/reports/{id}", put(safety::resolve))
+        .route("/invites", post(accounts::new_invite).get(accounts::invites))
+        .route("/invites/{id}", delete(accounts::cancel_invite))
+        .route("/audits", get(accounts::audits))
         .route("/users/{id}/sessions", get(sessions::list))
         .route("/users/{id}/sessions/revoke", post(sessions::revoke))
         .route("/users/{id}/sessions/revoke/all", post(sessions::revoke_all))

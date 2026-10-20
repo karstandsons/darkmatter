@@ -116,6 +116,9 @@ pub async fn direct(State(app): State<App>, me: Me, Json(pair): Json<Vec<String>
 /// The direct-message channel between `me` and `other`, made the first time.
 pub async fn direct_channel(app: &App, me: &str, other: &str) -> Result<ChannelRow> {
     let (a, b) = (me, other);
+    if super::safety::blocked_between(app, a, b).await? {
+        return Err(Error::bad_request("You can't message this person."));
+    }
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ? AND delete_at = 0").bind(other).fetch_one(&app.db).await?;
     if exists == 0 {
         return Err(Error::not_found("User"));

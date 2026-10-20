@@ -59,6 +59,12 @@ pub async fn create(State(app): State<App>, me: Me, Json(body): Json<Create>) ->
     if db::member(&app.db, &channel.id, &me.user_id).await?.is_none() {
         return Err(Error::forbidden());
     }
+    if channel.kind == "D"
+        && let Some(other) = channel.name.split("__").find(|id| *id != me.user_id)
+        && super::safety::blocked_between(&app, &me.user_id, other).await?
+    {
+        return Err(Error::bad_request("You can't message this person."));
+    }
     if !body.root_id.is_empty() {
         let root = db::post(&app.db, &body.root_id).await?;
         if !root.is_some_and(|r| r.delete_at == 0 && r.channel_id == channel.id && r.root_id.is_empty()) {
@@ -207,17 +213,16 @@ async fn mentions(app: &App, channel: &ChannelRow, author: &str, message: &str) 
     .bind(author)
     .fetch_all(&app.db)
     .await?;
+    // Someone who blocked the author isn't notified by them.
+    let blockers = super::safety::blocking(app, author).await?;
+    let members = members.into_iter().filter(|(id, _)| !blockers.contains(id));
     if channel.kind == "D" {
-        return Ok(members.into_iter().map(|(id, _)| id).collect());
+        return Ok(members.map(|(id, _)| id).collect());
     }
     let words = mention_words(message);
     let everyone = words.iter().any(|w| w == "channel" || w == "all");
     let here = words.iter().any(|w| w == "here");
-    Ok(members
-        .into_iter()
-        .filter(|(id, name)| everyone || words.contains(name) || (here && app.hub.online(id)))
-        .map(|(id, _)| id)
-        .collect())
+    Ok(members.filter(|(id, name)| everyone || words.contains(name) || (here && app.hub.online(id))).map(|(id, _)| id).collect())
 }
 
 /// The lowercased names after each `@`, without trailing punctuation.

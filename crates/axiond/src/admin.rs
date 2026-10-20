@@ -54,6 +54,42 @@ pub async fn set_picture(app: &App, username: &str, bytes: Vec<u8>) -> anyhow::R
     Ok(())
 }
 
+async fn id_of(app: &App, username: &str) -> anyhow::Result<String> {
+    sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+        .bind(username.trim().trim_start_matches('@').to_lowercase())
+        .fetch_optional(&app.db)
+        .await?
+        .with_context(|| format!("there's no {username}"))
+}
+
+/// A new invite code, shown once.
+pub async fn invite(app: &App, uses: i64, days: i64, note: &str) -> anyhow::Result<(String, i64)> {
+    Ok(crate::api::accounts::create_invite(app, "", uses, days, note).await?)
+}
+
+/// Deactivates (or reactivates) someone; deactivating signs them out.
+pub async fn set_active(app: &App, username: &str, active: bool) -> anyhow::Result<()> {
+    let id = id_of(app, username).await?;
+    Ok(crate::api::accounts::set_active(app, "", &id, active).await?)
+}
+
+/// Deletes someone's account for good.
+pub async fn delete_user(app: &App, username: &str, delete_messages: bool) -> anyhow::Result<()> {
+    let id = id_of(app, username).await?;
+    Ok(crate::api::accounts::delete_account(app, "", &id, delete_messages).await?)
+}
+
+/// Open reports, one line each.
+pub async fn open_reports(app: &App) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String, i64, String, String, String)> = sqlx::query_as(
+        "SELECT r.id, r.create_at, COALESCE(a.username, '?'), COALESCE(u.username, ''), r.reason FROM reports r \
+         LEFT JOIN users a ON a.id = r.reporter_id LEFT JOIN users u ON u.id = r.user_id WHERE r.resolved_at = 0 ORDER BY r.create_at",
+    )
+    .fetch_all(&app.db)
+    .await?;
+    Ok(rows.into_iter().map(|(id, at, by, about, reason)| format!("{id}  {at}  @{by} reported @{about}: {reason}")).collect())
+}
+
 /// Turns off someone's two-factor codes (a lost phone) and signs them out.
 pub async fn mfa_off(app: &App, username: &str) -> anyhow::Result<()> {
     let done = sqlx::query("UPDATE users SET mfa_active = 0, mfa_secret = '', mfa_last_step = 0 WHERE username = ?")
@@ -64,6 +100,8 @@ pub async fn mfa_off(app: &App, username: &str) -> anyhow::Result<()> {
         bail!("there's no {username}");
     }
     sqlx::query("DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?)").bind(username).execute(&app.db).await?;
+    let id = id_of(app, username).await?;
+    crate::audit::record(&app.db, "", "user.mfa_off", &id, "").await?;
     Ok(())
 }
 
@@ -152,6 +190,7 @@ pub async fn set_password(app: &App, username: &str, password: &str) -> anyhow::
         .with_context(|| format!("no user called {username}"))?;
     sqlx::query("UPDATE users SET password_hash = ?, update_at = ? WHERE id = ?").bind(&hash).bind(ids::now()).bind(&id).execute(&app.db).await?;
     sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(&id).execute(&app.db).await?;
+    crate::audit::record(&app.db, "", "user.password", &id, "").await?;
     Ok(())
 }
 

@@ -6,6 +6,7 @@
 
 pub mod admin;
 mod api;
+pub mod audit;
 mod auth;
 pub mod config;
 mod db;
