@@ -5,6 +5,12 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **Code in the message box.** Enter inside an open ``` block starts a
+  new line instead of sending (it used to send an empty code box), and
+  Ctrl+Enter (⌘Enter) sends from anywhere. A line above the box says
+  which. Pasted code that starts with a path or a `//` comment is sent
+  as written, not run as a command. Nothing is autocompleted inside
+  code. The + menu has a Code block item.
 ## [0.4.2] - 2026-10-20
 
 - **Typing no longer makes the conversation jiggle.** Pictures and GIFs

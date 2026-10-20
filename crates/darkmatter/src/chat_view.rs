@@ -200,12 +200,13 @@ impl Chat {
         let content = self.editors.get(key).unwrap_or(&self.no_editor);
         let menu = self.slash.as_ref().is_some_and(|m| m.thread == thread && !m.items.is_empty());
         let empty = content.is_empty();
+        let code = crate::chat::in_code_block(self.drafts.get(key).map_or("", String::as_str));
         let submit = if thread { Message::SendReply } else { Message::Send };
         text_editor(content)
             .id(id)
             .placeholder(placeholder)
             .on_action(move |a| Message::Edit(thread, a))
-            .key_binding(move |kp| composer_binding(kp, menu, empty, &submit))
+            .key_binding(move |kp| composer_binding(kp, menu, empty, code, &submit))
             .padding(padding)
             .max_height(240)
             .style(c.editor())
@@ -242,6 +243,7 @@ impl Chat {
             item("📎", "Photo or file", crate::commands::key_label(crate::commands::Command::Attach).filter(|_| !thread), files),
             item("🖼", "Paste an image", Some(paste.to_string()), Message::PasteImage),
             item("@", "Mention someone", None, Message::InsertText(thread, "@".into())),
+            item("{}", "Code block", None, Message::InsertText(thread, "```\n".into())),
             item("/", "Run a command", None, Message::InsertText(thread, "/".into())),
         ]
         .spacing(1);
@@ -634,11 +636,18 @@ impl Chat {
         (!chips.is_empty()).then(|| iced::widget::Row::with_children(chips).spacing(8).wrap().into())
     }
 
+    /// What Enter does, when it isn't sending: editing a message, or in
+    /// code.
     fn editing_note(&self, key: &str, c: Colors) -> Option<Element<'_, Message>> {
-        self.editing
-            .as_ref()
-            .filter(|e| e.key == key)
-            .map(|_| text("Editing message · Enter to save · Esc to cancel").size(12).color(c.yellow).into())
+        let send = if cfg!(target_os = "macos") { "⌘Enter" } else { "Ctrl+Enter" };
+        if self.editing.as_ref().is_some_and(|e| e.key == key) {
+            let enter = if self.drafts.get(key).is_some_and(|d| crate::chat::in_code_block(d)) { format!("{send} to save") } else { "Enter to save".into() };
+            return Some(text(format!("Editing message · {enter} · Esc to cancel")).size(12).color(c.yellow).into());
+        }
+        self.drafts
+            .get(key)
+            .filter(|d| crate::chat::in_code_block(d))
+            .map(|_| text(format!("In a code block · Enter for a new line · {send} to send")).size(12).color(c.muted).into())
     }
 
     fn typing_line(&self, channel_id: &str, parent_id: &str, c: Colors) -> Element<'_, Message> {
@@ -1176,10 +1185,12 @@ impl Chat {
     }
 }
 
-/// Keys in a message box. Enter sends and Shift+Enter breaks the line. Keys
-/// the app uses (shortcuts, Tab, ↑↓ in a completion menu, ↑ in an empty box
-/// to edit your last message, PageUp/Down) go to it as if no box had them.
-fn composer_binding(kp: text_editor::KeyPress, menu: bool, empty: bool, submit: &Message) -> Option<text_editor::Binding<Message>> {
+/// Keys in a message box. Enter sends and Shift+Enter breaks the line;
+/// inside code (an open ``` block) Enter breaks the line too, and
+/// Ctrl+Enter (⌘ on macOS) sends anywhere. Keys the app uses (shortcuts,
+/// Tab, ↑↓ in a completion menu, ↑ in an empty box to edit your last
+/// message, PageUp/Down) go to it as if no box had them.
+pub(crate) fn composer_binding(kp: text_editor::KeyPress, menu: bool, empty: bool, code: bool, submit: &Message) -> Option<text_editor::Binding<Message>> {
     use iced::keyboard::{Key, key::Named};
     use text_editor::Binding;
     if !matches!(kp.status, text_editor::Status::Focused { .. }) {
@@ -1198,7 +1209,8 @@ fn composer_binding(kp: text_editor::KeyPress, menu: bool, empty: bool, submit: 
         })))
     };
     match kp.key.as_ref() {
-        Key::Named(Named::Enter) if m.shift() => Some(Binding::Enter),
+        Key::Named(Named::Enter) if m.command() && !m.shift() && !m.alt() => Some(Binding::Custom(submit.clone())),
+        Key::Named(Named::Enter) if m.shift() || code => Some(Binding::Enter),
         Key::Named(Named::Enter) if !m.alt() && !m.command() => Some(Binding::Custom(submit.clone())),
         // The app's Esc handling closes menus and steps out of the box.
         Key::Named(Named::Escape) => None,

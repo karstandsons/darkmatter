@@ -88,11 +88,11 @@ pub struct PluginTarget {
 /// The word at the end of `input` that a menu completes: (kind, where it
 /// starts, the word). A slash command is the whole text.
 pub fn completing(input: &str) -> Option<(Completing, usize, &str)> {
-    if input.contains('\n') {
+    if input.contains('\n') || in_code(input) {
         return None;
     }
     if input.starts_with('/') {
-        return (!input.starts_with("//")).then_some((Completing::Command, 0, input));
+        return (slash(input) == Slash::Command).then_some((Completing::Command, 0, input));
     }
     let from = input.rfind(char::is_whitespace).map_or(0, |i| i + 1);
     let word = &input[from..];
@@ -104,6 +104,42 @@ pub fn completing(input: &str) -> Option<(Completing, usize, &str)> {
         return Some((Completing::Emoji, from, word));
     }
     None
+}
+
+/// Whether the end of `text` is inside a ``` block not yet closed: Enter
+/// adds a line there instead of sending.
+pub fn in_code_block(text: &str) -> bool {
+    text.matches("```").count() % 2 == 1
+}
+
+/// Whether the end of `text` is inside code, a block or a `span`: nothing
+/// is completed there (`std::fs`, `@decorator`, `/usr` are code).
+pub fn in_code(text: &str) -> bool {
+    let last = text.rsplit('\n').next().unwrap_or_default();
+    in_code_block(text) || last.replace("```", "").matches('`').count() % 2 == 1
+}
+
+/// What a message box's text starting with `/` is.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Slash {
+    /// `/name args`: a command.
+    Command,
+    /// `//name`: a message that starts with `/name`.
+    Escaped,
+    /// Anything else (`/usr/bin/env`, `// a comment`, `/`): a message as is.
+    Plain,
+}
+
+pub fn slash(text: &str) -> Slash {
+    let name = |s: &str| {
+        let word = s.split_whitespace().next().unwrap_or_default();
+        !word.is_empty() && word.chars().all(|c| c.is_alphanumeric() || "-_.".contains(c))
+    };
+    match text.strip_prefix('/') {
+        Some(rest) if rest.starts_with('/') && name(&rest[1..]) && !rest[1..].starts_with(char::is_whitespace) => Slash::Escaped,
+        Some(rest) if name(rest) && !rest.starts_with(char::is_whitespace) => Slash::Command,
+        _ => Slash::Plain,
+    }
 }
 
 pub struct SearchPane {
@@ -959,13 +995,14 @@ impl Chat {
             (self.pv().channel.clone(), String::new())
         };
         let text = self.drafts.get(&key)?.trim().to_string();
-        if !text.starts_with('/') {
-            return None;
-        }
-        if let Some(rest) = text.strip_prefix("//") {
-            // `//` sends a message that starts with a slash.
-            self.drafts.insert(key, format!("/{rest}"));
-            return None;
+        match slash(&text) {
+            Slash::Plain => return None,
+            Slash::Escaped => {
+                // `//name` sends a message that starts with `/name`.
+                self.drafts.insert(key, text[1..].to_string());
+                return None;
+            }
+            Slash::Command => {}
         }
         // Enter on a half-typed name picks the highlighted completion.
         if let Some(menu) = &self.slash
@@ -2201,7 +2238,12 @@ impl Chat {
                 self.plus = None;
                 let Some(key) = self.composer_key(thread) else { return Task::none() };
                 let draft = self.drafts.entry(key).or_default();
-                if !draft.is_empty() && !draft.ends_with(' ') && !add.starts_with(' ') {
+                if add.starts_with("```") {
+                    // A code block starts on a line of its own.
+                    if !draft.is_empty() && !draft.ends_with('\n') {
+                        draft.push('\n');
+                    }
+                } else if !draft.is_empty() && !draft.ends_with(' ') && !add.starts_with(' ') {
                     draft.push(' ');
                 }
                 draft.push_str(&add);
@@ -3054,6 +3096,64 @@ mod tests {
     }
 
     #[test]
+    fn code_is_left_alone() {
+        // Enter adds a line inside an open ``` block, not a `span`.
+        assert!(in_code_block("```"));
+        assert!(in_code_block("look:\n```rust\nfn main() {"));
+        assert!(!in_code_block("```\ncode\n```"));
+        assert!(!in_code_block("use `foo"));
+        // Nothing is completed in code.
+        assert!(in_code("use `std::fs") && in_code("```\n@decorator"));
+        assert_eq!(completing("see `:ro"), None);
+        assert_eq!(completing("`@bo"), None);
+        assert_eq!(completing("`code` :ro"), Some((Completing::Emoji, 7, ":ro")));
+        // A path or a comment isn't a command; `//name` escapes one.
+        assert_eq!(slash("/giphy cats"), Slash::Command);
+        assert_eq!(slash("/away"), Slash::Command);
+        assert_eq!(slash("//giphy cats"), Slash::Escaped);
+        for plain in ["/usr/bin/env python", "// a comment", "///", "/", "/ x", "/etc/hosts:\n127.0.0.1"] {
+            assert_eq!(slash(plain), Slash::Plain, "{plain}");
+        }
+        assert_eq!(completing("/usr/bi"), None);
+    }
+
+    #[test]
+    fn enter_in_a_code_block_adds_a_line_and_ctrl_enter_sends() {
+        use iced::keyboard::{Key, Modifiers, key::Named};
+        use iced::widget::text_editor::{Binding, KeyPress, Status};
+        let press = |modifiers| KeyPress {
+            key: Key::Named(Named::Enter),
+            modified_key: Key::Named(Named::Enter),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+            modifiers,
+            text: None,
+            status: Status::Focused { is_hovered: false },
+        };
+        let bind = |modifiers, code| crate::chat_view::composer_binding(press(modifiers), false, false, code, &Message::Send);
+        assert!(matches!(bind(Modifiers::empty(), false), Some(Binding::Custom(Message::Send))));
+        assert!(matches!(bind(Modifiers::empty(), true), Some(Binding::Enter)), "in code: a new line");
+        assert!(matches!(bind(Modifiers::SHIFT, false), Some(Binding::Enter)));
+        assert!(matches!(bind(Modifiers::COMMAND, true), Some(Binding::Custom(Message::Send))), "sends from anywhere");
+    }
+
+    #[test]
+    fn pasted_code_goes_as_written() {
+        let mut chat = chat();
+        let sent = |chat: &mut Chat, text: &str| {
+            let _ = chat.handle(Message::Draft(text.into()));
+            let _ = chat.handle(Message::Send);
+            chat.outbox.waiting("c1", "").last().map(|q| q.post.message.clone())
+        };
+        assert_eq!(sent(&mut chat, "/usr/bin/env python3").as_deref(), Some("/usr/bin/env python3"), "a path, not a command");
+        assert_eq!(sent(&mut chat, "// TODO: tidy").as_deref(), Some("// TODO: tidy"), "both slashes kept");
+        assert_eq!(sent(&mut chat, "//shrug ok").as_deref(), Some("/shrug ok"), "an escaped command");
+        // The + menu's code block starts on its own line.
+        let _ = chat.handle(Message::Draft("look".into()));
+        let _ = chat.handle(Message::InsertText(false, "```\n".into()));
+        assert_eq!(chat.draft(), "look\n```\n");
+    }
+
+    #[test]
     fn finds_the_word_to_complete() {
         assert_eq!(completing("/spl"), Some((Completing::Command, 0, "/spl")));
         assert_eq!(completing("//not a command"), None);
@@ -3404,3 +3504,4 @@ mod tests {
         assert!(selected(&chat).is_none());
     }
 }
+
