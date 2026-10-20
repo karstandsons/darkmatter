@@ -1,0 +1,45 @@
+# Layered on ../compose.yaml by rehearse.sh: the same hardened container,
+# getting its certificate from Pebble (Let's Encrypt's test server) through a
+# fake DNS, all on a private network. Paths are relative to deploy/axiond.
+name: axiond-rehearsal
+services:
+  axiond:
+    env_file: !reset []
+    environment:
+      AXIOND_DOMAIN: chat.axiond.localhost
+      AXIOND_ACME_DIRECTORY: https://pebble:14000/dir
+      AXIOND_ACME_CA: /pebble/minica.pem
+      AXIOND_SITE_NAME: Rehearsal
+    # *.localhost is this machine, so Darkmatter can use the name too.
+    ports: !override
+      - "127.0.0.1:8443:443"
+      - "[::1]:8443:443"
+    volumes: !override
+      - data:/data
+      - ./rehearsal/minica.pem:/pebble/minica.pem:ro
+    networks:
+      acme: { ipv4_address: 10.77.77.10 }
+    depends_on: [pebble]
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: -config /etc/pebble.json -dnsserver 10.77.77.2:8053
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+    # Its management side hands out the root that certificates chain to.
+    ports: ["127.0.0.1:15000:15000"]
+    volumes:
+      - ./rehearsal/pebble.json:/etc/pebble.json:ro
+    networks:
+      acme: { ipv4_address: 10.77.77.3 }
+  # Answers every name with axiond's address.
+  dns:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+    command: -defaultIPv4 10.77.77.10 -defaultIPv6 "" -http01 "" -https01 "" -tlsalpn01 "" -doh ""
+    networks:
+      acme: { ipv4_address: 10.77.77.2 }
+volumes:
+  data: {}
+networks:
+  acme:
+    ipam:
+      config: [{ subnet: 10.77.77.0/24 }]

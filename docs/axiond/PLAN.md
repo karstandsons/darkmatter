@@ -398,7 +398,13 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
 - **Changes from the plan:**
   - **The outbox is a JSON file** (state dir, mode 0600), not the SQLCipher database. That database arrives in M2 with the MLS state that needs it; the outbox moves into it then.
 - **Soak result:** 10 minutes, 249 SIGKILL crashes, 13,822 messages from five people: none lost, none doubled, all in order. **To look into:** six "database is locked" errors in one five-second burst (SQLite busy, codes 5 and 517). Clients retried and nothing was lost, but a server under normal load shouldn't return them.
-- **Not checked yet:** Let's Encrypt against a real domain, the release workflow's first run (arm64 under emulation), and the outbox in the running app (only through tests). The two of you running it on a VPS is the real test of M1.
+- **The local rehearsal (2026-10-20):** the whole VPS checklist on one machine with `deploy/axiond/rehearsal/rehearse.sh`, and Pebble standing in for Let's Encrypt. The certificate was issued over TLS-ALPN-01 and reused after restarts. Two admins and an invite were made from the command line. Darkmatter signed up with the invite over HTTPS and got messages live. Messages sent with the server down, and with Darkmatter closed, arrived once and in order. A backup went through restic, was restored onto a fresh volume and served the same messages. Fixed along the way:
+  - the restore steps (the container couldn't read a restored backup);
+  - the health check during staging (a test certificate made it unhealthy);
+  - HTTP/2 with Let's Encrypt certificates;
+  - admins added from the command line were missing from the audit log;
+  - queued messages were drawn under the previous person's name.
+- **Not checked yet:** Let's Encrypt itself with a real domain, and the release workflow's first run (arm64 under emulation). The two of you running it on a VPS is the real test of M1.
 
 **Order note:** the **wire format and API reserve space for E2EE from M0**: `props.dm_e2ee`, device IDs on sessions, and an `encrypted` flag on channels. That way M2 doesn't need a migration of the data model.
 

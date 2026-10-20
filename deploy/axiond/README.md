@@ -1,8 +1,9 @@
 # Running axiond on a VPS
 
 A checklist for putting axiond on a small virtual server, run by a couple of
-admins. It takes about an hour. Everything here was tried on a local Docker;
-the Let's Encrypt step needs a real domain.
+admins. It takes about an hour. To try it all on your own machine first, with
+Pebble (Let's Encrypt's test server) in place of Let's Encrypt, run
+`rehearsal/rehearse.sh up`; the script explains the rest.
 
 ## 1. The server
 
@@ -92,10 +93,15 @@ sudo systemctl start axiond-backup.service && journalctl -u axiond-backup -n 20
 Keep the restic password somewhere that isn't the server; both admins
 should have it. Without it the backups can't be read, by anyone.
 
-**Practise a restore** every few months on a spare machine:
+**Practise a restore** every few months on a spare machine, with Docker,
+restic, a checkout of this repository (`docker compose build` in
+`deploy/axiond` makes `axiond:local`) and copies of `/etc/axiond-backup.env`
+and the password file:
 
 ```sh
-restic restore latest --target /tmp/r
+sudo sh -c 'set -a; . /etc/axiond-backup.env; restic restore latest --target /tmp/r'
+# Backups are private files; hand them to the server's user (65532).
+sudo chown -R 65532:65532 /tmp/r
 sudo install -d -o 65532 -g 65532 -m 0700 /tmp/newdata
 docker run --rm -v /tmp/r:/r:ro -v /tmp/newdata:/data axiond:local \
   restore /r/opt/axiond/deploy/axiond/data/backups/axiond-<newest>.tar.gz
