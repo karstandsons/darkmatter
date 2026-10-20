@@ -4,7 +4,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use mm_api::models::{Channel, ChannelMember, ChannelType, Post, Reaction, Team, User};
+use mm_api::models::{Channel, ChannelMember, ChannelType, CustomEmoji, Post, Reaction, Team, User};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
@@ -325,5 +325,53 @@ pub async fn with_metadata(db: &Db, posts: &mut [Post]) -> sqlx::Result<()> {
             post.metadata.reactions.push(Reaction { user_id, post_id, emoji_name, create_at });
         }
     }
+    // The custom emoji each post uses, in its text or its reactions, so apps
+    // can fetch their pictures.
+    let names: std::collections::BTreeSet<String> = posts
+        .iter()
+        .flat_map(|p| emoji_names(&p.message).chain(p.metadata.reactions.iter().map(|r| r.emoji_name.clone())))
+        .collect();
+    if !names.is_empty() {
+        let list = serde_json::to_string(&names).unwrap_or_default();
+        let custom: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, name, creator_id FROM emoji WHERE delete_at = 0 AND name IN (SELECT value FROM json_each(?1))")
+                .bind(list)
+                .fetch_all(db)
+                .await?;
+        for post in posts.iter_mut() {
+            let used: std::collections::BTreeSet<String> =
+                emoji_names(&post.message).chain(post.metadata.reactions.iter().map(|r| r.emoji_name.clone())).collect();
+            for (id, name, creator_id) in custom.iter().filter(|(_, n, _)| used.contains(n)) {
+                post.metadata.emojis.push(CustomEmoji { id: id.clone(), name: name.clone(), creator_id: creator_id.clone(), delete_at: 0 });
+            }
+        }
+    }
     Ok(())
+}
+
+/// The `:name:` codes in a message.
+fn emoji_names(message: &str) -> impl Iterator<Item = String> + '_ {
+    let ok = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || "_+-".contains(c);
+    let mut rest = message;
+    std::iter::from_fn(move || {
+        while let Some(start) = rest.find(':') {
+            let after = &rest[start + 1..];
+            let len = after.find(|c: char| !ok(c)).unwrap_or(after.len());
+            if len > 0 && len <= 64 && after[len..].starts_with(':') {
+                rest = &after[len + 1..];
+                return Some(after[..len].to_string());
+            }
+            rest = after;
+        }
+        None
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn emoji_codes_in_text() {
+        let found: Vec<String> = super::emoji_names("hi :grad: and :party-parrot: at 10:30").collect();
+        assert_eq!(found, ["grad", "party-parrot"]);
+    }
 }
