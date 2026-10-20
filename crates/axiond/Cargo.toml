@@ -8,6 +8,10 @@ license = "AGPL-3.0-or-later"
 publish = false
 
 [dependencies]
+# End-to-end encryption: the server's checks (MLS delivery service).
+dm-crypto = { path = "../dm-crypto" }
+openmls_memory_storage = "0.6"
+base64 = "0.22"
 # Only the models: the same types Darkmatter reads, so the two can't drift.
 mm-api = { path = "../mm-api", default-features = false }
 serde.workspace = true

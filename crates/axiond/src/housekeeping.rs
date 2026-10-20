@@ -40,7 +40,10 @@ pub async fn run(app: &App) -> anyhow::Result<usize> {
         crate::api::files::remove_stored(app, id).await;
         sqlx::query("DELETE FROM files WHERE id = ?").bind(id).execute(&app.db).await?;
     }
-    sqlx::query("DELETE FROM sessions WHERE expires_at < ?").bind(now).execute(&app.db).await?;
+    let expired: Vec<(String, String)> = sqlx::query_as("DELETE FROM sessions WHERE expires_at < ? RETURNING user_id, device_id").bind(now).fetch_all(&app.db).await?;
+    for (user, device) in expired {
+        crate::e2ee::device_gone(app, &user, &device).await?;
+    }
     sqlx::query("DELETE FROM invites WHERE uses_left <= 0 OR expires_at < ?").bind(now).execute(&app.db).await?;
     Ok(gone.len())
 }

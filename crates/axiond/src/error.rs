@@ -36,6 +36,12 @@ impl Error {
         Self::new(StatusCode::NOT_FOUND, "app.not_found", format!("{what} not found."))
     }
 
+    /// Someone else changed it first (an encrypted group moved to a new
+    /// epoch): fetch what changed and try again.
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "axiond.e2ee.stale", message)
+    }
+
     pub fn too_many(message: impl Into<String>) -> Self {
         Self::new(StatusCode::TOO_MANY_REQUESTS, "api.context.rate_limited.app_error", message)
     }

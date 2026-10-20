@@ -44,6 +44,8 @@ pub fn check_new_password(password: &str) -> Result<(), String> {
 pub struct Me {
     pub user_id: String,
     pub session_id: String,
+    /// The device this session signs in (end-to-end encryption).
+    pub device_id: String,
     pub roles: String,
 }
 
@@ -65,15 +67,15 @@ impl FromRequestParts<App> for Me {
             .ok_or_else(Error::unauthorized)?
             .trim();
         let now = ids::now();
-        let row: Option<(String, String, i64, String)> = sqlx::query_as(
-            "SELECT s.id, s.user_id, s.last_activity_at, u.roles FROM sessions s JOIN users u ON u.id = s.user_id \
+        let row: Option<(String, String, String, i64, String)> = sqlx::query_as(
+            "SELECT s.id, s.user_id, s.device_id, s.last_activity_at, u.roles FROM sessions s JOIN users u ON u.id = s.user_id \
              WHERE s.token_hash = ? AND s.expires_at > ? AND u.delete_at = 0",
         )
         .bind(ids::hash_token(token))
         .bind(now)
         .fetch_optional(&app.db)
         .await?;
-        let (session_id, user_id, last_activity, roles) = row.ok_or_else(Error::unauthorized)?;
+        let (session_id, user_id, device_id, last_activity, roles) = row.ok_or_else(Error::unauthorized)?;
         // Slide the expiry along, at most once a minute.
         if now - last_activity > 60_000 {
             sqlx::query("UPDATE sessions SET last_activity_at = ?, expires_at = ? WHERE id = ?")
@@ -83,7 +85,7 @@ impl FromRequestParts<App> for Me {
                 .execute(&app.db)
                 .await?;
         }
-        Ok(Me { user_id, session_id, roles })
+        Ok(Me { user_id, session_id, device_id, roles })
     }
 }
 

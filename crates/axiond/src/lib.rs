@@ -11,6 +11,7 @@ mod auth;
 pub mod backup;
 pub mod config;
 mod db;
+pub mod e2ee;
 mod error;
 pub mod housekeeping;
 mod hub;
@@ -35,6 +36,7 @@ pub struct State {
     pub config: Config,
     pub db: db::Db,
     hub: hub::Hub,
+    e2ee: e2ee::State,
     guard: auth::Guard,
     limiter: limits::Limiter,
 }
@@ -51,7 +53,8 @@ impl App {
     /// Opens the database in the configured data folder.
     pub async fn open(config: Config) -> anyhow::Result<Self> {
         let db = db::open(&config.data_dir).await?;
-        Ok(App(Arc::new(State { config, db, hub: Default::default(), guard: Default::default(), limiter: Default::default() })))
+        let e2ee = e2ee::init(&db).await?;
+        Ok(App(Arc::new(State { config, db, hub: Default::default(), e2ee, guard: Default::default(), limiter: Default::default() })))
     }
 
     /// Serves the API on `listener` until Ctrl+C or SIGTERM: HTTPS if the

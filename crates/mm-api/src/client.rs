@@ -15,6 +15,8 @@ pub struct Client {
     base: Url,
     token: Option<String>,
     read_only: bool,
+    /// The device to sign in as (axiond's end-to-end encryption).
+    device_id: Option<String>,
 }
 
 /// POSTs that only read, allowed in read-only mode (paths relative to `/api/v4/`).
@@ -44,7 +46,7 @@ impl Client {
             base.set_path(&format!("{}/", base.path()));
         }
         let http = reqwest::Client::builder().user_agent(concat!("mm-api/", env!("CARGO_PKG_VERSION"))).build()?;
-        Ok(Client { http, base: base.join("api/v4/")?, token: None, read_only: false })
+        Ok(Client { http, base: base.join("api/v4/")?, token: None, read_only: false, device_id: None })
     }
 
     /// How the app names itself to the server, e.g. `Darkmatter/0.4.0 (linux)`.
@@ -52,6 +54,13 @@ impl Client {
     pub fn user_agent(mut self, agent: &str) -> Result<Self, Error> {
         self.http = reqwest::Client::builder().user_agent(agent).build()?;
         Ok(self)
+    }
+
+    /// Sign in as this device (axiond). Only for axiond: Mattermost takes
+    /// `device_id` to be a phone's push-notification address.
+    pub fn device_id(mut self, id: impl Into<String>) -> Self {
+        self.device_id = Some(id.into());
+        self
     }
 
     /// Use an existing session or personal access token.
@@ -86,6 +95,9 @@ impl Client {
         let mut body = json!({ "login_id": login_id, "password": password });
         if let Some(code) = mfa {
             body["token"] = code.into();
+        }
+        if let Some(device) = &self.device_id {
+            body["device_id"] = device.clone().into();
         }
         let resp = check(self.request(Method::POST, "users/login")?.json(&body).send().await?).await?;
         let token = resp
@@ -354,6 +366,65 @@ impl Client {
     pub async fn report(&self, post_id: &str, user_id: &str, reason: &str) -> Result<(), Error> {
         let body = json!({ "post_id": post_id, "user_id": user_id, "reason": reason });
         self.send_unit(Method::POST, "reports", Some(&body)).await
+    }
+
+    // End-to-end encryption on axiond (docs/axiond/E2EE.md §15). Binary data
+    // is base64.
+
+    /// Publishes your identity key (base64), the first time.
+    pub async fn put_identity(&self, identity_key: &str) -> Result<(), Error> {
+        self.send_unit(Method::PUT, "e2ee/identity", Some(&json!({ "identity_key": identity_key }))).await
+    }
+
+    /// Someone's identity key and their devices' certificates.
+    pub async fn identity(&self, user_id: &str) -> Result<E2eeIdentity, Error> {
+        self.get(&format!("e2ee/users/{user_id}/identity")).await
+    }
+
+    /// Publishes this device's certificate (as JSON).
+    pub async fn publish_device(&self, certificate: &serde_json::Value) -> Result<(), Error> {
+        self.send_unit(Method::POST, "e2ee/devices", Some(&json!({ "certificate": certificate }))).await
+    }
+
+    /// Takes out another of your devices.
+    pub async fn revoke_device(&self, device_id: &str) -> Result<(), Error> {
+        self.send_unit(Method::DELETE, &format!("e2ee/devices/{device_id}"), None::<&()>).await
+    }
+
+    pub async fn upload_key_packages(&self, key_packages: &[String]) -> Result<(), Error> {
+        self.send_unit(Method::POST, "e2ee/key_packages", Some(&json!({ "key_packages": key_packages }))).await
+    }
+
+    /// One key package for each device of these users.
+    pub async fn claim_key_packages(&self, user_ids: &[String]) -> Result<Vec<ClaimedKeyPackage>, Error> {
+        self.send(Method::POST, "e2ee/key_packages/claim", Some(&json!({ "user_ids": user_ids }))).await
+    }
+
+    /// Starts a channel's group from its first GroupInfo.
+    pub async fn create_group(&self, channel_id: &str, group_info: &str) -> Result<GroupState, Error> {
+        self.send(Method::POST, &format!("e2ee/channels/{channel_id}/group"), Some(&json!({ "group_info": group_info }))).await
+    }
+
+    pub async fn group_state(&self, channel_id: &str) -> Result<GroupState, Error> {
+        self.get(&format!("e2ee/channels/{channel_id}/group")).await
+    }
+
+    /// Sends a commit. A `409` means another got there first: fetch the
+    /// handshakes after yours and try again.
+    pub async fn post_handshake(&self, channel_id: &str, handshake: &NewHandshake) -> Result<HandshakeEntry, Error> {
+        self.send(Method::POST, &format!("e2ee/channels/{channel_id}/handshake"), Some(handshake)).await
+    }
+
+    pub async fn handshakes(&self, channel_id: &str, after: i64) -> Result<Vec<HandshakeEntry>, Error> {
+        self.get(&format!("e2ee/channels/{channel_id}/handshake?after={after}")).await
+    }
+
+    pub async fn welcomes(&self) -> Result<Vec<PendingWelcome>, Error> {
+        self.get("e2ee/welcomes").await
+    }
+
+    pub async fn ack_welcome(&self, id: i64) -> Result<(), Error> {
+        self.send_unit(Method::DELETE, &format!("e2ee/welcomes/{id}"), None::<&()>).await
     }
 
     /// Deletes your own account for good (axiond).

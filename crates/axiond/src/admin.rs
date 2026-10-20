@@ -99,8 +99,8 @@ pub async fn mfa_off(app: &App, username: &str) -> anyhow::Result<()> {
     if done.rows_affected() == 0 {
         bail!("there's no {username}");
     }
-    sqlx::query("DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?)").bind(username).execute(&app.db).await?;
     let id = id_of(app, username).await?;
+    crate::api::sessions::end_all(app, &id, None).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     crate::audit::record(&app.db, "", "user.mfa_off", &id, "").await?;
     Ok(())
 }
@@ -190,7 +190,7 @@ pub async fn set_password(app: &App, username: &str, password: &str) -> anyhow::
         .await?
         .with_context(|| format!("no user called {username}"))?;
     sqlx::query("UPDATE users SET password_hash = ?, update_at = ? WHERE id = ?").bind(&hash).bind(ids::now()).bind(&id).execute(&app.db).await?;
-    sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(&id).execute(&app.db).await?;
+    crate::api::sessions::end_all(app, &id, None).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     crate::audit::record(&app.db, "", "user.password", &id, "").await?;
     Ok(())
 }

@@ -128,6 +128,28 @@ fn a_dm_reaches_both_people_and_their_other_devices() {
 }
 
 #[test]
+fn last_resort_key_packages_work_and_pass_the_servers_check() {
+    let mut w = World::new();
+    let alice = w.device("alice", "laptop");
+    let bob = w.device("bob", "desktop");
+    let carol = w.device("carol", "desktop");
+    let one_time = bob.key_package(false).unwrap();
+    let last = bob.key_package(true).unwrap();
+    assert_eq!(dm_crypto::ds::check_key_package(&one_time).unwrap(), (name(&bob), bob.signature_key().to_vec(), false));
+    assert_eq!(dm_crypto::ds::check_key_package(&last).unwrap(), (name(&bob), bob.signature_key().to_vec(), true));
+    assert!(dm_crypto::ds::check_key_package(b"junk").is_err());
+    // The same last-resort package adds bob to two groups.
+    for channel in ["c1", "c2"] {
+        w.create(&alice, channel);
+        let h = alice.add(channel, &[last.clone(), carol.key_package(false).unwrap()], &w.keys).unwrap();
+        w.send(&alice, channel, &h).unwrap();
+        bob.join(h.welcome.as_ref().unwrap(), &w.server_key(), &w.keys).unwrap();
+        let ct = alice.encrypt(channel, &post("hi"), &Aad::post(channel, "", "p")).unwrap();
+        assert_eq!(read(&bob, channel, &ct, &w.keys).unwrap().1, "hi");
+    }
+}
+
+#[test]
 fn a_device_without_a_valid_certificate_is_refused() {
     let mut w = World::new();
     let alice = w.device("alice", "laptop");

@@ -3,6 +3,7 @@
 pub(crate) mod accounts;
 mod channels;
 mod commands;
+mod e2ee;
 pub(crate) mod images;
 pub(crate) mod files;
 mod posts;
@@ -47,7 +48,17 @@ pub fn router(app: App) -> Router {
         .route("/users/{id}/sessions/revoke/all", post(sessions::revoke_all))
         .route("/users/{id}/mfa/generate", post(sessions::generate))
         .route("/users/{id}/mfa", put(sessions::activate))
-        .route("/e2ee/config", get(e2ee_config))
+        .route("/e2ee/config", get(e2ee::config))
+        .route("/e2ee/identity", put(e2ee::put_identity))
+        .route("/e2ee/users/{id}/identity", get(e2ee::identity))
+        .route("/e2ee/devices", post(e2ee::publish_device))
+        .route("/e2ee/devices/{id}", delete(e2ee::revoke_device))
+        .route("/e2ee/key_packages", post(e2ee::upload_key_packages))
+        .route("/e2ee/key_packages/claim", post(e2ee::claim_key_packages))
+        .route("/e2ee/channels/{id}/group", post(e2ee::create_group).get(e2ee::group_state))
+        .route("/e2ee/channels/{id}/handshake", post(e2ee::post_handshake).get(e2ee::handshakes))
+        .route("/e2ee/welcomes", get(e2ee::welcomes))
+        .route("/e2ee/welcomes/{id}", delete(e2ee::ack_welcome))
         .route("/users/ids", post(users::by_ids))
         .route("/users/status/ids", post(status::by_ids))
         .route("/users/{id}/status", get(status::get_one).put(status::put))
@@ -104,10 +115,6 @@ pub fn router(app: App) -> Router {
 
 /// What end-to-end encryption this server offers. Darkmatter uses it to
 /// tell axiond from plain Mattermost (which answers 404). Nothing yet: M2.
-async fn e2ee_config() -> Json<Value> {
-    Json(json!({ "enabled": false, "server": "axiond", "version": crate::VERSION }))
-}
-
 /// The largest upload request: a post's worth of files at the size limit.
 fn upload_limit(app: &App) -> usize {
     let file = app.config.max_file_mb.saturating_mul(1024 * 1024) as usize;

@@ -216,6 +216,7 @@ pub async fn leave_channel(app: &App, user_id: &str, channel: &ChannelRow) -> Re
     if left.rows_affected() > 0 {
         let user = db::user(&app.db, user_id, user_id).await?;
         posts::insert(app, channel, user_id, posts::New::system("system_leave_channel", format!("@{} left the channel.", user.username))).await?;
+        crate::e2ee::user_left(app, &channel.id, user_id).await?;
     }
     Ok(())
 }

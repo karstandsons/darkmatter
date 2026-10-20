@@ -56,11 +56,14 @@ pub struct Revoke {
 /// Signs one app out; its sockets close straight away.
 pub async fn revoke(State(app): State<App>, me: Me, Path(user_id): Path<String>, Json(body): Json<Revoke>) -> Result<Json<Value>> {
     let user_id = yours_or_admin(&me, &user_id)?;
-    let gone = sqlx::query("DELETE FROM sessions WHERE id = ? AND user_id = ?").bind(&body.session_id).bind(&user_id).execute(&app.db).await?;
-    if gone.rows_affected() == 0 {
-        return Err(Error::not_found("Session"));
-    }
+    let device: Option<String> = sqlx::query_scalar("DELETE FROM sessions WHERE id = ? AND user_id = ? RETURNING device_id")
+        .bind(&body.session_id)
+        .bind(&user_id)
+        .fetch_optional(&app.db)
+        .await?;
+    let device = device.ok_or_else(|| Error::not_found("Session"))?;
     app.hub.end_session(&body.session_id);
+    crate::e2ee::device_gone(&app, &user_id, &device).await?;
     super::ok()
 }
 
@@ -71,16 +74,18 @@ pub async fn revoke_all(State(app): State<App>, me: Me, Path(user_id): Path<Stri
     super::ok()
 }
 
-/// Ends someone's sessions, except `keep`.
+/// Ends someone's sessions, except `keep`. Their devices leave every
+/// encrypted group.
 pub async fn end_all(app: &App, user_id: &str, keep: Option<&str>) -> Result<()> {
-    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM sessions WHERE user_id = ? AND id != ?")
+    let sessions: Vec<(String, String)> = sqlx::query_as("SELECT id, device_id FROM sessions WHERE user_id = ? AND id != ?")
         .bind(user_id)
         .bind(keep.unwrap_or(""))
         .fetch_all(&app.db)
         .await?;
-    for id in ids {
+    for (id, device) in sessions {
         sqlx::query("DELETE FROM sessions WHERE id = ?").bind(&id).execute(&app.db).await?;
         app.hub.end_session(&id);
+        crate::e2ee::device_gone(app, user_id, &device).await?;
     }
     Ok(())
 }

@@ -395,13 +395,85 @@ pub struct MfaSecret {
 }
 
 /// What `GET e2ee/config` says on axiond. Plain Mattermost has no such path.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AxiondInfo {
     pub server: String,
     pub version: String,
     /// End-to-end encryption is on.
     pub enabled: bool,
+    /// The MLS ciphersuite groups use (1).
+    pub ciphersuite: u16,
+    /// The server's key as the groups' external sender (base64): it may
+    /// propose removals, nothing else.
+    pub external_sender: String,
+}
+
+// End-to-end encryption on axiond (docs/axiond/E2EE.md §15). Binary data
+// (key packages, MLS messages) travels as base64 strings.
+
+/// A user's identity key and their devices' certificates.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct E2eeIdentity {
+    pub user_id: Id,
+    /// Base64 Ed25519 public key, or empty if they haven't set up encryption.
+    pub identity_key: String,
+    /// Certificates (JSON objects, as the device published them).
+    pub devices: Vec<serde_json::Value>,
+    /// Devices taken out (signed out, or revoked), by id.
+    pub revoked: Vec<String>,
+}
+
+/// One key package claimed for one device.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ClaimedKeyPackage {
+    pub user_id: Id,
+    pub device_id: String,
+    pub key_package: String,
+}
+
+/// Body for `POST e2ee/channels/{id}/handshake`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NewHandshake {
+    pub commit: String,
+    pub group_info: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub welcome: String,
+}
+
+/// One entry in a group's handshake log.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HandshakeEntry {
+    pub seq: i64,
+    pub epoch: u64,
+    /// `commit`, or `proposal` (the server's removals).
+    pub kind: String,
+    pub data: String,
+}
+
+/// A group's latest state for joining by external commit.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GroupState {
+    pub epoch: u64,
+    pub group_info: String,
+    /// The last handshake's sequence number: fetch after it from here on.
+    pub seq: i64,
+}
+
+/// A Welcome waiting for this device.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PendingWelcome {
+    pub id: i64,
+    pub channel_id: Id,
+    /// The handshake that added this device; fetch the log after it.
+    pub seq: i64,
+    pub welcome: String,
 }
 
 /// Body for `POST /posts`.

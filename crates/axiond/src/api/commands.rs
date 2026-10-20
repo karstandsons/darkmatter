@@ -262,6 +262,7 @@ async fn kick(app: &App, me: &Me, channel: &ChannelRow, other: &str) -> Result<R
     let by = db::user(&app.db, &me.user_id, &me.user_id).await?.username;
     posts::insert(app, channel, &me.user_id, posts::New::system("system_remove_from_channel", format!("@{name} was removed from the channel by @{by}."))).await?;
     app.hub.send(&[other.to_string()], &Event::new("user_removed", json!({ "channel_id": channel.id, "remover_id": me.user_id })).user(other));
+    crate::e2ee::user_left(app, &channel.id, other).await?;
     Ok(Reply::quiet())
 }
 

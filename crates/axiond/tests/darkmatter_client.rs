@@ -660,7 +660,8 @@ async fn sessions_and_two_factor_codes() {
 
     // Darkmatter can tell axiond from plain Mattermost.
     let e2ee: serde_json::Value = http.get(api("e2ee/config")).send().await.unwrap().json().await.unwrap();
-    assert_eq!((e2ee["server"].as_str(), e2ee["enabled"].as_bool()), (Some("axiond"), Some(false)));
+    assert_eq!((e2ee["server"].as_str(), e2ee["enabled"].as_bool(), e2ee["ciphersuite"].as_u64()), (Some("axiond"), Some(true), Some(1)));
+    assert_eq!(e2ee["external_sender"].as_str().map(str::len), Some(44), "the server's key, base64");
 }
 
 #[tokio::test]

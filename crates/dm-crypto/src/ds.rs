@@ -58,6 +58,17 @@ impl<S: StorageProvider<CURRENT_VERSION>> Server<S> {
         Ok(Server { provider, signer })
     }
 
+    /// Where the server keeps the groups' public state (the app saves it).
+    pub fn storage(&self) -> &S {
+        self.provider.storage()
+    }
+
+    /// The epoch a handshake message was made in, without applying it
+    /// ([`Server::commit`] does the real checks).
+    pub fn epoch_of(bytes: &[u8]) -> Result<u64> {
+        Ok(parse_protocol(bytes)?.epoch().as_u64())
+    }
+
     /// What clients put in their groups as the external sender (published in
     /// `e2ee/config`).
     pub fn key(&self) -> ServerKey {
@@ -242,4 +253,18 @@ fn parse_protocol(bytes: &[u8]) -> Result<ProtocolMessage> {
         .ok()
         .and_then(|m| m.try_into_protocol_message().ok())
         .ok_or(Error::Malformed("mls message"))
+}
+
+/// Checks a key package a device uploads: well-formed, self-signed, for our
+/// ciphersuite. Returns the device it's for, the signature key it uses (which
+/// its certificate must vouch for) and whether it's the last-resort one.
+pub fn check_key_package(bytes: &[u8]) -> Result<(DeviceName, Vec<u8>, bool)> {
+    let crypto = openmls_libcrux_crypto::CryptoProvider::new().map_err(mls)?;
+    let kp = KeyPackageIn::tls_deserialize_exact(bytes).map_err(|_| Error::Malformed("key package"))?;
+    let kp = kp.validate(&crypto, ProtocolVersion::Mls10).map_err(mls)?;
+    if kp.ciphersuite() != CIPHERSUITE {
+        return Err(Error::Untrusted("a key package for another ciphersuite".into()));
+    }
+    let leaf = kp.leaf_node();
+    Ok((identity::parse_credential(leaf.credential())?, leaf.signature_key().as_slice().to_vec(), kp.last_resort()))
 }

@@ -73,6 +73,8 @@ So the server can't add a device of its own making: it has no user identity key 
 
 **Changes to a user's identity key** only happen when someone loses every device and has no backup. Clients show a warning in every conversation with that user. **In a conversation where the user was verified, sending is blocked** until the change is accepted. (Signal only warns; the stricter rule fits our priorities. Decided, [§18](#18-decisions).)
 
+**A device is a signed-in session** (as built in M2): signing out, a revoked or expired session, a password reset or deactivation revokes the device and takes it out of every group. Signing in again makes a new device.
+
 **Removing a device** (from the devices page, or because a session is revoked): the user's other device publishes a revocation signed by the identity key, the server stops delivering to the device, and the device is removed from every group ([§4](#4-groups)).
 
 ## 4. Groups
@@ -105,7 +107,7 @@ axiond takes the MLS **Delivery Service** role. It also uses openmls's `PublicGr
 - **encrypted backups** ([§12](#12-new-devices-verification-and-recovery));
 - **posts** whose content is ciphertext ([§6](#6-messages)).
 
-**Delivery.** Handshake messages and Welcomes go to devices over the websocket (`mls_commit`, `mls_welcome`) and can be fetched by sequence number after a disconnect. The handshake log is kept for **30 days**. A device that has been away longer re-joins its groups with an external commit; it can't read what was sent while it was away unless it has a history backup.
+**Delivery.** Handshake messages and Welcomes go to devices over the websocket (`mls_commit`, `mls_welcome`) and can be fetched by sequence number after a disconnect. The log holds the server's Remove proposals in order with the commits, because a commit refers to proposals its readers must already have. A device moves its place in the log to the sequence number the server returns for its own commit, so it never reads its own commit back. The handshake log is kept for **30 days**. A device that has been away longer re-joins its groups with an external commit; it can't read what was sent while it was away unless it has a history backup.
 
 **What the server checks** (so a buggy or malicious client can't break a group for everyone):
 - the sender of a commit is a current member device, and the device belongs to the logged-in session;

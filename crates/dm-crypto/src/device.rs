@@ -97,7 +97,10 @@ impl<S: StorageProvider<CURRENT_VERSION>> Device<S> {
     /// A key package others use to add this device to a group: one-time, or
     /// the last-resort one the server hands out when the others run out.
     pub fn key_package(&self, last_resort: bool) -> Result<Vec<u8>> {
-        let mut builder = KeyPackage::builder();
+        // Every key package says the device understands last-resort ones,
+        // which openmls requires before it accepts one.
+        let capabilities = Capabilities::new(None, Some(&[CIPHERSUITE]), Some(&[ExtensionType::LastResort]), None, Some(&[CredentialType::Basic]));
+        let mut builder = KeyPackage::builder().leaf_node_capabilities(capabilities);
         if last_resort {
             builder = builder.mark_as_last_resort();
         }

@@ -82,6 +82,7 @@ pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body
 pub async fn logout(State(app): State<App>, me: Me) -> Result<Json<Value>> {
     sqlx::query("DELETE FROM sessions WHERE id = ?").bind(&me.session_id).execute(&app.db).await?;
     app.hub.end_session(&me.session_id);
+    crate::e2ee::device_gone(&app, &me.user_id, &me.device_id).await?;
     super::ok()
 }
 

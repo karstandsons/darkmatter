@@ -411,13 +411,13 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
 - **Not checked yet:** Let's Encrypt itself with a real domain, and the release workflow's first run (arm64 under emulation). The two of you running it on a VPS is the real test of M1.
 
 **M2 steps** (started 2026-10-20). Each step is committed when it's tested; the design is [E2EE.md](E2EE.md).
-1. **`dm-crypto`:** the crate on openmls 0.9.1. It covers:
+1. **`dm-crypto`:** *(done 2026-10-20)* the crate on openmls 0.9.1. It covers:
    - identity keys and device certificates;
    - creating and joining groups, sending and reading messages;
    - the plaintext format, authenticated data and padding.
 
    Tested in-process with several simulated devices. It builds for iOS and Android in CI from the start.
-2. **axiond as delivery service:**
+2. **axiond as delivery service:** *(done 2026-10-20)*
    - identity keys, device certificates and key packages;
    - the handshake log, checked with `PublicGroup`;
    - GroupInfo and Welcomes, with the server as external sender for Removes;
