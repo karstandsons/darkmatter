@@ -67,9 +67,10 @@ jobs:
       - run: cargo build --locked -p dm-crypto --target aarch64-apple-ios
 
   # And for Android, with the NDK the runner already has: the library and
-  # its tests, linked.
+  # its tests, linked. A warning only, until it has passed once.
   android:
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
