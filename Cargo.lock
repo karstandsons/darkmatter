@@ -1617,7 +1617,7 @@ dependencies = [
 
 [[package]]
 name = "darkmatter"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -1802,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "dm-client"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "dm-crypto",
@@ -1815,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "dm-crypto"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -4200,7 +4200,7 @@ dependencies = [
 
 [[package]]
 name = "mm-api"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "futures-util",
  "image",
@@ -4946,7 +4946,7 @@ dependencies = [
 
 [[package]]
 name = "omarchy-theme"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "dirs",
  "notify",

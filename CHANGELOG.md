@@ -5,6 +5,8 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-20
+
 - **GIFs show and play.** A GIF (from `/gif` or any upload) used to show
   only its file name, because Mattermost makes no preview of GIFs. They now
   play in the conversation, and only while they're on screen. The image
