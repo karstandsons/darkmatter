@@ -133,7 +133,9 @@ An encrypted post uses the normal `POST /api/v4/posts`:
 }
 ```
 
-- **`message` is empty.** axiond fills in "🔒 Encrypted message" for any client that doesn't understand `dm_e2ee`, and refuses posts with any other text in an encrypted channel, so plaintext can't slip into an encrypted room.
+- **`message` is empty.** axiond fills in "🔒 Encrypted message" for any client that doesn't understand `dm_e2ee`, and refuses posts with any other text in an encrypted channel, so plaintext can't slip into an encrypted room. It also refuses ciphertext from an epoch more than a few behind, and sending while its removal proposals have waited more than 30 seconds for a commit.
+- **Read once.** MLS can decrypt a message only once, so a device keeps each decrypted text in its local database and reads it from there afterwards. A sender can't decrypt its own message at all, so it keeps the text when it encrypts (under the post's `pending_post_id` until the server numbers it). Posts carry `pending_post_id` to every reader, for the authenticated-data check.
+- **Where it's built:** `dm-client` holds the client side (setup, groups, encrypting and decrypting posts) over `mm-api`, so Darkmatter and the phone apps share it; the app supplies its storage. Server commands that post for you (`/msg @someone text`) don't write into encrypted conversations.
 - **The MLS plaintext** is a small JSON document:
 
   ```json

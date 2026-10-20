@@ -33,6 +33,8 @@ pub enum Refusal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Applied {
     pub epoch: u64,
+    /// A device joining by itself (external commit): it needs no Welcome.
+    pub external: bool,
     pub added: Vec<DeviceName>,
     pub removed: Vec<DeviceName>,
 }
@@ -209,7 +211,7 @@ impl<S: StorageProvider<CURRENT_VERSION>> Server<S> {
         }
         group.merge_commit(self.provider.storage(), *staged).map_err(mls)?;
         let epoch = group.group_context().epoch().as_u64();
-        Ok(Applied { epoch, added, removed })
+        Ok(Applied { epoch, external: external_join, added, removed })
     }
 
     /// Proposes removing a device (it left the channel, or its session was

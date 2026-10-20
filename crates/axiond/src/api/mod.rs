@@ -83,7 +83,7 @@ pub fn router(app: App) -> Router {
         .route("/channels/members/me/view", post(channels::view))
         .route("/channels/{id}", get(channels::get_one))
         .route("/channels/{id}/posts", get(posts::in_channel))
-        .route("/channels/{id}/members", post(channels::join))
+        .route("/channels/{id}/members", post(channels::join).get(channels::members))
         .route("/channels/{id}/members/{user}", delete(channels::leave))
         .route("/posts", post(posts::create))
         .route("/posts/{id}", delete(posts::remove))

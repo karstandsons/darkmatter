@@ -112,10 +112,15 @@ async fn run(app: &App, me: &Me, channel: &ChannelRow, root_id: &str, trigger: &
             let (who, text) = args.split_once(char::is_whitespace).map_or((args, ""), |(w, t)| (w, t.trim()));
             let Some(other) = user_named(app, who).await? else { return Ok(Reply::say("Usage: /msg @username [text]")) };
             let dm = channels::direct_channel(app, &me.user_id, &other).await?;
+            let goto = format!("/{}/channels/{}", team.1, dm.name);
             if !text.is_empty() {
+                // The server can't write in an encrypted conversation.
+                if dm.encrypted {
+                    return Ok(Reply { text: "That conversation is end-to-end encrypted, so the server can't send it for you: type it there.".into(), goto });
+                }
                 post_text(app, me, &dm, "", text.to_string()).await?;
             }
-            Ok(Reply { text: String::new(), goto: format!("/{}/channels/{}", team.1, dm.name) })
+            Ok(Reply { text: String::new(), goto })
         }
         "header" | "purpose" => {
             if matches!(channel.kind.as_str(), "O" | "P") && db::member(&app.db, &channel.id, &me.user_id).await?.is_none() {
@@ -205,7 +210,7 @@ async fn post_text(app: &App, me: &Me, channel: &ChannelRow, root_id: &str, mess
     if db::member(&app.db, &channel.id, &me.user_id).await?.is_none() {
         return Err(Error::forbidden());
     }
-    let new = posts::New { root_id: root_id.into(), message, kind: "", pending_post_id: String::new(), file_ids: Vec::new() };
+    let new = posts::New { root_id: root_id.into(), message, kind: "", pending_post_id: String::new(), file_ids: Vec::new(), props: serde_json::json!({}) };
     posts::insert(app, channel, &me.user_id, new).await
 }
 

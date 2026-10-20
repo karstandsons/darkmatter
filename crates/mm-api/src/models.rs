@@ -118,6 +118,8 @@ pub struct Channel {
     pub total_msg_count: i64,
     pub total_msg_count_root: i64,
     pub creator_id: Id,
+    /// End-to-end encrypted (axiond only; Mattermost never sets it).
+    pub encrypted: bool,
 }
 
 impl Channel {
@@ -490,6 +492,9 @@ pub struct NewPost {
     /// optimistic local copy can be matched with the real post.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub pending_post_id: String,
+    /// Extra fields: on axiond, an encrypted post's `dm_e2ee`.
+    #[serde(skip_serializing_if = "Value::is_null")]
+    pub props: Value,
 }
 
 /// What the server says after running a slash command.

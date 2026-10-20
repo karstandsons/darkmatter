@@ -49,6 +49,15 @@ pub async fn my_members(State(app): State<App>, me: Me, Path(team): Path<String>
     Ok(Json(rows.into_iter().map(Into::into).collect()))
 }
 
+/// Everyone in a channel you can read (Mattermost's paging is ignored:
+/// axiond's channels are a group's size).
+pub async fn members(State(app): State<App>, me: Me, Path(id): Path<String>) -> Result<Json<Vec<ChannelMember>>> {
+    readable(&app, &me, &id).await?;
+    let sql = format!("SELECT {MEMBER_COLUMNS} FROM channel_members m WHERE m.channel_id = ?");
+    let rows: Vec<MemberRow> = sqlx::query_as(&sql).bind(&id).fetch_all(&app.db).await?;
+    Ok(Json(rows.into_iter().map(Into::into).collect()))
+}
+
 pub async fn get_one(State(app): State<App>, me: Me, Path(id): Path<String>) -> Result<Json<Channel>> {
     Ok(Json(readable(&app, &me, &id).await?.into()))
 }
@@ -131,7 +140,8 @@ pub async fn direct_channel(app: &App, me: &str, other: &str) -> Result<ChannelR
     }
     let (id, now) = (ids::new_id(), ids::now());
     let mut tx = app.db.begin().await?;
-    sqlx::query("INSERT INTO channels (id, team_id, type, name, create_at, update_at, creator_id) VALUES (?, '', 'D', ?, ?, ?, ?)")
+    // Direct messages are always end-to-end encrypted.
+    sqlx::query("INSERT INTO channels (id, team_id, type, name, create_at, update_at, creator_id, encrypted) VALUES (?, '', 'D', ?, ?, ?, ?, 1)")
         .bind(&id)
         .bind(&name)
         .bind(now)

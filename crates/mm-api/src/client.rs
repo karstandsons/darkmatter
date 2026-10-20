@@ -371,6 +371,11 @@ impl Client {
     // End-to-end encryption on axiond (docs/axiond/E2EE.md §15). Binary data
     // is base64.
 
+    /// Everyone in a channel.
+    pub async fn channel_members(&self, channel_id: &str) -> Result<Vec<ChannelMember>, Error> {
+        self.get(&format!("channels/{channel_id}/members?per_page=200")).await
+    }
+
     /// The device this session signs in as.
     pub async fn my_device(&self) -> Result<String, Error> {
         #[derive(serde::Deserialize)]
@@ -400,8 +405,11 @@ impl Client {
         self.send_unit(Method::DELETE, &format!("e2ee/devices/{device_id}"), None::<&()>).await
     }
 
-    pub async fn upload_key_packages(&self, key_packages: &[String]) -> Result<(), Error> {
-        self.send_unit(Method::POST, "e2ee/key_packages", Some(&json!({ "key_packages": key_packages }))).await
+    /// Uploads key packages; returns how many one-time ones the server now
+    /// holds for this device (upload none to just ask).
+    pub async fn upload_key_packages(&self, key_packages: &[String]) -> Result<u64, Error> {
+        let v: serde_json::Value = self.send(Method::POST, "e2ee/key_packages", Some(&json!({ "key_packages": key_packages }))).await?;
+        Ok(v["stored"].as_u64().unwrap_or_default())
     }
 
     /// One key package for each device of these users.

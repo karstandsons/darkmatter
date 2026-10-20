@@ -198,9 +198,9 @@ async fn paging_direct_messages_and_channels() {
     assert_eq!(bob.create_direct(&bob_id, &alice_id).await.unwrap().id, dm.id);
     assert_eq!(dm.dm_partner(&alice_id), Some(bob_id.as_str()));
     assert!(bob.my_channels(&team).await.unwrap().iter().any(|c| c.id == dm.id));
-    alice.create_post(&NewPost { channel_id: dm.id.clone(), message: "psst".into(), ..Default::default() }).await.unwrap();
-    let members = bob.my_channel_members(&team).await.unwrap();
-    assert_eq!(members.iter().find(|m| m.channel_id == dm.id).unwrap().mention_count, 1);
+    // DMs are end-to-end encrypted: plain text is refused (tests/encrypted_dms.rs).
+    assert!(dm.encrypted);
+    assert!(alice.create_post(&NewPost { channel_id: dm.id.clone(), message: "psst".into(), ..Default::default() }).await.is_err());
     assert_eq!(alice.users_by_ids(std::slice::from_ref(&bob_id)).await.unwrap()[0].email, "", "others' emails stay private");
     assert_eq!(alice.autocomplete_users(&team, "bo").await.unwrap()[0].id, bob_id);
 
@@ -563,11 +563,13 @@ async fn statuses_and_server_commands() {
     assert_eq!(joined.goto_location, "/home/channels/rust");
     assert!(bob.my_channels(&team).await.unwrap().iter().any(|c| c.id == rust));
 
-    // /msg opens a DM (and says something, if asked).
+    // /msg opens a DM. It's encrypted, so the server won't write the text
+    // for you, and says so.
     let dm = run(&alice, &town, "/msg @bob psst").await.unwrap();
     let dm_name = dm.goto_location.rsplit('/').next().unwrap().to_string();
     let dm_channel = bob.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == dm_name).unwrap();
-    assert_eq!(bob.posts(&dm_channel.id, PostsQuery::Page { page: 0, per_page: 5 }, false).await.unwrap().chronological()[0].message, "psst");
+    assert!(dm_channel.encrypted);
+    assert!(bob.posts(&dm_channel.id, PostsQuery::Page { page: 0, per_page: 5 }, false).await.unwrap().order.is_empty());
 
     // /header changes the channel for everyone, with a note in the channel.
     run(&bob, &rust, "/header Rust talk").await.unwrap();

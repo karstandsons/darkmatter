@@ -641,6 +641,7 @@ dependencies = [
  "axum-server",
  "base64 0.22.1",
  "clap",
+ "dm-client",
  "dm-crypto",
  "flate2",
  "futures-util",
@@ -1622,6 +1623,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dirs",
+ "dm-client",
  "dm-crypto",
  "emojis",
  "flate2",
@@ -1634,7 +1636,6 @@ dependencies = [
  "notify-rust",
  "omarchy-theme",
  "open",
- "openmls_memory_storage",
  "qrcode",
  "reqwest",
  "rfd",
@@ -1797,6 +1798,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
  "libloading",
+]
+
+[[package]]
+name = "dm-client"
+version = "0.4.0"
+dependencies = [
+ "base64 0.22.1",
+ "dm-crypto",
+ "mm-api",
+ "openmls_memory_storage",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -1028,6 +1028,15 @@ pub(crate) fn bootstrap(session: Session) -> Task<Message> {
                         v.writer().outbox(outbox.clone());
                     }
                     let (status, crypto) = crate::crypto::setup(&client, &me.id, v, axiond.as_ref()).await;
+                    // Join (a new device) or catch up on each encrypted
+                    // channel's group.
+                    if let Some(c) = &crypto {
+                        for ch in channels.iter().filter(|ch| ch.encrypted) {
+                            if let Err(e) = c.sync(&ch.id).await {
+                                tracing::warn!("couldn't sync the encryption of {}: {e}", ch.id);
+                            }
+                        }
+                    }
                     (outbox, status, crypto)
                 }
                 None => {

@@ -198,11 +198,10 @@ pub struct Chat {
     /// What axiond says about itself; `None` on plain Mattermost.
     pub axiond: Option<mm_api::models::AxiondInfo>,
     /// The account's encrypted local database.
-    #[expect(dead_code, reason = "encrypted messages are kept in it: M2 step 4")]
+    #[expect(dead_code, reason = "local search reads it: M2 step 8")]
     pub vault: Option<std::sync::Arc<crate::vault::Vault>>,
     /// End-to-end encryption on this device (axiond), and how it stands.
-    #[expect(dead_code, reason = "encrypted DMs: M2 step 4")]
-    pub crypto: Option<std::sync::Arc<crate::crypto::Crypto>>,
+    pub crypto: crate::crypto::Shared,
     pub crypto_status: crate::crypto::Status,
     /// Installed plugins (`~/.config/darkmatter/plugins`).
     pub plugins: std::sync::Arc<Plugins>,
@@ -236,10 +235,21 @@ impl Chat {
     /// Sends what's due from the outbox.
     pub fn flush(&mut self) -> Task<Message> {
         let sends = self.outbox.due().into_iter().map(|post| {
-            let client = self.client.clone();
+            let (client, crypto) = (self.client.clone(), self.crypto.clone());
+            let encrypted = self.store.channels.get(&post.channel_id).is_some_and(|c| c.encrypted);
             let id = post.pending_post_id.clone();
             Task::perform(
-                async move { client.create_post(&post).await.map_err(|e| (crate::outbox::problem(&e), crate::outbox::retryable(&e))) },
+                async move {
+                    // In an encrypted channel the server only ever gets ciphertext.
+                    let post = match (encrypted, &crypto) {
+                        (false, _) => post,
+                        (true, Some(c)) => c.encrypt_post(&post).await.map_err(|e| (format!("couldn't encrypt it: {e}"), true))?,
+                        (true, None) => return Err(("this device can't encrypt yet (see Account)".to_string(), false)),
+                    };
+                    let mut sent = client.create_post(&post).await.map_err(|e| (crate::outbox::problem(&e), crate::outbox::retryable(&e)))?;
+                    crate::crypto::open(&crypto, &mut [&mut sent]).await;
+                    Ok(sent)
+                },
                 move |r| Message::Delivered(id.clone(), r),
             )
         });
@@ -319,13 +329,20 @@ impl Chat {
             if let Some(j) = &mut self.pv_mut().jump {
                 j.window_requested = true;
             }
-            let client = self.client.clone();
+            let (client, crypto) = (self.client.clone(), self.crypto.clone());
             return Task::perform(
                 async move {
                     let before = client.posts(&channel, PostsQuery::Before { post_id: root.clone(), per_page: AROUND }, true);
                     let after = client.posts(&channel, PostsQuery::After { post_id: root.clone(), per_page: AROUND }, true);
                     let thread = client.thread(&root);
-                    let r = tokio::try_join!(before, after, thread).map_err(err);
+                    let r = match tokio::try_join!(before, after, thread).map_err(err) {
+                        Ok((b, a, t)) => async {
+                            let open = |l| crate::crypto::open_list(&crypto, Ok(l));
+                            Ok((open(b).await?, open(a).await?, open(t).await?))
+                        }
+                        .await,
+                        Err(e) => Err(e),
+                    };
                     (channel, root, r)
                 },
                 |(channel, root, r)| Message::JumpWindow(channel, root, r),
@@ -358,11 +375,11 @@ impl Chat {
             return Task::none();
         }
         t.loading_newer = true;
-        let client = self.client.clone();
+        let (client, crypto) = (self.client.clone(), self.crypto.clone());
         Task::perform(
             async move {
                 let r = client.posts(&id, PostsQuery::After { post_id: newest, per_page: 60 }, true).await.map_err(err);
-                (id, r)
+                (id, crate::crypto::open_list(&crypto, r).await)
             },
             |(id, r)| Message::Newer(id, r),
         )
@@ -378,11 +395,11 @@ impl Chat {
     }
 
     fn load_thread(&self, root: String) -> Task<Message> {
-        let client = self.client.clone();
+        let (client, crypto) = (self.client.clone(), self.crypto.clone());
         Task::perform(
             async move {
                 let r = client.thread(&root).await.map_err(err);
-                (root, r)
+                (root, crate::crypto::open_list(&crypto, r).await)
             },
             |(root, r)| Message::Thread(root, r),
         )
@@ -1139,11 +1156,11 @@ impl Chat {
     }
 
     fn load_history(&self, id: String) -> Task<Message> {
-        let client = self.client.clone();
+        let (client, crypto) = (self.client.clone(), self.crypto.clone());
         Task::perform(
             async move {
                 let r = client.posts(&id, PostsQuery::Page { page: 0, per_page: 60 }, true).await.map_err(err);
-                (id, r)
+                (id, crate::crypto::open_list(&crypto, r).await)
             },
             |(id, r)| Message::History(id, r),
         )
@@ -1161,12 +1178,12 @@ impl Chat {
         tracing::debug!("loading posts before {oldest} in {id}");
         t.loading_older = true;
         self.pv_mut().hold_top = None;
-        let client = self.client.clone();
+        let (client, crypto) = (self.client.clone(), self.crypto.clone());
         Task::perform(
             async move {
                 let query = PostsQuery::Before { post_id: oldest, per_page: 60 };
                 let r = client.posts(&id, query, true).await.map_err(err);
-                (id, r)
+                (id, crate::crypto::open_list(&crypto, r).await)
             },
             |(id, r)| Message::History(id, r),
         )
@@ -1895,6 +1912,7 @@ impl Chat {
                     file_ids,
                     root_id: root,
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
+                    ..Default::default()
                 };
                 self.outbox.push(post);
                 Task::batch([self.flush(), to_latest(THREAD)])
@@ -2492,6 +2510,32 @@ impl Chat {
                 channels.dedup();
                 let loads = channels.into_iter().map(|c| self.load_history(c));
                 Task::batch([bootstrap(session)].into_iter().chain(loads))
+            }
+            // An encrypted group changed (someone joined, left or updated):
+            // catch up now, so the next message reads without a wait.
+            M::Event(Event::Other(raw)) if raw.event == "mls_commit" || raw.event == "mls_welcome" => {
+                let Some(crypto) = self.crypto.clone() else { return Task::none() };
+                let channel = raw.data["channel_id"].as_str().unwrap_or_default().to_string();
+                let welcome = raw.event == "mls_welcome";
+                Task::future(async move {
+                    let r = if welcome { crypto.on_welcome().await } else { crypto.on_handshake(&channel).await };
+                    if let Err(e) = r {
+                        tracing::warn!("couldn't catch up on {channel}'s encryption: {e}");
+                    }
+                })
+                .discard()
+            }
+            // An encrypted post: read it first, then handle it like any other.
+            M::Event(Event::Posted { mut post, team_id, mentions }) if post.props.get("dm_e2ee").is_some() && post.props.get("dm_open").is_none() => {
+                let crypto = self.crypto.clone();
+                Task::perform(
+                    async move {
+                        crate::crypto::open(&crypto, &mut [&mut post]).await;
+                        post.props["dm_open"] = true.into();
+                        post
+                    },
+                    move |post| Message::Ws(M::Event(Event::Posted { post, team_id: team_id.clone(), mentions: mentions.clone() })),
+                )
             }
             M::Event(Event::Posted { post, mentions, .. }) => {
                 // Ours, arriving before the reply to the send (or instead of it).

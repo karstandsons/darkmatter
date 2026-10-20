@@ -51,5 +51,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 rcgen = "0.14"
 tokio = { workspace = true, features = ["process"] }
 mm-api = { path = "../mm-api" }
+# The client side of encryption, driven against a real axiond.
+dm-client = { path = "../dm-client" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart"] }
 tempfile = "3"

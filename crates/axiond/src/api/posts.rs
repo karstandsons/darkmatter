@@ -26,11 +26,13 @@ pub struct New {
     pub pending_post_id: String,
     /// Uploads to attach, already checked with `files::check_unattached`.
     pub file_ids: Vec<String>,
+    /// For an encrypted post: `dm_e2ee` (and later `dm_mentions`).
+    pub props: Value,
 }
 
 impl New {
     pub fn system(kind: &'static str, message: String) -> Self {
-        New { root_id: String::new(), message, kind, pending_post_id: String::new(), file_ids: Vec::new() }
+        New { root_id: String::new(), message, kind, pending_post_id: String::new(), file_ids: Vec::new(), props: json!({}) }
     }
 }
 
@@ -45,20 +47,74 @@ pub struct Create {
     file_ids: Vec<String>,
     #[serde(default)]
     pending_post_id: String,
+    #[serde(default)]
+    props: Value,
 }
+
+/// What a post in an encrypted channel shows to apps that can't read it.
+pub const ENCRYPTED_PLACEHOLDER: &str = "🔒 Encrypted message";
+
+/// Checks an encrypted post's `dm_e2ee` and keeps only what's meant for the
+/// server (docs/axiond/E2EE.md §6): it must be MLS ciphertext for the
+/// group's current epoch (or one of the few before), with no plaintext
+/// beside it, and not while the server's removals have waited too long.
+async fn encrypted_props(app: &App, channel_id: &str, message: &str, props: &Value) -> Result<Value> {
+    if !message.trim().is_empty() {
+        return Err(Error::bad_request("This conversation is end-to-end encrypted: send from an app that encrypts (Darkmatter)."));
+    }
+    let e2ee = &props["dm_e2ee"];
+    let (Some(1), Some(epoch), Some(ct)) = (e2ee["v"].as_u64(), e2ee["epoch"].as_u64(), e2ee["ct"].as_str()) else {
+        return Err(Error::bad_request("This conversation is end-to-end encrypted: the message must be too."));
+    };
+    if ct.is_empty() || ct.len() > MAX_CIPHERTEXT {
+        return Err(Error::bad_request("That encrypted message is too long."));
+    }
+    let current: Option<i64> = sqlx::query_scalar("SELECT epoch FROM e2ee_groups WHERE channel_id = ?").bind(channel_id).fetch_optional(&app.db).await?;
+    let current = current.ok_or_else(|| Error::bad_request("This conversation's encryption isn't set up yet."))? as u64;
+    if epoch > current || epoch + (dm_crypto::PAST_EPOCHS as u64) <= current {
+        return Err(Error::conflict("The conversation's keys changed: catch up and send again."));
+    }
+    // The server's removals must be committed before anyone sends for long:
+    // after a short grace, a removed device mustn't keep receiving.
+    let last: Option<(String, i64)> = sqlx::query_as("SELECT kind, create_at FROM e2ee_handshakes WHERE channel_id = ? ORDER BY seq DESC LIMIT 1")
+        .bind(channel_id)
+        .fetch_optional(&app.db)
+        .await?;
+    if let Some((kind, at)) = last
+        && kind == "proposal"
+        && ids::now() - at > REMOVAL_GRACE_MS
+    {
+        return Err(Error::conflict("Someone left this conversation: catch up and send again."));
+    }
+    let mut kept = json!({ "dm_e2ee": { "v": 1, "epoch": epoch, "ct": ct } });
+    if let Some(mentions) = props.get("dm_mentions").and_then(Value::as_array) {
+        kept["dm_mentions"] = Value::Array(mentions.iter().filter(|m| m.is_string()).take(100).cloned().collect());
+    }
+    Ok(kept)
+}
+
+/// The largest ciphertext (base64) a post may carry.
+const MAX_CIPHERTEXT: usize = 128 * 1024;
+/// How long the server's removal proposals may wait for a commit before
+/// sending is refused.
+const REMOVAL_GRACE_MS: i64 = 30_000;
 
 pub async fn create(State(app): State<App>, me: Me, Json(body): Json<Create>) -> Result<(StatusCode, Json<Post>)> {
     if app.limiter.take(&format!("post {}", me.user_id), crate::limits::POSTS).is_err() {
         return Err(Error::too_many("You're sending messages too fast. Wait a moment."));
     }
-    let message = body.message.trim_end().to_string();
+    let channel = db::channel(&app.db, &body.channel_id).await?.ok_or_else(|| Error::not_found("Channel"))?;
+    let (message, props) = if channel.encrypted {
+        (ENCRYPTED_PLACEHOLDER.to_string(), encrypted_props(&app, &channel.id, &body.message, &body.props).await?)
+    } else {
+        (body.message.trim_end().to_string(), json!({}))
+    };
     if message.trim().is_empty() && body.file_ids.is_empty() {
         return Err(Error::bad_request("A message can't be empty."));
     }
     if message.chars().count() > MAX_MESSAGE {
         return Err(Error::bad_request(format!("Messages can be at most {MAX_MESSAGE} characters.")));
     }
-    let channel = db::channel(&app.db, &body.channel_id).await?.ok_or_else(|| Error::not_found("Channel"))?;
     if db::member(&app.db, &channel.id, &me.user_id).await?.is_none() {
         return Err(Error::forbidden());
     }
@@ -89,7 +145,7 @@ pub async fn create(State(app): State<App>, me: Me, Json(body): Json<Create>) ->
         }
     }
     super::files::check_unattached(&app, &me.user_id, &channel.id, &body.file_ids).await?;
-    let new = New { root_id: body.root_id, message, kind: "", pending_post_id: body.pending_post_id, file_ids: body.file_ids };
+    let new = New { root_id: body.root_id, message, kind: "", pending_post_id: body.pending_post_id, file_ids: body.file_ids, props };
     Ok((StatusCode::CREATED, Json(insert(&app, &channel, &me.user_id, new).await?)))
 }
 
@@ -97,12 +153,14 @@ pub async fn create(State(app): State<App>, me: Me, Json(body): Json<Create>) ->
 pub async fn insert(app: &App, channel: &ChannelRow, user_id: &str, new: New) -> Result<Post> {
     let (id, now) = (ids::new_id(), ids::now());
     let is_root = new.root_id.is_empty();
+    // Encrypted posts carry only the placeholder, so in DMs (where every
+    // message counts) this still notifies, and elsewhere finds no one.
     let mentioned = if new.kind.is_empty() { mentions(app, channel, user_id, &new.message).await? } else { Vec::new() };
 
     let mut tx = app.db.begin().await?;
     sqlx::query(
-        "INSERT INTO posts (id, channel_id, user_id, root_id, create_at, update_at, message, type, file_ids, pending_post_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO posts (id, channel_id, user_id, root_id, create_at, update_at, message, type, file_ids, pending_post_id, props) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10)",
     )
     .bind(&id)
     .bind(&channel.id)
@@ -113,6 +171,7 @@ pub async fn insert(app: &App, channel: &ChannelRow, user_id: &str, new: New) ->
     .bind(new.kind)
     .bind(serde_json::to_string(&new.file_ids).unwrap_or_else(|_| "[]".into()))
     .bind(&new.pending_post_id)
+    .bind(new.props.to_string())
     .execute(&mut *tx)
     .await?;
     for file in &new.file_ids {
@@ -272,6 +331,9 @@ pub async fn edit(State(app): State<App>, me: Me, Path(id): Path<String>, Json(b
     let post = db::post(&app.db, &id).await?.filter(|p| p.delete_at == 0).ok_or_else(|| Error::not_found("Message"))?;
     if post.user_id != me.user_id || post.is_system() {
         return Err(Error::forbidden());
+    }
+    if post.props.get("dm_e2ee").is_some() {
+        return Err(Error::bad_request("Editing encrypted messages isn't possible yet."));
     }
     let Some(message) = body.message.map(|m| m.trim_end().to_string()) else { return Ok(Json(post)) };
     if message.trim().is_empty() || message.chars().count() > MAX_MESSAGE {

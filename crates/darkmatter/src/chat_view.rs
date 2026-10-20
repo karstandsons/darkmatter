@@ -339,6 +339,13 @@ impl Chat {
         let mut header = row![text(self.store.channel_label(channel)).size(17).font(bold()).color(c.fg_bright)]
             .spacing(12)
             .align_y(iced::Center);
+        if channel.encrypted {
+            header = header.push(tooltip(
+                text("🔒").size(13),
+                container(text("End-to-end encrypted: only the people here can read it").size(11)).padding([2, 6]).style(c.panel(c.surface)),
+                tooltip::Position::Bottom,
+            ));
+        }
         // The title bar hides a title that doesn't fit beside the controls,
         // so keep the topic short.
         let topic = if channel.header.is_empty() { &channel.purpose } else { &channel.header };

@@ -181,6 +181,7 @@ impl From<ChannelRow> for Channel {
             total_msg_count: r.total_msg_count,
             total_msg_count_root: r.total_msg_count_root,
             creator_id: r.creator_id,
+            encrypted: r.encrypted,
         }
     }
 }
@@ -236,12 +237,13 @@ pub struct PostRow {
     pub props: String,
     pub file_ids: String,
     pub is_pinned: bool,
+    pub pending_post_id: String,
     pub reply_count: i64,
 }
 
 /// Columns of `posts p`, with the size of the thread each post is in.
 pub const POST_COLUMNS: &str = "p.id, p.channel_id, p.user_id, p.root_id, p.create_at, p.update_at, p.edit_at, \
-     p.delete_at, p.message, p.type, p.props, p.file_ids, p.is_pinned, \
+     p.delete_at, p.message, p.type, p.props, p.file_ids, p.is_pinned, p.pending_post_id, \
      (SELECT COUNT(*) FROM posts r WHERE r.delete_at = 0 \
         AND r.root_id = CASE p.root_id WHEN '' THEN p.id ELSE p.root_id END) AS reply_count";
 
@@ -262,6 +264,8 @@ impl From<PostRow> for Post {
             props: serde_json::from_str(&r.props).unwrap_or_else(|_| serde_json::json!({})),
             file_ids: serde_json::from_str(&r.file_ids).unwrap_or_default(),
             reply_count: r.reply_count,
+            // Encrypted posts are bound to it (E2EE.md §6), so readers need it.
+            pending_post_id: r.pending_post_id,
             ..Default::default()
         }
     }

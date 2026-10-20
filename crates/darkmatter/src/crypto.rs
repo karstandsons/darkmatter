@@ -1,29 +1,21 @@
 //! This device's end-to-end encryption on axiond (docs/axiond/E2EE.md).
 //!
-//! The MLS work is in `dm-crypto`. Here: setting the device up with the
-//! server (identity key, device certificate, key packages), and keeping
-//! openmls's state saved in the account's vault after every change.
+//! The work is in `dm-client` (over `dm-crypto`). Here: the account's
+//! vault as its store, and turning encrypted posts into what's shown.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as B64;
-use dm_crypto::device::ServerKey;
-use dm_crypto::{Device, IdentityKey, UserIdentity};
+use dm_client::{Decrypted, E2ee, LocalStore, Setup};
+use dm_crypto::IdentityKey;
+use dm_crypto::wire::Content;
 use mm_api::Client;
-use mm_api::models::AxiondInfo;
-use openmls_memory_storage::MemoryStorage;
+use mm_api::models::{AxiondInfo, Post, PostList};
 
-use crate::vault::{Vault, Writer};
+use crate::vault::Vault;
 
-/// One-time key packages uploaded when a device is set up.
-const KEY_PACKAGES: usize = 20;
-
-/// What the vault keys these under.
-const IDENTITY: &str = "identity.secret";
-const DEVICE_ID: &str = "device.id";
-const DEVICE_KEY: &str = "device.signature_key";
+pub type Crypto = E2ee<VaultStore>;
+pub type Shared = Option<Arc<Crypto>>;
 
 /// Where encryption stands on this device, for the Account window.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,32 +31,47 @@ pub enum Status {
     Failed(String),
 }
 
-pub struct Crypto {
-    pub device: Device<MemoryStorage>,
-    #[expect(dead_code, reason = "joining groups needs it: M2 step 4")]
-    pub server: ServerKey,
-    pub identity: IdentityKey,
-    vault: Writer,
-    /// openmls's state as last written to the vault.
-    saved: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
-}
+/// The account's vault, as `dm-client`'s store.
+#[derive(Clone)]
+pub struct VaultStore(pub Arc<Vault>);
 
-impl std::fmt::Debug for Crypto {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Crypto").field("device", &self.device.device_id).finish_non_exhaustive()
+impl LocalStore for VaultStore {
+    async fn get(&self, key: &str) -> Option<Vec<u8>> {
+        self.0.get(key).await
     }
-}
 
-impl Crypto {
-    /// Writes to the vault whatever openmls changed since the last time.
-    /// Called after every operation on the device.
-    pub fn persist(&self) {
-        let now = self.device.storage().values.read().unwrap().clone();
-        let mut saved = self.saved.lock().unwrap();
-        let put: Vec<(Vec<u8>, Vec<u8>)> = now.iter().filter(|(k, v)| saved.get(*k) != Some(*v)).map(|(k, v)| (k.clone(), v.clone())).collect();
-        let delete: Vec<Vec<u8>> = saved.keys().filter(|k| !now.contains_key(*k)).cloned().collect();
-        self.vault.mls(put, delete);
-        *saved = now;
+    fn set(&self, key: &str, value: Vec<u8>) {
+        self.0.writer().set(key, value);
+    }
+
+    async fn mls(&self) -> HashMap<Vec<u8>, Vec<u8>> {
+        self.0.mls().await
+    }
+
+    fn save_mls(&self, put: Vec<(Vec<u8>, Vec<u8>)>, delete: Vec<Vec<u8>>) {
+        self.0.writer().mls(put, delete);
+    }
+
+    async fn clear_device(&self) {
+        if let Err(e) = self.0.clear_device().await {
+            tracing::error!("couldn't clear the old device's state: {e}");
+        }
+    }
+
+    async fn identity(&self, user_id: &str) -> Option<String> {
+        self.0.identity(user_id).await.map(|(key, _)| key)
+    }
+
+    fn remember_identity(&self, user_id: &str, key: &str) {
+        self.0.writer().remember_identity(user_id, key);
+    }
+
+    async fn text(&self, key: &str) -> Option<String> {
+        self.0.text(key).await
+    }
+
+    fn save_text(&self, key: &str, channel_id: &str, json: &str) {
+        self.0.writer().text(key, channel_id, json);
     }
 }
 
@@ -76,11 +83,11 @@ pub fn fingerprint(key: &IdentityKey) -> String {
 
 /// Sets this device up for encryption, or picks up where it was. On plain
 /// Mattermost, or when axiond has it off, there's nothing to do.
-pub async fn setup(client: &Client, user_id: &str, vault: &Vault, info: Option<&AxiondInfo>) -> (Status, Option<Arc<Crypto>>) {
+pub async fn setup(client: &Client, user_id: &str, vault: &Arc<Vault>, info: Option<&AxiondInfo>) -> (Status, Shared) {
     let Some(info) = info.filter(|i| i.enabled) else { return (Status::Off, None) };
-    match try_setup(client, user_id, vault, info).await {
-        Ok(Some(crypto)) => (Status::Ready { fingerprint: fingerprint(&crypto.identity) }, Some(Arc::new(crypto))),
-        Ok(None) => (Status::NeedsLink, None),
+    match dm_client::setup(client.clone(), user_id, VaultStore(vault.clone()), info).await {
+        Ok(Setup::Ready(e2ee)) => (Status::Ready { fingerprint: fingerprint(&e2ee.identity) }, Some(Arc::new(*e2ee))),
+        Ok(Setup::NeedsLink) => (Status::NeedsLink, None),
         Err(e) => {
             tracing::warn!("encryption isn't set up: {e}");
             (Status::Failed(e), None)
@@ -88,63 +95,35 @@ pub async fn setup(client: &Client, user_id: &str, vault: &Vault, info: Option<&
     }
 }
 
-async fn try_setup(client: &Client, user_id: &str, vault: &Vault, info: &AxiondInfo) -> Result<Option<Crypto>, String> {
-    let server = ServerKey { signature_key: B64.decode(&info.external_sender).map_err(|_| "the server's key isn't valid")? };
-    let device_id = client.my_device().await.map_err(|e| e.to_string())?;
-    let on_server = client.identity(user_id).await.map_err(|e| e.to_string())?;
-    let server_identity = B64.decode(&on_server.identity_key).ok().and_then(|k| IdentityKey::from_slice(&k).ok());
-
-    // The identity key: ours from before, or a new one on the account's
-    // first device. If the account has one we don't hold, this device must
-    // be linked from one that does.
-    let identity = match vault.get(IDENTITY).await.and_then(|s| <[u8; 32]>::try_from(s.as_slice()).ok()) {
-        Some(secret) => UserIdentity::from_secret(&secret),
-        None if server_identity.is_some() => return Ok(None),
-        None => {
-            let id = UserIdentity::generate();
-            vault.writer().set(IDENTITY, id.secret().to_vec());
-            id
+/// Puts each encrypted post's text in place of the server's placeholder, or
+/// says why it can't be read here. Plain posts are left alone.
+pub async fn open(crypto: &Shared, posts: &mut [&mut Post]) {
+    posts.sort_by_key(|p| p.create_at);
+    for post in posts.iter_mut() {
+        if post.props.get("dm_e2ee").is_none() || post.delete_at > 0 {
+            continue;
         }
-    };
-    let public = identity.public();
-    match server_identity {
-        Some(k) if k != public => return Err("the server has a different identity key for you than this device".into()),
-        Some(_) => {}
-        None => client.put_identity(&B64.encode(public.0)).await.map_err(|e| e.to_string())?,
+        let shown = match crypto {
+            None => Decrypted::Unreadable("encryption isn't set up on this device".into()),
+            Some(c) => c.decrypt_post(post).await,
+        };
+        post.message = match shown {
+            Decrypted::Plain => continue,
+            Decrypted::Text(Content::Post { message, .. }) => message,
+            Decrypted::Text(_) => "🔒 *Not a message this app shows yet.*".into(),
+            Decrypted::Unreadable(why) => format!("🔒 *This message can't be read here: {why}.*"),
+        };
     }
+}
 
-    // The same device as last time: carry on with its state.
-    let known = vault.get(DEVICE_ID).await.and_then(|d| String::from_utf8(d).ok());
-    let key = vault.get(DEVICE_KEY).await;
-    if let (Some(known), Some(key)) = (known, key)
-        && known == device_id
-    {
-        let saved = vault.mls().await;
-        let storage = MemoryStorage::default();
-        *storage.values.write().unwrap() = saved.clone();
-        let device = Device::open(user_id, &device_id, &key, storage).map_err(|e| e.to_string())?;
-        tracing::info!("encryption ready on this device ({device_id})");
-        return Ok(Some(Crypto { device, server, identity: public, vault: vault.writer(), saved: Mutex::new(saved) }));
+/// [`open`] for a page of posts as fetched.
+pub async fn open_list(crypto: &Shared, list: Result<PostList, String>) -> Result<PostList, String> {
+    let mut list = list?;
+    let mut posts: Vec<&mut Post> = list.posts.values_mut().filter(|p| p.props.get("dm_e2ee").is_some()).collect();
+    if !posts.is_empty() {
+        open(crypto, &mut posts).await;
     }
-
-    // A new device (a new sign-in): the old one's state is gone with its
-    // session, on the server and here.
-    vault.clear_device().await.map_err(|e| e.to_string())?;
-    let device = Device::create(user_id, &device_id, MemoryStorage::default()).map_err(|e| e.to_string())?;
-    let cert = identity.certify(user_id, &device_id, device.signature_key(), chrono::Utc::now().timestamp_millis());
-    client.publish_device(&serde_json::to_value(&cert).map_err(|e| e.to_string())?).await.map_err(|e| e.to_string())?;
-    let mut packages = Vec::with_capacity(KEY_PACKAGES + 1);
-    for i in 0..=KEY_PACKAGES {
-        packages.push(B64.encode(device.key_package(i == KEY_PACKAGES).map_err(|e| e.to_string())?));
-    }
-    client.upload_key_packages(&packages).await.map_err(|e| e.to_string())?;
-    let writer = vault.writer();
-    writer.set(DEVICE_ID, device_id.as_bytes().to_vec());
-    writer.set(DEVICE_KEY, device.signature_key().to_vec());
-    let crypto = Crypto { device, server, identity: public, vault: writer, saved: Mutex::new(HashMap::new()) };
-    crypto.persist();
-    tracing::info!("encryption set up for this device ({device_id})");
-    Ok(Some(crypto))
+    Ok(list)
 }
 
 #[cfg(test)]
@@ -159,27 +138,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_survives_a_restart_through_the_vault() {
+    async fn the_vault_is_a_store() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v.db");
-        let key = [3u8; 32];
-        let server = ServerKey { signature_key: vec![1; 32] };
-        let sig;
-        {
-            let vault = Vault::open(&path, &key).await.unwrap();
-            let device = Device::create("u", "d", MemoryStorage::default()).unwrap();
-            sig = device.signature_key().to_vec();
-            let crypto = Crypto { device, server: server.clone(), identity: IdentityKey([0; 32]), vault: vault.writer(), saved: Mutex::default() };
-            crypto.persist();
-            crypto.device.create_group("c1", &server).unwrap();
-            crypto.persist();
-            vault.writer().flush().await;
-        }
-        let vault = Vault::open(&path, &key).await.unwrap();
-        let storage = MemoryStorage::default();
-        *storage.values.write().unwrap() = vault.mls().await;
-        let device = Device::open("u", "d", &sig, storage).unwrap();
-        assert!(device.has_group("c1"), "the group came back from the vault");
-        assert_eq!(device.epoch("c1").unwrap(), 0);
+        let vault = Arc::new(Vault::open(&dir.path().join("v.db"), &[3u8; 32]).await.unwrap());
+        let store = VaultStore(vault.clone());
+        store.set("seq.c1", b"7".to_vec());
+        store.save_mls(vec![(b"k".to_vec(), b"v".to_vec())], vec![]);
+        store.remember_identity("bob", "KEY");
+        store.save_text("p1", "c1", r#"{"t":"post","message":"hi"}"#);
+        vault.writer().flush().await;
+        assert_eq!(store.get("seq.c1").await.unwrap(), b"7");
+        assert_eq!(store.identity("bob").await.as_deref(), Some("KEY"));
+        assert_eq!(store.text("p1").await.as_deref(), Some(r#"{"t":"post","message":"hi"}"#));
+        store.clear_device().await;
+        assert!(store.get("seq.c1").await.is_none() && store.mls().await.is_empty());
+        assert!(store.text("p1").await.is_some(), "messages already read stay readable");
+    }
+
+    #[tokio::test]
+    async fn without_encryption_posts_say_so() {
+        let mut post = Post { props: serde_json::json!({ "dm_e2ee": { "v": 1, "epoch": 0, "ct": "" } }), message: "🔒 Encrypted message".into(), ..Default::default() };
+        let mut plain = Post { message: "hello".into(), ..Default::default() };
+        open(&None, &mut [&mut post, &mut plain]).await;
+        assert!(post.message.contains("isn't set up on this device"));
+        assert_eq!(plain.message, "hello");
     }
 }

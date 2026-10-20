@@ -142,6 +142,16 @@ impl<S: StorageProvider<CURRENT_VERSION>> Device<S> {
             .ok_or_else(|| Error::NoGroup(channel_id.into()))
     }
 
+    /// Drops this device's copy of a group it's no longer in (removed, or
+    /// too far behind to catch up), so it can join again afresh.
+    pub fn forget(&self, channel_id: &str) -> Result<()> {
+        match self.load(channel_id) {
+            Ok(mut group) => group.delete(self.provider.storage()).map_err(|e| Error::Storage(format!("{e:?}"))),
+            Err(Error::NoGroup(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn has_group(&self, channel_id: &str) -> bool {
         self.load(channel_id).is_ok()
     }

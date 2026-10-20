@@ -142,7 +142,8 @@ impl Outbox {
 /// having trouble, as opposed to the server refusing the message.
 pub fn retryable(e: &mm_api::Error) -> bool {
     match e {
-        mm_api::Error::Api(api) => matches!(api.status_code, 0 | 408 | 429 | 500..=599),
+        // 409: an encrypted conversation's keys moved on meanwhile.
+        mm_api::Error::Api(api) => matches!(api.status_code, 0 | 408 | 409 | 429 | 500..=599),
         mm_api::Error::Http(_) => true,
         _ => false,
     }

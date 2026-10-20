@@ -41,8 +41,8 @@ enum Write {
     Set(String, Vec<u8>),
     Outbox(Vec<Queued>),
     Mls { put: Vec<(Vec<u8>, Vec<u8>)>, delete: Vec<Vec<u8>> },
-    #[cfg_attr(not(test), expect(dead_code, reason = "trust on first use: M2 step 4"))]
     Identity { user_id: String, key: String },
+    Text { key: String, channel_id: String, content: String },
     Flush(oneshot::Sender<()>),
 }
 
@@ -63,9 +63,13 @@ impl Writer {
     }
 
     /// Remembers someone's identity key, if we hadn't seen one for them.
-    #[cfg_attr(not(test), expect(dead_code, reason = "trust on first use: M2 step 4"))]
     pub fn remember_identity(&self, user_id: &str, key: &str) {
         let _ = self.0.send(Write::Identity { user_id: user_id.into(), key: key.into() });
+    }
+
+    /// Keeps a decrypted message's content.
+    pub fn text(&self, key: &str, channel_id: &str, content: &str) {
+        let _ = self.0.send(Write::Text { key: key.into(), channel_id: channel_id.into(), content: content.into() });
     }
 
     /// Waits until everything queued so far is written.
@@ -205,16 +209,20 @@ impl Vault {
     }
 
     /// The identity key first seen for someone, and whether you verified it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "trust on first use: M2 step 4"))]
     pub async fn identity(&self, user_id: &str) -> Option<(String, bool)> {
         sqlx::query_as("SELECT identity_key, verified FROM identities WHERE user_id = ?").bind(user_id).fetch_optional(&self.pool).await.ok().flatten()
+    }
+
+    /// A decrypted message's content.
+    pub async fn text(&self, key: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT content FROM texts WHERE k = ?").bind(key).fetch_optional(&self.pool).await.ok().flatten()
     }
 
     /// Forgets this device's encryption state (it's gone from the server).
     pub async fn clear_device(&self) -> sqlx::Result<()> {
         self.writer.flush().await;
         sqlx::query("DELETE FROM mls").execute(&self.pool).await?;
-        sqlx::query("DELETE FROM kv WHERE k LIKE 'device.%'").execute(&self.pool).await?;
+        sqlx::query("DELETE FROM kv WHERE k LIKE 'device.%' OR k LIKE 'seq.%'").execute(&self.pool).await?;
         Ok(())
     }
 }
@@ -260,6 +268,15 @@ async fn apply(pool: &SqlitePool, write: Write) -> sqlx::Result<()> {
             sqlx::query("INSERT OR IGNORE INTO identities (user_id, identity_key, first_seen) VALUES (?, ?, ?)")
                 .bind(user_id)
                 .bind(key)
+                .bind(chrono::Utc::now().timestamp_millis())
+                .execute(pool)
+                .await?;
+        }
+        Write::Text { key, channel_id, content } => {
+            sqlx::query("INSERT INTO texts (k, channel_id, content, create_at) VALUES (?, ?, ?, ?) ON CONFLICT (k) DO UPDATE SET content = excluded.content")
+                .bind(key)
+                .bind(channel_id)
+                .bind(content)
                 .bind(chrono::Utc::now().timestamp_millis())
                 .execute(pool)
                 .await?;

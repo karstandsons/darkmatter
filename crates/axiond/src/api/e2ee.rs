@@ -318,7 +318,7 @@ pub async fn post_handshake(State(app): State<App>, me: Me, Path(channel_id): Pa
             Err(Refusal::Stale { current }) => return Err(Error::conflict(format!("The group is at epoch {current} now: fetch the handshakes you missed and try again."))),
             Err(Refusal::Invalid(e)) => return Err(refused(e)),
         };
-        if !applied.added.is_empty() && welcome.is_none() {
+        if !applied.added.is_empty() && !applied.external && welcome.is_none() {
             return Err(Error::bad_request("A commit that adds devices needs its Welcome."));
         }
         e2ee::save(&mut tx, &channel_id, server.storage(), &own).await?;

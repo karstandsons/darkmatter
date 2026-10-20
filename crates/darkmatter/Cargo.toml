@@ -48,7 +48,7 @@ qrcode = { version = "0.14", default-features = false }
 # workspace) with SQLCipher underneath. SQLCipher uses the system's
 # libcrypto on Linux and CommonCrypto on macOS.
 dm-crypto = { path = "../dm-crypto" }
-openmls_memory_storage = "0.6"
+dm-client = { path = "../dm-client" }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 libsqlite3-sys = { version = "0.30", features = ["bundled-sqlcipher"] }
 base64 = "0.22"
