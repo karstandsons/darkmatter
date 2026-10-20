@@ -278,15 +278,22 @@ async fn ping(config: &Config) -> anyhow::Result<()> {
             return ask(stream, "localhost").await;
         };
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        // Our own certificate files are trusted as given (they may be self-signed).
-        if let axiond::config::Tls::Files(cert, _) = &tls {
-            use rustls_pki_types::pem::PemObject;
-            for c in rustls_pki_types::CertificateDer::pem_file_iter(cert)? {
-                roots.add(c?)?;
+        let client = match &tls {
+            // Our own certificate file: the server must present exactly it
+            // (it may well be self-signed).
+            axiond::config::Tls::Files(cert, _) => {
+                use rustls_pki_types::pem::PemObject;
+                let expected = rustls_pki_types::CertificateDer::from_pem_file(cert)?;
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(std::sync::Arc::new(Pinned(expected.into_owned())))
+                    .with_no_client_auth()
             }
-        }
-        let client = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+            _ => {
+                let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+                rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()
+            }
+        };
         let name = rustls_pki_types::ServerName::try_from(host.clone())?;
         let stream = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client)).connect(name, stream).await?;
         ask(stream, &host).await
@@ -314,4 +321,47 @@ fn new_password(username: &str) -> anyhow::Result<String> {
         bail!("the passwords didn't match");
     }
     Ok(first)
+}
+
+/// Accepts only one exact certificate, with valid handshake signatures.
+#[derive(Debug)]
+struct Pinned(rustls_pki_types::CertificateDer<'static>);
+
+impl rustls::client::danger::ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _name: &rustls_pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.0.as_ref() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("the server's certificate isn't the one in tls_cert".into()))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+    }
 }

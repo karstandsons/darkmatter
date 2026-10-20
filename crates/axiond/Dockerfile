@@ -3,7 +3,7 @@
 #   docker run -d --name axiond -p 127.0.0.1:8065:8065 -v axiond:/data \
 #     -e AXIOND_BEHIND_PROXY=true axiond
 #   docker exec -it axiond axiond setup --admin you --email you@example.com --team home
-# axiond doesn't do TLS yet: put Caddy or another TLS proxy in front.
+# For a server on the internet, use deploy/axiond (HTTPS built in).
 
 FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev

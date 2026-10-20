@@ -1,0 +1,34 @@
+# axiond on a VPS: one container that serves HTTPS itself, with a
+# Let's Encrypt certificate it gets and renews on its own.
+#
+#   cp .env.example .env && $EDITOR .env
+#   sudo install -d -o 65532 -g 65532 -m 0700 data
+#   docker compose up -d --build
+#   docker compose exec axiond axiond setup --admin you --email you@example.com --team home
+#
+# See README.md for the whole checklist.
+
+services:
+  axiond:
+    build:
+      context: ../..
+      dockerfile: crates/axiond/Dockerfile
+    image: axiond:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      AXIOND_LISTEN: 0.0.0.0:443
+      AXIOND_DATA_DIR: /data
+    ports:
+      - "443:443/tcp"
+      # Calls (M3) will use one UDP port:
+      # - "443:443/udp"
+    volumes:
+      - ./data:/data
+    # Nothing but /data is writable, and the process can't gain privileges.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }

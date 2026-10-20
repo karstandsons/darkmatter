@@ -129,6 +129,10 @@ new) data folder. It never writes over an existing database.
 
 ## Docker
 
+For a real server, use the deploy kit in [deploy/axiond](../../deploy/axiond):
+Docker Compose with HTTPS built in, a hardening checklist, and encrypted
+backups off the server.
+
 The image is built from the repository root. It holds one static binary, runs
 as a non-root user, and keeps its data in the `/data` volume.
 
