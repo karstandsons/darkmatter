@@ -3,7 +3,6 @@
 //! in an encrypted message.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, RwLock};
 
 use dm_crypto::wire::FileKey;
 
@@ -61,19 +60,21 @@ impl Cache {
     }
 
     /// Start fetching every key not seen before.
-    pub fn fetch(&mut self, client: &Client, keys: impl IntoIterator<Item = Key>) -> Task<Message> {
+    /// Encrypted files are decrypted with the keys `crypto` has from the
+    /// messages it read.
+    pub fn fetch(&mut self, client: &Client, crypto: &Shared, keys: impl IntoIterator<Item = Key>) -> Task<Message> {
         let mut tasks = Vec::new();
         for key in keys {
             if self.items.contains_key(&key) {
                 continue;
             }
             self.items.insert(key.clone(), Media::Loading);
-            let client = client.clone();
+            let (client, crypto) = (client.clone(), crypto.clone());
             if let Key::Gif(id) = &key {
                 let id = id.clone();
                 tasks.push(Task::perform(
                     async move {
-                        let bytes = download(&client, &id).await;
+                        let bytes = download(&client, &crypto, &id).await;
                         // Decoding every frame takes a moment: not on the UI thread.
                         let frames = match bytes {
                             Ok(b) => tokio::task::spawn_blocking(move || crate::animated::Frames::decode(&b)).await.map_err(|e| e.to_string()).and_then(|r| r),
@@ -90,8 +91,8 @@ impl Cache {
                     async move {
                         let bytes = match &key {
                             Key::Avatar(id, _) => client.profile_image(id).await.map_err(|e| e.to_string()),
-                            Key::Preview(id) => preview(&client, id).await,
-                            Key::Full(id) => download(&client, id).await,
+                            Key::Preview(id) => preview(&client, &crypto, id).await,
+                            Key::Full(id) => download(&client, &crypto, id).await,
                             Key::Emoji(id) => client.emoji_image(id).await.map_err(|e| e.to_string()),
                             Key::Gif(_) => unreachable!("fetched above"),
                         };
@@ -196,7 +197,6 @@ pub async fn upload(client: Client, channel_id: String, path: std::path::PathBuf
     if encrypted {
         let file = tokio::task::spawn_blocking(move || outgoing(name, bytes)).await.map_err(|e| e.to_string())?;
         let key = dm_client::files::upload(&client, &channel_id, file).await?;
-        remember(&key);
         return Ok(Uploaded { id: key.id.clone(), e2ee: Some(key) });
     }
     let result = client.upload_file(&channel_id, &name, bytes).await.map_err(|e| e.to_string())?;
@@ -255,34 +255,24 @@ fn mime_for(name: &str) -> &'static str {
     }
 }
 
-/// The keys of encrypted files seen in decrypted messages, by file id.
-static KEYS: LazyLock<RwLock<HashMap<String, FileKey>>> = LazyLock::new(Default::default);
+type Shared = crate::crypto::Shared;
 
-/// Remembers how to read an encrypted file.
-pub fn remember(key: &FileKey) {
-    KEYS.write().unwrap_or_else(|e| e.into_inner()).insert(key.id.clone(), key.clone());
-}
-
-fn key_of(id: &str) -> Option<FileKey> {
-    KEYS.read().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
-}
-
-/// Forgets every file key (signed out).
-pub fn forget_keys() {
-    KEYS.write().unwrap_or_else(|e| e.into_inner()).clear();
+/// An encrypted file's key, from the messages this account has read.
+fn key_of(crypto: &Shared, id: &str) -> Option<FileKey> {
+    crypto.as_ref()?.file_key(id)
 }
 
 /// An attachment's bytes, decrypted if it's an encrypted one.
-pub async fn download(client: &Client, id: &str) -> Result<Vec<u8>, String> {
-    match key_of(id) {
+pub async fn download(client: &Client, crypto: &Shared, id: &str) -> Result<Vec<u8>, String> {
+    match key_of(crypto, id) {
         Some(key) => dm_client::files::download(client, &key).await,
         None => client.file(id).await.map_err(|e| e.to_string()),
     }
 }
 
 /// A picture's preview: the server's, or the sender's encrypted thumbnail.
-async fn preview(client: &Client, id: &str) -> Result<Vec<u8>, String> {
-    match key_of(id) {
+async fn preview(client: &Client, crypto: &Shared, id: &str) -> Result<Vec<u8>, String> {
+    match key_of(crypto, id) {
         Some(key) => match &key.thumb {
             Some(thumb) => dm_client::files::download(client, thumb).await,
             None => dm_client::files::download(client, &key).await,
@@ -312,7 +302,7 @@ pub fn file_info(key: &FileKey, post: &mm_api::models::Post) -> mm_api::models::
 }
 
 /// Download an attachment into the cache dir and open it with the system's default app.
-pub async fn open_file(client: Client, file_id: String, name: String) -> Result<(), String> {
+pub async fn open_file(client: Client, crypto: Shared, file_id: String, name: String) -> Result<(), String> {
     // Only the final path component, so a crafted name can't escape the directory.
     let name = std::path::Path::new(&name)
         .file_name()
@@ -322,7 +312,7 @@ pub async fn open_file(client: Client, file_id: String, name: String) -> Result<
     let dir = dirs::cache_dir().ok_or("no cache dir")?.join("darkmatter/files").join(&file_id);
     let path = dir.join(name);
     if !path.exists() {
-        let bytes = download(&client, &file_id).await?;
+        let bytes = download(&client, &crypto, &file_id).await?;
         tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
         // Another app has to open it, so a decrypted file is written out
         // here, readable only by you.

@@ -3,7 +3,7 @@
 pub(crate) mod accounts;
 pub(crate) mod channels;
 mod commands;
-mod e2ee;
+pub(crate) mod e2ee;
 pub(crate) mod images;
 pub(crate) mod files;
 mod posts;
@@ -58,6 +58,7 @@ pub fn router(app: App) -> Router {
         .route("/e2ee/key_packages/claim", post(e2ee::claim_key_packages))
         .route("/e2ee/channels/{id}/group", post(e2ee::create_group).get(e2ee::group_state))
         .route("/e2ee/channels/{id}/handshake", post(e2ee::post_handshake).get(e2ee::handshakes))
+        .route("/e2ee/channels/{id}/events", post(e2ee::post_event))
         .route("/e2ee/welcomes", get(e2ee::welcomes))
         .route("/e2ee/welcomes/{id}", delete(e2ee::ack_welcome))
         .route("/users/ids", post(users::by_ids))

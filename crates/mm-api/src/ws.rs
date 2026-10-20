@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as Frame;
 use url::Url;
 
-use crate::models::{Post, Reaction, UserThread};
+use crate::models::{E2eeEvent, Post, Reaction, UserThread};
 use crate::{Client, Error};
 
 /// No frame (the server pings every ~30s) for this long means the link is dead.
@@ -54,6 +54,8 @@ pub enum Event {
     ThreadUpdated(Box<UserThread>),
     ThreadReadChanged { thread_id: String, unread_replies: i64, unread_mentions: i64 },
     ThreadFollowChanged { thread_id: String, following: bool },
+    /// axiond: an encrypted event (a reaction) on a post.
+    E2ee(Box<E2eeEvent>),
     /// Any event without a typed variant yet.
     Other(RawEvent),
 }
@@ -113,6 +115,7 @@ impl RawEvent {
             }),
             "status_change" => Some(Event::StatusChange { user_id: self.str("user_id"), status: self.str("status") }),
             "reaction_added" => self.nested("reaction").map(Event::ReactionAdded),
+            "e2ee_event" => self.nested("event").map(Event::E2ee),
             "reaction_removed" => self.nested("reaction").map(Event::ReactionRemoved),
             "channel_viewed" => Some(Event::ChannelViewed { channel_id: self.str("channel_id") }),
             "thread_updated" => self.nested("thread").map(Event::ThreadUpdated),

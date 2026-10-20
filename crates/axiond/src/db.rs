@@ -309,7 +309,7 @@ pub async fn post(db: &Db, id: &str) -> sqlx::Result<Option<Post>> {
 }
 
 /// Fills in `metadata.reactions` and `metadata.files`, oldest first, as
-/// Mattermost sends them.
+/// Mattermost sends them, and `metadata.e2ee_events` (axiond's own).
 pub async fn with_metadata(db: &Db, posts: &mut [Post]) -> sqlx::Result<()> {
     if posts.is_empty() {
         return Ok(());
@@ -318,6 +318,11 @@ pub async fn with_metadata(db: &Db, posts: &mut [Post]) -> sqlx::Result<()> {
     for file in crate::api::files::of_posts(db, &ids).await? {
         if let Some(post) = posts.iter_mut().find(|p| p.id == file.post_id) {
             post.metadata.files.push(file);
+        }
+    }
+    for event in crate::api::e2ee::events_of(db, &ids).await? {
+        if let Some(post) = posts.iter_mut().find(|p| p.id == event.post_id) {
+            post.metadata.e2ee_events.push(event);
         }
     }
     let rows: Vec<(String, String, String, i64)> = sqlx::query_as(

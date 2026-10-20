@@ -31,6 +31,11 @@ async fn reactable(app: &App, me: &Me, post_id: &str) -> Result<Post> {
     if db::member(&app.db, &post.channel_id, &me.user_id).await?.is_none() {
         return Err(Error::forbidden());
     }
+    // Which emoji is part of what's encrypted: reactions there are
+    // encrypted events (E2EE.md §8).
+    if db::channel(&app.db, &post.channel_id).await?.is_some_and(|c| c.encrypted) {
+        return Err(Error::bad_request("This conversation is end-to-end encrypted: react from an app that encrypts (Darkmatter)."));
+    }
     Ok(post)
 }
 

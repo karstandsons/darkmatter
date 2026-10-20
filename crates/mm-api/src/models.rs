@@ -234,6 +234,34 @@ pub struct PostMetadata {
     pub images: HashMap<String, Value>,
     #[serde(deserialize_with = "nullable")]
     pub reactions: Vec<Reaction>,
+    /// axiond: the post's encrypted events (reactions in encrypted
+    /// channels), oldest first.
+    #[serde(deserialize_with = "nullable", skip_serializing_if = "Vec::is_empty")]
+    pub e2ee_events: Vec<E2eeEvent>,
+}
+
+/// An encrypted event on a post (axiond): who sent it, where, and its MLS
+/// ciphertext (`{v, epoch, ct}`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct E2eeEvent {
+    pub id: Id,
+    pub channel_id: Id,
+    pub post_id: Id,
+    pub user_id: Id,
+    /// The sender's own id for it, which its authenticated data names.
+    pub client_id: String,
+    pub create_at: Millis,
+    pub dm_e2ee: Value,
+}
+
+/// `POST e2ee/channels/{id}/events`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct NewE2eeEvent {
+    pub post_id: Id,
+    pub client_id: String,
+    pub dm_e2ee: Value,
 }
 
 /// `GET /channels/{id}/posts` result: posts keyed by id plus newest-first `order`.

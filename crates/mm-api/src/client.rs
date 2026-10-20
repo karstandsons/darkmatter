@@ -286,6 +286,17 @@ impl Client {
         decode("files", check(req.send().await?).await?).await
     }
 
+    /// axiond: sends an encrypted event (a reaction) on a post.
+    pub async fn post_e2ee_event(&self, channel_id: &str, event: &NewE2eeEvent) -> Result<E2eeEvent, Error> {
+        self.send(Method::POST, &format!("e2ee/channels/{channel_id}/events"), Some(event)).await
+    }
+
+    /// axiond: replaces an encrypted post's edit (`props.dm_edit`).
+    pub async fn edit_encrypted(&self, post_id: &str, dm_edit: &serde_json::Value) -> Result<Post, Error> {
+        let body = json!({ "props": { "dm_edit": dm_edit } });
+        self.send(Method::PUT, &format!("posts/{post_id}/patch"), Some(&body)).await
+    }
+
     pub async fn file_info(&self, file_id: &str) -> Result<FileInfo, Error> {
         self.get(&format!("files/{file_id}/info")).await
     }

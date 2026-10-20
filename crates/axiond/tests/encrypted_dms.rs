@@ -294,3 +294,86 @@ async fn files_in_an_encrypted_dm() {
     // Someone outside the conversation can't fetch even the blob.
     assert!(carol_api.file(&key.id).await.is_err());
 }
+
+#[tokio::test]
+async fn edits_reactions_mentions_and_deletes_stay_encrypted() {
+    let s = server().await;
+    let (alice_api, alice) = device(&s, "alice", MemoryStore::default()).await;
+    let bob_store = MemoryStore::default();
+    let (bob_api, bob) = device(&s, "bob", bob_store.clone()).await;
+    let (carol_api, carol) = device(&s, "carol", MemoryStore::default()).await;
+    let team = alice_api.my_teams().await.unwrap()[0].id.clone();
+    let plans = alice_api.create_channel(&team, "plans", "Plans", true).await.unwrap();
+    run(&alice_api, &plans.id, "/invite @bob").await;
+    run(&alice_api, &plans.id, "/invite @carol").await;
+    let mentions = |api: &Client| {
+        let (api, team, channel) = (api.clone(), team.clone(), plans.id.clone());
+        async move { api.my_channel_members(&team).await.unwrap().into_iter().find(|m| m.channel_id == channel).unwrap().mention_count }
+    };
+
+    // Mentions: the server can't read "@bob", so alice's app names him.
+    let mut post = NewPost { channel_id: plans.id.clone(), message: "lunch, @bob?".into(), pending_post_id: "alice:lunch".into(), ..Default::default() };
+    post.props = serde_json::json!({ dm_client::MENTIONS_PROP: [bob.user_id.clone()] });
+    let sealed = alice.encrypt_post(&post).await.unwrap();
+    assert_eq!(sealed.props[dm_client::MENTIONS_PROP][0], bob.user_id.as_str());
+    let lunch = alice_api.create_post(&sealed).await.unwrap();
+    assert_eq!((mentions(&bob_api).await, mentions(&carol_api).await), (1, 0));
+    // And @channel reaches everyone.
+    post.pending_post_id = "alice:all".into();
+    post.props = serde_json::json!({ dm_client::MENTIONS_PROP: ["@channel"] });
+    alice_api.create_post(&alice.encrypt_post(&post).await.unwrap()).await.unwrap();
+    assert_eq!((mentions(&bob_api).await, mentions(&carol_api).await), (2, 1));
+
+    // Edits: plain edits and plain reactions are refused here.
+    assert!(alice_api.edit_post(&lunch.id, "in the clear").await.is_err());
+    assert!(bob_api.add_reaction(&bob.user_id, &lunch.id, "tada").await.is_err());
+    let edit = alice.encrypt_edit(&plans.id, &lunch.id, "lunch at 1, @bob?").await.unwrap();
+    let edited = alice_api.edit_encrypted(&lunch.id, &edit).await.unwrap();
+    assert!(edited.edit_at > 0 && edited.message == "🔒 Encrypted message");
+    // Bob reads it for the first time already edited; carol saw the original first.
+    assert_eq!(text(read(&carol, &lunch).await), "lunch, @bob?");
+    for e2ee in [&bob, &carol, &alice] {
+        assert_eq!(text(read(e2ee, &edited).await), "lunch at 1, @bob?");
+    }
+    // Only its author can edit it: bob's edit, even if the server took it, isn't shown.
+    assert!(bob_api.edit_encrypted(&lunch.id, &edit).await.is_err(), "the server refuses other people's edits");
+
+    // Reactions: the server knows who reacted, not with what.
+    let tada = bob.encrypt_reaction(&plans.id, &lunch.id, "tada", true).await.unwrap();
+    let stored = bob_api.post_e2ee_event(&plans.id, &tada).await.unwrap();
+    assert!(!stored.dm_e2ee.to_string().contains("tada"));
+    // A retry is the same event.
+    assert_eq!(bob_api.post_e2ee_event(&plans.id, &tada).await.unwrap().id, stored.id);
+    let heart = carol.encrypt_reaction(&plans.id, &lunch.id, "heart", true).await.unwrap();
+    carol_api.post_e2ee_event(&plans.id, &heart).await.unwrap();
+    let unheart = carol.encrypt_reaction(&plans.id, &lunch.id, "heart", false).await.unwrap();
+    carol_api.post_e2ee_event(&plans.id, &unheart).await.unwrap();
+    // A reaction moved to another post is refused when read.
+    let mut moved = tada.clone();
+    moved.client_id = "moved".into();
+    let other = send(&alice_api, &alice, &plans.id, "another").await;
+    moved.post_id = other.id.clone();
+    let _ = bob_api.post_e2ee_event(&plans.id, &moved).await;
+
+    let fetched = posts(&alice_api, &plans.id).await;
+    let lunch_now = fetched.iter().find(|p| p.id == lunch.id).unwrap();
+    assert_eq!(lunch_now.metadata.e2ee_events.len(), 3);
+    let refs: Vec<&Post> = fetched.iter().collect();
+    alice.read_in_order(&refs).await;
+    let shown: Vec<(String, String)> = alice.reactions(lunch_now).await.into_iter().map(|r| (r.user_id, r.emoji_name)).collect();
+    assert_eq!(shown, vec![(bob.user_id.clone(), "tada".to_string())], "carol took hers back");
+    assert!(alice.reactions(fetched.iter().find(|p| p.id == other.id).unwrap()).await.is_empty(), "the moved one isn't shown");
+
+    // Deleting: the ciphertext goes from the server, the text from devices.
+    assert_eq!(text(read(&bob, &other).await), "another");
+    alice_api.delete_post(&lunch.id).await.unwrap();
+    let (props, events): (String, i64) = sqlx::query_as("SELECT props, (SELECT count(*) FROM e2ee_events WHERE post_id = ?1) FROM posts WHERE id = ?1")
+        .bind(&lunch.id)
+        .fetch_one(&s._app.db)
+        .await
+        .unwrap();
+    assert!(!props.contains("dm_e2ee") && !props.contains("dm_edit"), "{props}");
+    assert_eq!(events, 0);
+    bob.forget_post(&lunch);
+    assert!(bob_store.text(&lunch.id).await.is_none());
+}

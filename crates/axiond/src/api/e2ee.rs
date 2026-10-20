@@ -4,11 +4,12 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use dm_crypto::ds::Refusal;
 use dm_crypto::{DeviceCertificate, IdentityKey};
-use mm_api::models::{AxiondInfo, ClaimedKeyPackage, E2eeIdentity, GroupState, HandshakeEntry, NewHandshake, PendingWelcome};
+use mm_api::models::{AxiondInfo, ClaimedKeyPackage, E2eeEvent, E2eeIdentity, GroupState, HandshakeEntry, NewE2eeEvent, NewHandshake, PendingWelcome};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -256,6 +257,90 @@ async fn encrypted_channel(app: &App, me: &Me, channel_id: &str) -> Result<db::C
         return Err(Error::bad_request("This channel isn't encrypted."));
     }
     Ok(channel)
+}
+
+/// The largest ciphertext (base64) an event may carry: a reaction is tiny.
+const MAX_EVENT: usize = 4 * 1024;
+
+#[derive(sqlx::FromRow)]
+struct EventRow {
+    id: String,
+    channel_id: String,
+    post_id: String,
+    user_id: String,
+    client_id: String,
+    create_at: i64,
+    epoch: i64,
+    ct: String,
+}
+
+impl From<EventRow> for E2eeEvent {
+    fn from(r: EventRow) -> Self {
+        E2eeEvent {
+            id: r.id,
+            channel_id: r.channel_id,
+            post_id: r.post_id,
+            user_id: r.user_id,
+            client_id: r.client_id,
+            create_at: r.create_at,
+            dm_e2ee: json!({ "v": 1, "epoch": r.epoch, "ct": r.ct }),
+        }
+    }
+}
+
+const EVENT_COLUMNS: &str = "id, channel_id, post_id, user_id, client_id, create_at, epoch, ct";
+
+/// The encrypted events of these posts (a JSON array of ids), oldest first.
+pub async fn events_of(db: &db::Db, post_ids: &str) -> sqlx::Result<Vec<E2eeEvent>> {
+    let sql = format!("SELECT {EVENT_COLUMNS} FROM e2ee_events WHERE post_id IN (SELECT value FROM json_each(?1)) ORDER BY create_at, id");
+    let rows: Vec<EventRow> = sqlx::query_as(&sql).bind(post_ids).fetch_all(db).await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// `POST e2ee/channels/{id}/events`: an encrypted event (a reaction) on a
+/// post (E2EE.md §8). The server stores it against the post and tells the
+/// channel; it can't see what it says.
+pub async fn post_event(State(app): State<App>, me: Me, Path(channel_id): Path<String>, Json(body): Json<NewE2eeEvent>) -> Result<(StatusCode, Json<E2eeEvent>)> {
+    if app.limiter.take(&format!("post {}", me.user_id), crate::limits::POSTS).is_err() {
+        return Err(Error::too_many("You're reacting too fast. Wait a moment."));
+    }
+    encrypted_channel(&app, &me, &channel_id).await?;
+    let post = db::post(&app.db, &body.post_id).await?.filter(|p| p.delete_at == 0 && p.channel_id == channel_id).ok_or_else(|| Error::not_found("Message"))?;
+    if body.client_id.is_empty() || body.client_id.len() > 64 {
+        return Err(Error::bad_request("An event needs its own id."));
+    }
+    let e2ee = super::posts::ciphertext(&app, &channel_id, &body.dm_e2ee, MAX_EVENT).await?;
+    // A retry of one that arrived: the same event, not a second.
+    let sql = format!("SELECT {EVENT_COLUMNS} FROM e2ee_events WHERE user_id = ? AND client_id = ?");
+    if let Some(row) = sqlx::query_as::<_, EventRow>(&sql).bind(&me.user_id).bind(&body.client_id).fetch_optional(&app.db).await? {
+        return Ok((StatusCode::CREATED, Json(row.into())));
+    }
+    let event = E2eeEvent {
+        id: ids::new_id(),
+        channel_id: channel_id.clone(),
+        post_id: post.id.clone(),
+        user_id: me.user_id.clone(),
+        client_id: body.client_id,
+        create_at: ids::now(),
+        dm_e2ee: e2ee.clone(),
+    };
+    sqlx::query("INSERT INTO e2ee_events (id, channel_id, post_id, user_id, client_id, create_at, epoch, ct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(&event.id)
+        .bind(&event.channel_id)
+        .bind(&event.post_id)
+        .bind(&event.user_id)
+        .bind(&event.client_id)
+        .bind(event.create_at)
+        .bind(e2ee["epoch"].as_i64())
+        .bind(e2ee["ct"].as_str())
+        .execute(&app.db)
+        .await?;
+    // Marks the post changed, so `since` fetches pick it up.
+    sqlx::query("UPDATE posts SET update_at = ? WHERE id = ?").bind(event.create_at).bind(&post.id).execute(&app.db).await?;
+    let members = db::member_ids(&app.db, &channel_id).await?;
+    let data = json!({ "event": serde_json::to_string(&event).map_err(|_| Error::internal())? });
+    app.hub.send(&members, &Event::new("e2ee_event", data).channel(&channel_id));
+    Ok((StatusCode::CREATED, Json(event)))
 }
 
 #[derive(Deserialize)]

@@ -43,6 +43,7 @@ enum Write {
     Mls { put: Vec<(Vec<u8>, Vec<u8>)>, delete: Vec<Vec<u8>> },
     Identity { user_id: String, key: String },
     Text { key: String, channel_id: String, content: String },
+    ForgetTexts { post_id: String, pending_post_id: String },
     Flush(oneshot::Sender<()>),
 }
 
@@ -70,6 +71,11 @@ impl Writer {
     /// Keeps a decrypted message's content.
     pub fn text(&self, key: &str, channel_id: &str, content: &str) {
         let _ = self.0.send(Write::Text { key: key.into(), channel_id: channel_id.into(), content: content.into() });
+    }
+
+    /// Forgets a deleted post's kept content: its text, edits and events.
+    pub fn forget_texts(&self, post_id: &str, pending_post_id: &str) {
+        let _ = self.0.send(Write::ForgetTexts { post_id: post_id.into(), pending_post_id: pending_post_id.into() });
     }
 
     /// Waits until everything queued so far is written.
@@ -278,6 +284,19 @@ async fn apply(pool: &SqlitePool, write: Write) -> sqlx::Result<()> {
                 .bind(channel_id)
                 .bind(content)
                 .bind(chrono::Utc::now().timestamp_millis())
+                .execute(pool)
+                .await?;
+        }
+        Write::ForgetTexts { post_id, pending_post_id } => {
+            // Keys are `<post id>`, `edit:<post id>:…`, `event:<post id>:…`
+            // and `pending:<pending id>`. Ids have no LIKE wildcards in them,
+            // but escape anyway.
+            let like = |prefix: &str| format!("{prefix}:{}:%", post_id.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            sqlx::query("DELETE FROM texts WHERE k = ?1 OR k = ?2 OR k LIKE ?3 ESCAPE '\\' OR k LIKE ?4 ESCAPE '\\'")
+                .bind(&post_id)
+                .bind(if pending_post_id.is_empty() { String::new() } else { format!("pending:{pending_post_id}") })
+                .bind(like("edit"))
+                .bind(like("event"))
                 .execute(pool)
                 .await?;
         }

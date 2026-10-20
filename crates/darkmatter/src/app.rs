@@ -226,6 +226,8 @@ pub enum Message {
     EmojiPick(Option<String>),
     EditPost(String),
     Edited(Result<Post, String>),
+    /// An encrypted reaction sent (or why not).
+    Reacted(Result<(), String>),
     /// First press asks to confirm, the second deletes.
     DeletePost(String),
     Deleted(String, Result<(), String>),
@@ -762,7 +764,6 @@ impl App {
                 if let Screen::Chat(chat) = &self.screen {
                     let mut client = chat.client.clone();
                     Session::clear();
-                    crate::media::forget_keys();
                     self.screen = Screen::Login(LoginForm { server: chat.session.server.clone(), ..Default::default() });
                     let logout = Task::future(async move { client.logout().await }).discard();
                     return Task::batch([logout, operation::focus(LOGIN_FIRST)]);

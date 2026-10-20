@@ -26,6 +26,9 @@ pub trait LocalStore: Send + Sync + 'static {
     /// this device's own messages before the server has numbered them.
     fn text(&self, key: &str) -> impl Future<Output = Option<String>> + Send;
     fn save_text(&self, key: &str, channel_id: &str, json: &str);
+    /// Forgets everything kept for a post: its text (and its
+    /// `pending:<pending_post_id>` copy), its edits and its events.
+    fn forget_texts(&self, post_id: &str, pending_post_id: &str);
 }
 
 /// Everything in memory: for tests, and devices that keep nothing.
@@ -81,5 +84,10 @@ impl LocalStore for MemoryStore {
 
     fn save_text(&self, key: &str, _channel_id: &str, json: &str) {
         self.0.lock().unwrap().texts.insert(key.into(), json.into());
+    }
+
+    fn forget_texts(&self, post_id: &str, pending_post_id: &str) {
+        let (edits, events, pending) = (format!("edit:{post_id}:"), format!("event:{post_id}:"), format!("pending:{pending_post_id}"));
+        self.0.lock().unwrap().texts.retain(|k, _| k != post_id && !k.starts_with(&edits) && !k.starts_with(&events) && (pending_post_id.is_empty() || *k != pending));
     }
 }

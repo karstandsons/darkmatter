@@ -300,8 +300,8 @@ guide](https://documentation.ubuntu.com/project/community/contributors/matrix/mu
   Never the real server.
 
 ## Order
-1. **Now (with M2 step 7):** stop making new things app-wide. The step 6
-   file keys move into the chat's own state, with step 7.
+1. **Now (with M2 step 7):** stop making new things app-wide. *(done: the
+   step 6 file keys now live in each account's encryption state.)*
 2. **After M2 step 7:** the work above, as **Darkmatter 0.5.0**, in these
    commits:
    1. accounts, moving the old files over, routing messages to accounts,
@@ -319,8 +319,8 @@ From an audit of `crates/darkmatter` (2026-10-20). Paths are under
 `crates/darkmatter/src/`.
 
 **Global state**
-- `media.rs`, `KEYS`: encrypted-file keys for the whole process. Move per
-  account.
+- `media.rs`, `KEYS`: encrypted-file keys for the whole process. *(Moved
+  into each account's encryption state with M2 step 7.)*
 - `session.rs`, `READ_ONLY`, and `style.rs`, `FONT`: rightly app-wide.
 
 **On disk**
@@ -379,4 +379,4 @@ From an audit of `crates/darkmatter` (2026-10-20). Paths are under
   and only the messages need tagging.
 
 **Crypto**
-- Per account already, apart from `KEYS` above.
+- Per account, `KEYS` included since M2 step 7.

@@ -115,11 +115,11 @@ pub struct Aad {
     /// The thread, or empty.
     #[serde(default)]
     pub root_id: String,
-    /// The sender's id for this post (`pending_post_id`), so a ciphertext
-    /// can't be reused for another post.
+    /// The sender's id for this post (`pending_post_id`) or event
+    /// (`client_id`), so a ciphertext can't be reused for another.
     #[serde(default)]
     pub pending_post_id: String,
-    /// For an edit, the post being edited.
+    /// For an edit, the post being edited; for an event, the post it's on.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub post_id: String,
 }
@@ -129,12 +129,16 @@ impl Aad {
         Aad { v: 1, kind: Kind::Post, channel_id: channel_id.into(), root_id: root_id.into(), pending_post_id: pending_post_id.into(), post_id: String::new() }
     }
 
-    pub fn edit(channel_id: &str, post_id: &str, pending_post_id: &str) -> Self {
-        Aad { v: 1, kind: Kind::Edit, channel_id: channel_id.into(), root_id: String::new(), pending_post_id: pending_post_id.into(), post_id: post_id.into() }
+    /// An edit of `post_id`. Edits have no id of their own: a server that
+    /// shows an earlier edit again is only withholding the later one, which
+    /// it can always do.
+    pub fn edit(channel_id: &str, post_id: &str) -> Self {
+        Aad { v: 1, kind: Kind::Edit, channel_id: channel_id.into(), root_id: String::new(), pending_post_id: String::new(), post_id: post_id.into() }
     }
 
-    pub fn event(channel_id: &str, pending_post_id: &str) -> Self {
-        Aad { v: 1, kind: Kind::Event, channel_id: channel_id.into(), root_id: String::new(), pending_post_id: pending_post_id.into(), post_id: String::new() }
+    /// An event (a reaction) on `post_id`, with the sender's own id for it.
+    pub fn event(channel_id: &str, post_id: &str, client_id: &str) -> Self {
+        Aad { v: 1, kind: Kind::Event, channel_id: channel_id.into(), root_id: String::new(), pending_post_id: client_id.into(), post_id: post_id.into() }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -164,10 +168,12 @@ impl Aad {
 /// The content and its kind must agree with the authenticated data: an
 /// edit's plaintext can't be passed off as a new post, or the reverse.
 pub fn check_kind(content: &Content, aad: &Aad) -> Result<()> {
-    let ok = matches!(
-        (content, aad.kind),
-        (Content::Post { .. }, Kind::Post) | (Content::Edit { .. }, Kind::Edit) | (Content::Reaction { .. }, Kind::Event)
-    );
+    let ok = match (content, aad.kind) {
+        (Content::Post { .. }, Kind::Post) | (Content::Edit { .. }, Kind::Edit) => true,
+        // A reaction names its post twice: inside, and where it was sent.
+        (Content::Reaction { post_id, .. }, Kind::Event) => *post_id == aad.post_id,
+        _ => false,
+    };
     if ok { Ok(()) } else { Err(Error::Untrusted("the message's content doesn't match its kind".into())) }
 }
 
@@ -194,7 +200,10 @@ mod tests {
         assert!(back.check(&Aad::post("c2", "", "p1")).is_err(), "moved to another channel");
         assert!(back.check(&Aad::post("c1", "r", "p1")).is_err(), "moved into a thread");
         assert!(back.check(&Aad::post("c1", "", "p2")).is_err(), "replayed as another post");
-        assert!(back.check(&Aad::edit("c1", "x", "p1")).is_err(), "replayed as an edit");
+        assert!(back.check(&Aad::edit("c1", "x")).is_err(), "replayed as an edit");
         assert!(check_kind(&Content::Edit { message: "x".into() }, &sent).is_err());
+        let r = Content::Reaction { post_id: "p".into(), emoji: "tada".into(), on: true };
+        check_kind(&r, &Aad::event("c1", "p", "e1")).unwrap();
+        assert!(check_kind(&r, &Aad::event("c1", "q", "e1")).is_err(), "a reaction moved to another post");
     }
 }

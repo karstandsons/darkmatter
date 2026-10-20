@@ -62,11 +62,24 @@ async fn encrypted_props(app: &App, channel_id: &str, message: &str, props: &Val
     if !message.trim().is_empty() {
         return Err(Error::bad_request("This conversation is end-to-end encrypted: send from an app that encrypts (Darkmatter)."));
     }
-    let e2ee = &props["dm_e2ee"];
+    let mut kept = json!({ "dm_e2ee": ciphertext(app, channel_id, &props["dm_e2ee"], MAX_CIPHERTEXT).await? });
+    // Who the sender's app says it mentions (§9): user ids, and `@channel`,
+    // `@all` or `@here`.
+    if let Some(mentions) = props.get("dm_mentions").and_then(Value::as_array) {
+        kept["dm_mentions"] = Value::Array(mentions.iter().filter(|m| m.as_str().is_some_and(|m| m.len() <= 64)).take(100).cloned().collect());
+    }
+    Ok(kept)
+}
+
+/// Checks MLS ciphertext (`{v, epoch, ct}`) for an encrypted channel: from
+/// the group's current epoch or one of the few before, not too long, and
+/// not while the server's removals have waited too long. Returns just those
+/// fields.
+pub async fn ciphertext(app: &App, channel_id: &str, e2ee: &Value, max: usize) -> Result<Value> {
     let (Some(1), Some(epoch), Some(ct)) = (e2ee["v"].as_u64(), e2ee["epoch"].as_u64(), e2ee["ct"].as_str()) else {
         return Err(Error::bad_request("This conversation is end-to-end encrypted: the message must be too."));
     };
-    if ct.is_empty() || ct.len() > MAX_CIPHERTEXT {
+    if ct.is_empty() || ct.len() > max {
         return Err(Error::bad_request("That encrypted message is too long."));
     }
     let current: Option<i64> = sqlx::query_scalar("SELECT epoch FROM e2ee_groups WHERE channel_id = ?").bind(channel_id).fetch_optional(&app.db).await?;
@@ -86,11 +99,7 @@ async fn encrypted_props(app: &App, channel_id: &str, message: &str, props: &Val
     {
         return Err(Error::conflict("Someone left this conversation: catch up and send again."));
     }
-    let mut kept = json!({ "dm_e2ee": { "v": 1, "epoch": epoch, "ct": ct } });
-    if let Some(mentions) = props.get("dm_mentions").and_then(Value::as_array) {
-        kept["dm_mentions"] = Value::Array(mentions.iter().filter(|m| m.is_string()).take(100).cloned().collect());
-    }
-    Ok(kept)
+    Ok(json!({ "v": 1, "epoch": epoch, "ct": ct }))
 }
 
 /// The largest ciphertext (base64) a post may carry.
@@ -153,9 +162,7 @@ pub async fn create(State(app): State<App>, me: Me, Json(body): Json<Create>) ->
 pub async fn insert(app: &App, channel: &ChannelRow, user_id: &str, new: New) -> Result<Post> {
     let (id, now) = (ids::new_id(), ids::now());
     let is_root = new.root_id.is_empty();
-    // Encrypted posts carry only the placeholder, so in DMs (where every
-    // message counts) this still notifies, and elsewhere finds no one.
-    let mentioned = if new.kind.is_empty() { mentions(app, channel, user_id, &new.message).await? } else { Vec::new() };
+    let mentioned = if new.kind.is_empty() { mentions(app, channel, user_id, &new.message, &new.props).await? } else { Vec::new() };
 
     let mut tx = app.db.begin().await?;
     sqlx::query(
@@ -281,8 +288,9 @@ pub async fn insert(app: &App, channel: &ChannelRow, user_id: &str, new: New) ->
 
 /// Who a message mentions: `@username`s in the channel, everyone for
 /// `@channel`/`@all`, whoever's online for `@here`, and the other person in a
-/// direct message. Never the author.
-async fn mentions(app: &App, channel: &ChannelRow, author: &str, message: &str) -> Result<Vec<String>> {
+/// direct message. Never the author. In an encrypted channel the server
+/// can't read the message, so the sender's `dm_mentions` say.
+async fn mentions(app: &App, channel: &ChannelRow, author: &str, message: &str, props: &Value) -> Result<Vec<String>> {
     let members: Vec<(String, String)> = sqlx::query_as(
         "SELECT u.id, u.username FROM users u JOIN channel_members m ON m.user_id = u.id WHERE m.channel_id = ? AND u.id != ?",
     )
@@ -295,6 +303,12 @@ async fn mentions(app: &App, channel: &ChannelRow, author: &str, message: &str) 
     let members = members.into_iter().filter(|(id, _)| !blockers.contains(id));
     if channel.kind == "D" {
         return Ok(members.map(|(id, _)| id).collect());
+    }
+    if channel.encrypted {
+        let listed: Vec<&str> = props["dm_mentions"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        let everyone = listed.iter().any(|m| *m == "@channel" || *m == "@all");
+        let here = listed.contains(&"@here");
+        return Ok(members.filter(|(id, _)| everyone || listed.contains(&id.as_str()) || (here && app.hub.online(id))).map(|(id, _)| id).collect());
     }
     let words = mention_words(message);
     let everyone = words.iter().any(|w| w == "channel" || w == "all");
@@ -325,6 +339,8 @@ fn mention_words(message: &str) -> Vec<String> {
 #[derive(Deserialize)]
 pub struct Patch {
     message: Option<String>,
+    /// For an encrypted post: `dm_edit`, the new text's ciphertext.
+    props: Option<Value>,
 }
 
 pub async fn edit(State(app): State<App>, me: Me, Path(id): Path<String>, Json(body): Json<Patch>) -> Result<Json<Post>> {
@@ -333,7 +349,7 @@ pub async fn edit(State(app): State<App>, me: Me, Path(id): Path<String>, Json(b
         return Err(Error::forbidden());
     }
     if post.props.get("dm_e2ee").is_some() {
-        return Err(Error::bad_request("Editing encrypted messages isn't possible yet."));
+        return edit_encrypted(&app, post, body).await.map(Json);
     }
     let Some(message) = body.message.map(|m| m.trim_end().to_string()) else { return Ok(Json(post)) };
     if message.trim().is_empty() || message.chars().count() > MAX_MESSAGE {
@@ -352,6 +368,27 @@ pub async fn edit(State(app): State<App>, me: Me, Path(id): Path<String>, Json(b
     Ok(Json(post))
 }
 
+/// An encrypted post's edit (E2EE.md §8): its ciphertext goes in
+/// `props.dm_edit`, beside the original, which still holds the files.
+async fn edit_encrypted(app: &App, post: Post, body: Patch) -> Result<Post> {
+    if body.message.is_some_and(|m| !m.trim().is_empty()) {
+        return Err(Error::bad_request("This conversation is end-to-end encrypted: send from an app that encrypts (Darkmatter)."));
+    }
+    let Some(props) = body.props else { return Ok(post) };
+    let edit = ciphertext(app, &post.channel_id, &props["dm_edit"], MAX_CIPHERTEXT).await?;
+    let now = ids::now();
+    sqlx::query("UPDATE posts SET props = json_set(props, '$.dm_edit', json(?)), edit_at = ?, update_at = ? WHERE id = ?")
+        .bind(edit.to_string())
+        .bind(now)
+        .bind(now)
+        .bind(&post.id)
+        .execute(&app.db)
+        .await?;
+    let post = db::post(&app.db, &post.id).await?.ok_or_else(Error::internal)?;
+    tell(app, "post_edited", &post).await?;
+    Ok(post)
+}
+
 /// Deletes a post, and a thread's replies with it.
 pub async fn remove(State(app): State<App>, me: Me, Path(id): Path<String>) -> Result<Json<Value>> {
     let post = db::post(&app.db, &id).await?.filter(|p| p.delete_at == 0).ok_or_else(|| Error::not_found("Message"))?;
@@ -364,11 +401,16 @@ pub async fn remove(State(app): State<App>, me: Me, Path(id): Path<String>) -> R
     } else {
         Vec::new()
     };
-    sqlx::query("UPDATE posts SET delete_at = ?1, update_at = ?1 WHERE (id = ?2 OR root_id = ?2) AND delete_at = 0")
-        .bind(now)
-        .bind(&id)
-        .execute(&app.db)
-        .await?;
+    // An encrypted post's ciphertext goes with it, and its encrypted events.
+    sqlx::query(
+        "UPDATE posts SET delete_at = ?1, update_at = ?1, props = json_remove(props, '$.dm_e2ee', '$.dm_edit') \
+         WHERE (id = ?2 OR root_id = ?2) AND delete_at = 0",
+    )
+    .bind(now)
+    .bind(&id)
+    .execute(&app.db)
+    .await?;
+    sqlx::query("DELETE FROM e2ee_events WHERE post_id IN (SELECT id FROM posts WHERE id = ?1 OR root_id = ?1)").bind(&id).execute(&app.db).await?;
     sqlx::query(
         "UPDATE files SET delete_at = ?1, update_at = ?1 WHERE delete_at = 0 \
          AND post_id IN (SELECT id FROM posts WHERE id = ?2 OR root_id = ?2)",

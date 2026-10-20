@@ -234,11 +234,7 @@ fn thread_key(root: &str) -> String {
     format!("thread:{root}")
 }
 
-/// A new post's props: the keys of its encrypted files, which the outbox
-/// keeps (in the vault) until the post is encrypted with them inside.
-fn files_prop(files: Vec<dm_crypto::wire::FileKey>) -> serde_json::Value {
-    if files.is_empty() { serde_json::Value::Null } else { serde_json::json!({ dm_client::FILES_PROP: files }) }
-}
+
 
 impl Chat {
     /// Sends what's due from the outbox.
@@ -679,7 +675,7 @@ impl Chat {
                 let Some(lb) = &self.lightbox else { return Task::none() };
                 let f = lb.current().clone();
                 let loaded = self.media.get(&media::Key::Full(f.id.clone())).cloned();
-                Task::perform(lightbox::save(self.client.clone(), f, loaded), |r| Message::Lightbox(Msg::Saved(r)))
+                Task::perform(lightbox::save(self.client.clone(), self.crypto.clone(), f, loaded), |r| Message::Lightbox(Msg::Saved(r)))
             }
             Msg::Saved(result) => {
                 if let Some(lb) = &mut self.lightbox {
@@ -704,7 +700,7 @@ impl Chat {
     fn fetch_full(&mut self) -> Task<Message> {
         let Some(lb) = &self.lightbox else { return Task::none() };
         let keys: Vec<_> = lb.files.iter().skip(lb.index).take(2).map(|f| media::Key::Full(f.id.clone())).collect();
-        self.media.fetch(&self.client, keys)
+        self.media.fetch(&self.client, &self.crypto, keys)
     }
 
     /// A vim-style key, pressed with no text box focused.
@@ -1000,6 +996,24 @@ impl Chat {
         self.command_sent = Some((key, text.clone()));
         let (client, team, channel) = (self.client.clone(), self.team.clone(), self.store.post(&root).map_or(self.pv().channel.clone(), |p| p.channel_id.clone()));
         Some(Task::perform(async move { client.execute_command(&team, &channel, &root, &text).await.map_err(err) }, Message::CommandRan))
+    }
+
+    /// A new post's props in an encrypted channel: the keys of its files,
+    /// which the outbox keeps (in the vault) until the post is encrypted
+    /// with them inside, and who it mentions, for the server to count.
+    fn new_props(&self, channel_id: &str, message: &str, files: Vec<dm_crypto::wire::FileKey>) -> serde_json::Value {
+        if !self.store.channels.get(channel_id).is_some_and(|c| c.encrypted) {
+            return serde_json::Value::Null;
+        }
+        let mut props = serde_json::json!({});
+        if !files.is_empty() {
+            props[dm_client::FILES_PROP] = serde_json::json!(files);
+        }
+        let mentions = crate::crypto::mentions(&self.store, message);
+        if !mentions.is_empty() {
+            props[dm_client::MENTIONS_PROP] = serde_json::json!(mentions);
+        }
+        props
     }
 
     /// The finished uploads for the composer with draft key `key`: the ids
@@ -1322,6 +1336,22 @@ impl Chat {
             return Task::none();
         }
         let client = self.client.clone();
+        let encrypted = self.store.post(&id).and_then(|p| self.store.channels.get(&p.channel_id)).filter(|c| c.encrypted).map(|c| c.id.clone());
+        if let Some(channel) = encrypted {
+            // The new text is encrypted like a message; the server keeps it
+            // beside the original.
+            let crypto = self.crypto.clone();
+            return Task::perform(
+                async move {
+                    let c = crypto.as_ref().ok_or("this device can't encrypt yet (see Account)")?;
+                    let edit = c.encrypt_edit(&channel, &id, text.trim()).await?;
+                    let mut post = client.edit_encrypted(&id, &edit).await.map_err(err)?;
+                    crate::crypto::open(&crypto, &mut [&mut post]).await;
+                    Ok(post)
+                },
+                Message::Edited,
+            );
+        }
         Task::perform(async move { client.edit_post(&id, text.trim()).await.map_err(err) }, Message::Edited)
     }
 
@@ -1469,7 +1499,7 @@ impl Chat {
             }
         }
         self.store.custom_emoji.extend(learned);
-        self.media.fetch(&self.client, keys)
+        self.media.fetch(&self.client, &self.crypto, keys)
     }
 
     fn handle(&mut self, message: Message) -> Task<Message> {
@@ -1600,11 +1630,12 @@ impl Chat {
                 self.error = None;
                 let channel = self.pv().channel.clone();
                 self.attachments.retain(|a| a.key != channel);
+                let props = self.new_props(&channel, &message, files);
                 let post = NewPost {
                     channel_id: self.pv().channel.clone(),
                     message,
                     file_ids,
-                    props: files_prop(files),
+                    props,
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
                     ..Default::default()
                 };
@@ -1980,11 +2011,12 @@ impl Chat {
                 }
                 self.attachments.retain(|a| a.key != key);
                 self.drafts.remove(&key);
+                let props = self.new_props(&channel_id, &message, files);
                 let post = NewPost {
                     channel_id,
                     message,
                     file_ids,
-                    props: files_prop(files),
+                    props,
                     root_id: root,
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
                 };
@@ -2001,7 +2033,7 @@ impl Chat {
             }
             Message::Lightbox(m) => self.lightbox_update(m),
             Message::OpenFile(id, name) => {
-                Task::perform(media::open_file(self.client.clone(), id, name), Message::Opened)
+                Task::perform(media::open_file(self.client.clone(), self.crypto.clone(), id, name), Message::Opened)
             }
             Message::Opened(Err(e)) => {
                 self.error = Some(format!("Couldn't open file: {e}"));
@@ -2146,7 +2178,7 @@ impl Chat {
             Message::Escape if self.plugin_picker.is_some() => self.update(Message::ClosePluginPicker),
             Message::OpenEmoji(post_id) => {
                 let picker = EmojiPicker::open(post_id, &self.recent_emoji, &self.store.custom_emoji);
-                let images = self.media.fetch(&self.client, picker.media_keys());
+                let images = self.media.fetch(&self.client, &self.crypto, picker.media_keys());
                 self.emoji_picker = Some(picker);
                 Task::batch([images, operation::focus(emoji_picker::INPUT)])
             }
@@ -2161,7 +2193,7 @@ impl Chat {
                 self.plus = None;
                 let mut picker = EmojiPicker::open(String::new(), &self.recent_emoji, &self.store.custom_emoji);
                 picker.insert = Some(thread);
-                let images = self.media.fetch(&self.client, picker.media_keys());
+                let images = self.media.fetch(&self.client, &self.crypto, picker.media_keys());
                 self.emoji_picker = Some(picker);
                 Task::batch([images, operation::focus(emoji_picker::INPUT)])
             }
@@ -2198,7 +2230,7 @@ impl Chat {
             Message::EmojiQuery(q) => {
                 let Some(p) = &mut self.emoji_picker else { return Task::none() };
                 p.set_query(q, &self.recent_emoji, &self.store.custom_emoji);
-                self.media.fetch(&self.client, p.media_keys())
+                self.media.fetch(&self.client, &self.crypto, p.media_keys())
             }
             Message::EmojiPick(name) => {
                 let Some(picker) = self.emoji_picker.take() else { return Task::none() };
@@ -2217,6 +2249,11 @@ impl Chat {
             Message::EditPost(post_id) => self.start_edit(&post_id),
             Message::Edited(Ok(post)) => {
                 self.store.edited(post);
+                Task::none()
+            }
+            Message::Reacted(Ok(())) => Task::none(),
+            Message::Reacted(Err(e)) => {
+                self.error = Some(format!("Couldn't react: {e}"));
                 Task::none()
             }
             Message::Edited(Err(e)) => {
@@ -2569,6 +2606,21 @@ impl Chat {
                 Task::none()
             }
             Message::Escape if self.vim_keys && self.switcher.is_none() && self.panel.is_none() => self.select_step(i64::MAX),
+            Message::React(post_id, emoji, add)
+                if let Some(channel) = self.store.post(&post_id).and_then(|p| self.store.channels.get(&p.channel_id)).filter(|c| c.encrypted).map(|c| c.id.clone()) =>
+            {
+                // Which emoji is encrypted: an event the server can't read.
+                let (client, crypto) = (self.client.clone(), self.crypto.clone());
+                Task::perform(
+                    async move {
+                        let c = crypto.as_ref().ok_or("this device can't encrypt yet (see Account)")?;
+                        let event = c.encrypt_reaction(&channel, &post_id, &emoji, add).await?;
+                        client.post_e2ee_event(&channel, &event).await.map_err(err)?;
+                        Ok(())
+                    },
+                    Message::Reacted,
+                )
+            }
             Message::React(post_id, emoji, add) => {
                 let client = self.client.clone();
                 let me = self.store.me.id.clone();
@@ -2723,13 +2775,40 @@ impl Chat {
                 self.store.sent(*post);
                 Task::none()
             }
+            // An encrypted post's edit: read it first, then show it.
+            M::Event(Event::PostEdited(mut post)) if crate::crypto::sealed(&post) && post.props.get("dm_open").is_none() => {
+                let crypto = self.crypto.clone();
+                Task::perform(
+                    async move {
+                        crate::crypto::open(&crypto, &mut [&mut post]).await;
+                        post.props["dm_open"] = true.into();
+                        post
+                    },
+                    |post| Message::Ws(M::Event(Event::PostEdited(post))),
+                )
+            }
             M::Event(Event::PostEdited(post)) => {
                 self.store.edited(*post);
                 Task::none()
             }
             M::Event(Event::PostDeleted(post)) => {
+                // What this device kept of it goes too.
+                if self.store.channels.get(&post.channel_id).is_some_and(|c| c.encrypted)
+                    && let Some(c) = &self.crypto
+                {
+                    c.forget_post(&post);
+                }
                 self.store.deleted(&post);
                 Task::none()
+            }
+            M::Event(Event::E2ee(event)) => {
+                let crypto = self.crypto.clone();
+                Task::future(async move {
+                    let (emoji, on) = crypto.as_ref()?.decrypt_event(&event).await?;
+                    let r = mm_api::models::Reaction { user_id: event.user_id.clone(), post_id: event.post_id.clone(), emoji_name: emoji, create_at: event.create_at };
+                    Some(Message::Ws(M::Event(if on { Event::ReactionAdded(r) } else { Event::ReactionRemoved(r) })))
+                })
+                .and_then(Task::done)
             }
             M::Event(Event::ReactionAdded(r)) => {
                 self.store.reaction(r, true);

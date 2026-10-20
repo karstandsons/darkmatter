@@ -224,7 +224,7 @@ fn tool_style(_: &Theme, status: button::Status) -> button::Style {
 
 /// Ask where to save a copy, then write it: the bytes already loaded, or
 /// fetched again if the full image isn't in yet.
-pub async fn save(client: mm_api::Client, f: FileInfo, loaded: Option<iced::widget::image::Handle>) -> Result<Option<PathBuf>, String> {
+pub async fn save(client: mm_api::Client, crypto: crate::crypto::Shared, f: FileInfo, loaded: Option<iced::widget::image::Handle>) -> Result<Option<PathBuf>, String> {
     let mut dialog = rfd::AsyncFileDialog::new().set_title("Save image").set_file_name(&f.name);
     if let Some(dir) = dirs::download_dir() {
         dialog = dialog.set_directory(dir);
@@ -232,7 +232,7 @@ pub async fn save(client: mm_api::Client, f: FileInfo, loaded: Option<iced::widg
     let Some(target) = dialog.save_file().await else { return Ok(None) };
     let bytes = match loaded {
         Some(iced::widget::image::Handle::Bytes(_, b)) => b.to_vec(),
-        _ => crate::media::download(&client, &f.id).await?,
+        _ => crate::media::download(&client, &crypto, &f.id).await?,
     };
     let path = target.path().to_path_buf();
     tokio::fs::write(&path, bytes).await.map_err(|e| e.to_string())?;

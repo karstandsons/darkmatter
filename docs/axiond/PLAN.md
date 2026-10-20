@@ -430,7 +430,18 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
    - axiond refusing plaintext in encrypted channels.
 5. **Private channels and membership:** *(built 2026-10-20; tested end to end through axiond, the in-app check still to do)* adds, removes (server-proposed), external commits for public encrypted channels, regular leaf updates, a member list taken from the group. Also: `POST /channels` (private ones encrypted), an admin switch to encrypt a public channel (`axiond channel encrypt`), `/create [private] <name>` in Darkmatter, and Darkmatter following channel events (added to a channel, a new DM, removed). Catching up fetches the keys of people who have since left, and a device that can't apply a handshake rejoins instead of drifting out of step.
 6. **Encrypted files**, with thumbnails made on the client. *(built 2026-10-20; tested end to end through axiond, the in-app check still to do)* Each file is encrypted under its own key and uploaded as `blob`; a picture also gets an 800x600 JPEG thumbnail, encrypted and uploaded beside it. The keys, names, types, sizes and SHA-256s travel inside the encrypted post. axiond stores encrypted uploads as `application/octet-stream`, makes no pictures of them, and allows 20 uploads per encrypted post (10 files and their thumbnails). Darkmatter shows, plays (GIFs), opens and saves them decrypted. Thumbnails of videos wait for a video decoder.
-7. **Edits, reactions** (encrypted events) **and mentions** (`dm_mentions`).
+7. **Edits, reactions** (encrypted events) **and mentions** (`dm_mentions`). *(built 2026-10-20; tested end to end through axiond, the in-app check still to do)*
+   - **Edits:** an edit's ciphertext is kept in `props.dm_edit`, beside the original, which still holds the files. Only the author's own device can make one that's shown.
+   - **Reactions:** encrypted events (`POST e2ee/channels/{id}/events`), sent with posts as `metadata.e2ee_events` and live as `e2ee_event`. Plain reactions are refused in encrypted channels.
+   - **Mentions:** the sender's app lists them as user ids, plus `@channel`, `@all` and `@here`. The server counts and notifies from that list.
+   - **Deletes:** a deleted post's ciphertext and events go from the server, and devices forget what they kept of it.
+   - **Reading in order:** a page of posts is decrypted in the order it was sent: posts, edits and events together.
+   - **Per account:** the keys of decrypted files moved into each account's encryption state, the first piece of the [multi-server plan](../darkmatter/MULTI_SERVER.md).
+   - **Found while building, still to do:** reading a long backlog. MLS keeps only 20 skipped message keys per sender, and 5 past epochs. A device that was offline for a while and opens a channel at its newest page decrypts the newest messages first. Older ones that are further back than that then can't be read, and catching up to the latest epoch for a new message skips old epochs' keys. The fix:
+     - fetch what came since the last message read, oldest first;
+     - catch up handshakes only as far as each message's epoch.
+
+     It goes next, before step 8.
 8. **Local search** over decrypted messages, merged with the server's results.
 9. **Devices:**
    - linking a new device by QR or code;

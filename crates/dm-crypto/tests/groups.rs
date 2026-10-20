@@ -317,7 +317,7 @@ fn a_message_moved_or_replayed_elsewhere_is_caught() {
     let Incoming::Message { aad, .. } = bob.process("c1", &ct.ciphertext().unwrap(), &w.keys).unwrap() else { panic!() };
     aad.check(&sent).unwrap();
     assert!(aad.check(&Aad::post("c1", "root", "p1")).is_err());
-    assert!(aad.check(&Aad::edit("c1", "x", "p1")).is_err());
+    assert!(aad.check(&Aad::edit("c1", "x")).is_err());
     assert!(aad.check(&Aad::post("c1", "", "p9")).is_err());
     // The same ciphertext again: MLS won't decrypt it twice.
     assert!(bob.process("c1", &ct.ciphertext().unwrap(), &w.keys).is_err());

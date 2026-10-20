@@ -9,6 +9,9 @@ The release workflow uses each version's section here as its release notes.
   `/invite`), end-to-end encrypted like DMs, and encrypted files and
   pictures in them. Pictures are shrunk for the conversation on your own
   computer, since the server can't see them.
+  Editing, reactions and @mentions work in encrypted conversations too:
+  the server learns who reacted or was mentioned, never the text or the
+  emoji.
 
 ## [0.4.1] - 2026-10-20
 

@@ -73,6 +73,10 @@ impl LocalStore for VaultStore {
     fn save_text(&self, key: &str, channel_id: &str, json: &str) {
         self.0.writer().text(key, channel_id, json);
     }
+
+    fn forget_texts(&self, post_id: &str, pending_post_id: &str) {
+        self.0.writer().forget_texts(post_id, pending_post_id);
+    }
 }
 
 /// A fingerprint people can read out: the identity key, in groups of four.
@@ -96,11 +100,25 @@ pub async fn setup(client: &Client, user_id: &str, vault: &Arc<Vault>, info: Opt
 }
 
 /// Puts each encrypted post's text in place of the server's placeholder, or
-/// says why it can't be read here. Plain posts are left alone.
+/// says why it can't be read here, and its reactions in place from its
+/// encrypted events. Plain posts are left alone.
 pub async fn open(crypto: &Shared, posts: &mut [&mut Post]) {
     posts.sort_by_key(|p| p.create_at);
+    if let Some(c) = crypto {
+        let all: Vec<&Post> = posts.iter().map(|p| &**p).collect();
+        c.read_in_order(&all).await;
+    }
     for post in posts.iter_mut() {
-        if post.props.get("dm_e2ee").is_none() || post.delete_at > 0 {
+        if post.delete_at > 0 {
+            continue;
+        }
+        if !post.metadata.e2ee_events.is_empty() {
+            post.metadata.reactions = match crypto {
+                Some(c) => c.reactions(post).await,
+                None => Vec::new(),
+            };
+        }
+        if post.props.get("dm_e2ee").is_none() {
             continue;
         }
         let shown = match crypto {
@@ -112,9 +130,6 @@ pub async fn open(crypto: &Shared, posts: &mut [&mut Post]) {
             Decrypted::Text(Content::Post { message, files }) => {
                 // The files as the sender described them; the server knows
                 // them only as blobs (thumbnails included).
-                for key in &files {
-                    crate::media::remember(key);
-                }
                 post.metadata.files = files.iter().map(|k| crate::media::file_info(k, post)).collect();
                 message
             }
@@ -128,14 +143,31 @@ pub async fn open(crypto: &Shared, posts: &mut [&mut Post]) {
     }
 }
 
+/// Whether [`open`] has anything to do for a post.
+pub fn sealed(post: &Post) -> bool {
+    post.props.get("dm_e2ee").is_some() || !post.metadata.e2ee_events.is_empty()
+}
+
 /// [`open`] for a page of posts as fetched.
 pub async fn open_list(crypto: &Shared, list: Result<PostList, String>) -> Result<PostList, String> {
     let mut list = list?;
-    let mut posts: Vec<&mut Post> = list.posts.values_mut().filter(|p| p.props.get("dm_e2ee").is_some()).collect();
+    let mut posts: Vec<&mut Post> = list.posts.values_mut().filter(|p| sealed(p)).collect();
     if !posts.is_empty() {
         open(crypto, &mut posts).await;
     }
     Ok(list)
+}
+
+/// The `dm_mentions` for a message in an encrypted channel: the ids of the
+/// people it names, and `@channel`, `@all` or `@here` (E2EE.md §9).
+pub fn mentions(store: &crate::store::Store, message: &str) -> Vec<String> {
+    dm_client::mention_names(message)
+        .into_iter()
+        .filter_map(|name| match name.as_str() {
+            "channel" | "all" | "here" => Some(format!("@{name}")),
+            _ => store.users.values().find(|u| u.username.eq_ignore_ascii_case(&name)).map(|u| u.id.clone()),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -165,6 +197,28 @@ mod tests {
         store.clear_device().await;
         assert!(store.get("seq.c1").await.is_none() && store.mls().await.is_empty());
         assert!(store.text("p1").await.is_some(), "messages already read stay readable");
+
+        // A deleted post takes its text, edits, events and pending copy with
+        // it, and nothing else.
+        for k in ["edit:p1:abc", "event:p1:u:e1", "pending:me:1", "p10", "edit:p10:x", "event:p2:u:e1"] {
+            store.save_text(k, "c1", "{}");
+        }
+        store.forget_texts("p1", "me:1");
+        vault.writer().flush().await;
+        for gone in ["p1", "edit:p1:abc", "event:p1:u:e1", "pending:me:1"] {
+            assert!(store.text(gone).await.is_none(), "{gone}");
+        }
+        for kept in ["p10", "edit:p10:x", "event:p2:u:e1"] {
+            assert!(store.text(kept).await.is_some(), "{kept}");
+        }
+    }
+
+    #[test]
+    fn mentions_are_named_by_id() {
+        let mut store = crate::store::Store::new(mm_api::models::User { id: "me".into(), username: "me".into(), ..Default::default() });
+        store.add_users(vec![mm_api::models::User { id: "u-bob".into(), username: "Bob".into(), ..Default::default() }]);
+        assert_eq!(mentions(&store, "hey @bob and @here, mail bob@example.com, @nobody"), ["u-bob", "@here"]);
+        assert!(mentions(&store, "no one").is_empty());
     }
 
     #[tokio::test]

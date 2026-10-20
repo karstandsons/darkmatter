@@ -172,12 +172,18 @@ As built (step 6):
 - **Threads:** `root_id` stays visible to the server, so threads, reply counts and the Threads list keep working.
 - **Pinning, saving and read state** are plain operations on post IDs and stay as they are.
 
+As built (step 7):
+- **Edits:** the edit's ciphertext goes in `props.dm_edit` beside the original `dm_e2ee`, which stays because it holds the file keys. Its authenticated data is `{kind: edit, channel_id, post_id}` with no id of its own. A server that shows an earlier edit again is only withholding the later one, which it can always do. A device keeps each edit's text under the post and the edit's ciphertext hash.
+- **Events:** `{post_id, client_id, dm_e2ee}`. The authenticated data names the post and the sender's `client_id`, and the reaction inside names the post again. They come with posts as `metadata.e2ee_events`, oldest first, and live as the `e2ee_event` websocket event. A retry with the same `client_id` gets the stored event. Each person's last event per emoji decides whether their reaction shows.
+- **Deletes:** the server removes `dm_e2ee`, `dm_edit` and the post's events. Devices forget the post's text, edits, events and pending copy.
+
 ## 9. Mentions, unreads and notifications
 
 The server can't read a message, so it can't find @mentions in it. The sender's client does, and lists the mentioned user IDs in `props.dm_mentions` (`@channel`, `@all` and `@here` become a flag). The server uses that for mention counts and notifications.
 
 - **The trade-off:** the server learns who was mentioned, but not what was said. In DMs every message counts as a mention anyway. This is in the metadata list in [§1](#1-goals-and-limits). (Decided, [§18](#18-decisions).)
 - A client can't lie its way into someone else's mention count beyond what any channel member could do by mentioning them.
+- **As built:** `dm_mentions` holds user ids, and `@channel`, `@all` or `@here`. The server counts only channel members, never the author, and not someone who blocked the author.
 - **Unread counts** work as today: they count posts, not content.
 - **Push notifications** on phones (M4) carry no content: the phone wakes, fetches the post by ID, decrypts it and shows the text itself.
 

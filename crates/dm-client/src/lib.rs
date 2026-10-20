@@ -26,7 +26,7 @@ use dm_crypto::device::ServerKey;
 use dm_crypto::wire::{Aad, Content, DmE2ee, FileKey};
 use dm_crypto::{Device, DeviceCertificate, Directory, Handshake, IdentityKey, Incoming, UserIdentity};
 use mm_api::Client;
-use mm_api::models::{AxiondInfo, NewHandshake, NewPost, Post};
+use mm_api::models::{AxiondInfo, E2eeEvent, NewE2eeEvent, NewHandshake, NewPost, Post, Reaction};
 use openmls_memory_storage::MemoryStorage;
 
 pub use store::{LocalStore, MemoryStore};
@@ -96,6 +96,49 @@ impl Directory for Keys {
     fn certificate(&self, user_id: &str, device_id: &str) -> Option<DeviceCertificate> {
         self.certificates.get(&(user_id.into(), device_id.into())).cloned()
     }
+}
+
+/// The prop the app lists a post's mentions in (user ids, `@channel`,
+/// `@all`, `@here`). It goes to the server beside the ciphertext, which uses
+/// it for mention counts and notifications (E2EE.md §9).
+pub const MENTIONS_PROP: &str = "dm_mentions";
+
+/// Where a kept edit lives: by post, and by the edit's own ciphertext, since
+/// a post can be edited many times.
+fn edit_key(post_id: &str, ct: &[u8]) -> String {
+    format!("edit:{post_id}:{}", &dm_crypto::file::sha256_hex(ct)[..32])
+}
+
+fn event_key(post_id: &str, user_id: &str, client_id: &str) -> String {
+    format!("event:{post_id}:{user_id}:{client_id}")
+}
+
+fn parse(value: &serde_json::Value) -> Option<(DmE2ee, Vec<u8>)> {
+    let e2ee: DmE2ee = serde_json::from_value(value.clone()).ok()?;
+    let ct = e2ee.ciphertext().ok()?;
+    Some((e2ee, ct))
+}
+
+/// The `@` names in a message, lowercased, as the server reads them:
+/// usernames, and `channel`, `all` and `here`. The app turns them into
+/// [`MENTIONS_PROP`].
+pub fn mention_names(message: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut rest = message;
+    while let Some(at) = rest.find('@') {
+        // Not part of an email address.
+        let before = rest[..at].chars().next_back();
+        rest = &rest[at + 1..];
+        if before.is_some_and(|c| c.is_alphanumeric()) {
+            continue;
+        }
+        let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))).unwrap_or(rest.len());
+        let word = rest[..end].trim_end_matches(['.', '-', '_']);
+        if !word.is_empty() && !words.iter().any(|w| w == &word.to_ascii_lowercase()) {
+            words.push(word.to_ascii_lowercase());
+        }
+    }
+    words
 }
 
 /// The prop the app puts a post's file keys in before it's encrypted. It
@@ -207,11 +250,13 @@ pub struct E2ee<S> {
     lock: tokio::sync::Mutex<()>,
     /// This device was away for more than a day before this start.
     away: bool,
+    /// The keys of files in messages read so far, by file id.
+    file_keys: Mutex<HashMap<String, FileKey>>,
 }
 
 impl<S: LocalStore> E2ee<S> {
     fn new(api: Client, user_id: &str, device: Device<MemoryStorage>, identity: IdentityKey, server: ServerKey, store: S, saved: HashMap<Vec<u8>, Vec<u8>>) -> Self {
-        E2ee { api, user_id: user_id.into(), device, identity, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false }
+        E2ee { api, user_id: user_id.into(), device, identity, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false, file_keys: Default::default() }
     }
 
     /// Gives the store whatever openmls changed since the last time.
@@ -549,7 +594,8 @@ impl<S: LocalStore> E2ee<S> {
     }
 
     /// Encrypts a post for an encrypted channel. The text is kept so this
-    /// device can show it (it can't decrypt its own messages).
+    /// device can show it (it can't decrypt its own messages). The app's
+    /// `dm_files` go inside; its `dm_mentions` stay beside, for the server.
     pub async fn encrypt_post(&self, post: &NewPost) -> Result<NewPost, String> {
         let _held = self.lock.lock().await;
         self.ready(&post.channel_id).await?;
@@ -561,12 +607,88 @@ impl<S: LocalStore> E2ee<S> {
         let mut out = post.clone();
         out.message = String::new();
         out.props = serde_json::json!({ "dm_e2ee": e2ee });
+        if let Some(mentions) = post.props.get(MENTIONS_PROP) {
+            out.props[MENTIONS_PROP] = mentions.clone();
+        }
         Ok(out)
     }
 
+    /// Encrypts new text for one of this user's posts (E2EE.md §8), as the
+    /// `dm_edit` to send. The text is kept, as for posts.
+    pub async fn encrypt_edit(&self, channel_id: &str, post_id: &str, message: &str) -> Result<serde_json::Value, String> {
+        let _held = self.lock.lock().await;
+        self.ready(channel_id).await?;
+        let content = Content::Edit { message: message.into() };
+        let e2ee = self.device.encrypt(channel_id, &content, &Aad::edit(channel_id, post_id)).map_err(s)?;
+        self.persist();
+        let key = edit_key(post_id, &e2ee.ciphertext().map_err(s)?);
+        self.store.save_text(&key, channel_id, &serde_json::to_string(&content).map_err(s)?);
+        serde_json::to_value(&e2ee).map_err(s)
+    }
+
+    /// Encrypts a reaction added (`on`) or taken back, as an event to send.
+    pub async fn encrypt_reaction(&self, channel_id: &str, post_id: &str, emoji: &str, on: bool) -> Result<NewE2eeEvent, String> {
+        let _held = self.lock.lock().await;
+        self.ready(channel_id).await?;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let client_id = format!("{}-{nanos}", self.device.device_id);
+        let content = Content::Reaction { post_id: post_id.into(), emoji: emoji.into(), on };
+        let e2ee = self.device.encrypt(channel_id, &content, &Aad::event(channel_id, post_id, &client_id)).map_err(s)?;
+        self.persist();
+        self.store.save_text(&event_key(post_id, &self.user_id, &client_id), channel_id, &serde_json::to_string(&content).map_err(s)?);
+        Ok(NewE2eeEvent { post_id: post_id.into(), client_id, dm_e2ee: serde_json::to_value(&e2ee).map_err(s)? })
+    }
+
+    /// Reads posts, their edits and their events in the order they were
+    /// sent, so each is decrypted with the keys of its moment (MLS keeps
+    /// only a few skipped keys). What's read is kept; [`E2ee::decrypt_post`]
+    /// and [`E2ee::reactions`] then find it.
+    pub async fn read_in_order(&self, posts: &[&Post]) {
+        enum Item<'a> {
+            Post(&'a Post),
+            Edit(&'a Post, &'a serde_json::Value),
+            Event(&'a E2eeEvent),
+        }
+        let mut items: Vec<(i64, Item)> = Vec::new();
+        for post in posts.iter().filter(|p| p.delete_at == 0) {
+            if post.props.get("dm_e2ee").is_some() {
+                items.push((post.create_at, Item::Post(post)));
+            }
+            if let Some(edit) = post.props.get("dm_edit") {
+                items.push((post.edit_at, Item::Edit(post, edit)));
+            }
+            items.extend(post.metadata.e2ee_events.iter().map(|e| (e.create_at, Item::Event(e))));
+        }
+        items.sort_by_key(|(at, _)| *at);
+        for (_, item) in items {
+            match item {
+                Item::Post(post) => drop(self.decrypt_original(post).await),
+                Item::Edit(post, edit) => drop(self.decrypt_edit(post, edit).await),
+                Item::Event(event) => drop(self.decrypt_event(event).await),
+            }
+        }
+    }
+
     /// Reads an encrypted post, once: after the first time its text comes
-    /// from the store (MLS can't decrypt the same message twice).
+    /// from the store (MLS can't decrypt the same message twice). An edit
+    /// replaces the text and keeps the files.
     pub async fn decrypt_post(&self, post: &Post) -> Decrypted {
+        let original = self.decrypt_original(post).await;
+        if let Decrypted::Text(Content::Post { files, .. }) = &original {
+            let mut keys = self.file_keys.lock().unwrap_or_else(|e| e.into_inner());
+            keys.extend(files.iter().map(|f| (f.id.clone(), f.clone())));
+        }
+        let (Decrypted::Text(Content::Post { files, .. }), Some(edit)) = (&original, post.props.get("dm_edit")) else { return original };
+        match self.decrypt_edit(post, edit).await {
+            Ok(message) => Decrypted::Text(Content::Post { message, files: files.clone() }),
+            Err(why) => {
+                tracing::warn!("couldn't read the edit of post {}: {why}", post.id);
+                original
+            }
+        }
+    }
+
+    async fn decrypt_original(&self, post: &Post) -> Decrypted {
         let Some(e2ee) = post.props.get("dm_e2ee") else { return Decrypted::Plain };
         if let Some(text) = self.text(&post.id).await {
             return Decrypted::Text(text);
@@ -575,51 +697,122 @@ impl<S: LocalStore> E2ee<S> {
             && !post.pending_post_id.is_empty()
             && let Some(text) = self.text(&format!("pending:{}", post.pending_post_id)).await
         {
-            self.keep(post, &text);
+            self.keep(&post.id, &post.channel_id, &text);
             return Decrypted::Text(text);
         }
-        let Ok(e2ee) = serde_json::from_value::<DmE2ee>(e2ee.clone()) else { return Decrypted::Unreadable("it isn't a message this app understands".into()) };
-        let Ok(ct) = e2ee.ciphertext() else { return Decrypted::Unreadable("it isn't a message this app understands".into()) };
+        let Some((e2ee, ct)) = parse(e2ee) else { return Decrypted::Unreadable("it isn't a message this app understands".into()) };
+        let expected = Aad::post(&post.channel_id, &post.root_id, &post.pending_post_id);
+        match self.open(&post.id, &post.channel_id, &e2ee, &ct, &post.user_id, &expected).await {
+            Ok(content) => Decrypted::Text(content),
+            Err(why) => Decrypted::Unreadable(why),
+        }
+    }
 
+    async fn decrypt_edit(&self, post: &Post, edit: &serde_json::Value) -> Result<String, String> {
+        let (e2ee, ct) = parse(edit).ok_or("it isn't an edit this app understands")?;
+        let key = edit_key(&post.id, &ct);
+        let content = match self.text(&key).await {
+            Some(content) => content,
+            None => self.open(&key, &post.channel_id, &e2ee, &ct, &post.user_id, &Aad::edit(&post.channel_id, &post.id)).await?,
+        };
+        match content {
+            Content::Edit { message } => Ok(message),
+            _ => Err("it isn't an edit".into()),
+        }
+    }
+
+    /// Reads an encrypted event, once: a reaction's emoji and whether it was
+    /// added. `None` if it can't be read here.
+    pub async fn decrypt_event(&self, event: &E2eeEvent) -> Option<(String, bool)> {
+        let key = event_key(&event.post_id, &event.user_id, &event.client_id);
+        let content = match self.text(&key).await {
+            Some(content) => content,
+            None => {
+                let (e2ee, ct) = parse(&event.dm_e2ee)?;
+                let expected = Aad::event(&event.channel_id, &event.post_id, &event.client_id);
+                match self.open(&key, &event.channel_id, &e2ee, &ct, &event.user_id, &expected).await {
+                    Ok(content) => content,
+                    Err(why) => {
+                        tracing::warn!("couldn't read event {}: {why}", event.id);
+                        return None;
+                    }
+                }
+            }
+        };
+        match content {
+            Content::Reaction { post_id, emoji, on } if post_id == event.post_id => Some((emoji, on)),
+            _ => None,
+        }
+    }
+
+    /// A post's reactions, from its encrypted events: each person's last
+    /// word on each emoji.
+    pub async fn reactions(&self, post: &Post) -> Vec<Reaction> {
+        let mut state: Vec<Reaction> = Vec::new();
+        for event in &post.metadata.e2ee_events {
+            let Some((emoji, on)) = self.decrypt_event(event).await else { continue };
+            state.retain(|r| !(r.user_id == event.user_id && r.emoji_name == emoji));
+            if on {
+                state.push(Reaction { user_id: event.user_id.clone(), post_id: post.id.clone(), emoji_name: emoji, create_at: event.create_at });
+            }
+        }
+        state
+    }
+
+    /// How to read an encrypted file, if a message read here had it.
+    pub fn file_key(&self, file_id: &str) -> Option<FileKey> {
+        self.file_keys.lock().unwrap_or_else(|e| e.into_inner()).get(file_id).cloned()
+    }
+
+    /// Forgets what this device kept of a deleted post: its text, edits and
+    /// reactions.
+    pub fn forget_post(&self, post: &Post) {
+        self.store.forget_texts(&post.id, &post.pending_post_id);
+    }
+
+    /// Decrypts a message (a post, an edit or an event) from `sender`,
+    /// which must say it belongs where `expected` says, and keeps its
+    /// content under `key`. The error says why, for people.
+    async fn open(&self, key: &str, channel_id: &str, e2ee: &DmE2ee, ct: &[u8], sender: &str, expected: &Aad) -> Result<Content, String> {
         let _held = self.lock.lock().await;
         // Another task may have read it while this one waited.
-        if let Some(text) = self.text(&post.id).await {
-            return Decrypted::Text(text);
+        if let Some(text) = self.text(key).await {
+            return Ok(text);
         }
-        if !self.device.has_group(&post.channel_id)
+        if !self.device.has_group(channel_id)
             && let Err(e) = self.take_welcomes().await
         {
             tracing::warn!("couldn't fetch Welcomes: {e}");
         }
         let before = "it was sent before this device joined the conversation";
-        if !self.device.has_group(&post.channel_id) || self.joined(&post.channel_id).await.is_some_and(|j| e2ee.epoch < j) {
-            return Decrypted::Unreadable(before.into());
+        if !self.device.has_group(channel_id) || self.joined(channel_id).await.is_some_and(|j| e2ee.epoch < j) {
+            return Err(before.into());
         }
-        if self.device.epoch(&post.channel_id).is_ok_and(|e| e2ee.epoch > e)
-            && let Err(e) = self.catch_up(&post.channel_id).await
+        if self.device.epoch(channel_id).is_ok_and(|e| e2ee.epoch > e)
+            && let Err(e) = self.catch_up(channel_id).await
         {
-            tracing::warn!("couldn't catch up on {}: {e}", post.channel_id);
+            tracing::warn!("couldn't catch up on {channel_id}: {e}");
         }
-        let result = self.device.process(&post.channel_id, &ct, &Keys::default());
+        let result = self.device.process(channel_id, ct, &Keys::default());
         self.persist();
         match result {
             Ok(Incoming::Message { from, content, aad, .. }) => {
-                if from.0 != post.user_id {
-                    tracing::warn!("post {} is from {} but was encrypted by {}", post.id, post.user_id, from.0);
-                    return Decrypted::Unreadable("it claims to be from someone other than who sent it".into());
+                if from.0 != sender {
+                    tracing::warn!("{key} is from {sender} but was encrypted by {}", from.0);
+                    return Err("it claims to be from someone other than who sent it".into());
                 }
-                if let Err(e) = aad.check(&Aad::post(&post.channel_id, &post.root_id, &post.pending_post_id)) {
-                    tracing::warn!("post {}: {e}", post.id);
-                    return Decrypted::Unreadable("it was moved from where it was sent".into());
+                if let Err(e) = aad.check(expected) {
+                    tracing::warn!("{key}: {e}");
+                    return Err("it was moved from where it was sent".into());
                 }
-                self.keep(post, &content);
-                Decrypted::Text(content)
+                self.keep(key, channel_id, &content);
+                Ok(content)
             }
-            Ok(Incoming::Own) => Decrypted::Unreadable("it was sent from this device, but its text wasn't kept".into()),
-            Ok(_) => Decrypted::Unreadable("it isn't a message".into()),
+            Ok(Incoming::Own) => Err("it was sent from this device, but its text wasn't kept".into()),
+            Ok(_) => Err("it isn't a message".into()),
             Err(e) => {
-                tracing::warn!("couldn't decrypt post {}: {e}", post.id);
-                Decrypted::Unreadable("it couldn't be decrypted on this device".into())
+                tracing::warn!("couldn't decrypt {key}: {e}");
+                Err("it couldn't be decrypted on this device".into())
             }
         }
     }
@@ -628,9 +821,9 @@ impl<S: LocalStore> E2ee<S> {
         self.store.text(key).await.and_then(|t| serde_json::from_str(&t).ok())
     }
 
-    fn keep(&self, post: &Post, content: &Content) {
+    fn keep(&self, key: &str, channel_id: &str, content: &Content) {
         if let Ok(json) = serde_json::to_string(content) {
-            self.store.save_text(&post.id, &post.channel_id, &json);
+            self.store.save_text(key, channel_id, &json);
         }
     }
 
