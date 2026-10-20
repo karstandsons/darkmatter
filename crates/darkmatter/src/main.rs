@@ -1,4 +1,5 @@
 mod account;
+mod animated;
 mod app;
 mod chat;
 mod chat_view;

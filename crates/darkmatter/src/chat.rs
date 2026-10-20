@@ -1371,7 +1371,9 @@ impl Chat {
                     keys.push(media::Key::Avatar(u.id.clone(), u.last_picture_update));
                 }
                 for f in &post.metadata.files {
-                    if f.mime_type.starts_with("image/") && f.has_preview_image {
+                    if crate::lightbox::is_gif(f) {
+                        keys.push(media::Key::Gif(f.id.clone()));
+                    } else if f.mime_type.starts_with("image/") && f.has_preview_image {
                         keys.push(media::Key::Preview(f.id.clone()));
                     }
                 }
@@ -1919,6 +1921,10 @@ impl Chat {
             }
             Message::Media(key, result) => {
                 self.media.loaded(key, result);
+                Task::none()
+            }
+            Message::Animation(key, result) => {
+                self.media.animation(key, result);
                 Task::none()
             }
             Message::Lightbox(m) => self.lightbox_update(m),

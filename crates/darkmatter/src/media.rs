@@ -17,11 +17,15 @@ pub enum Key {
     Full(String),
     /// A custom emoji's image, by emoji id.
     Emoji(String),
+    /// A GIF, played from the original file (servers make no animated
+    /// previews; Mattermost makes none at all for GIFs).
+    Gif(String),
 }
 
 pub enum Media {
     Loading,
     Ready(image::Handle),
+    Animated(std::sync::Arc<crate::animated::Frames>),
     Failed,
 }
 
@@ -34,6 +38,15 @@ impl Cache {
     pub fn get(&self, key: &Key) -> Option<&image::Handle> {
         match self.items.get(key) {
             Some(Media::Ready(h)) => Some(h),
+            Some(Media::Animated(f)) => Some(f.first()),
+            _ => None,
+        }
+    }
+
+    /// A GIF's frames, once decoded.
+    pub fn frames(&self, key: &Key) -> Option<&crate::animated::Frames> {
+        match self.items.get(key) {
+            Some(Media::Animated(f)) => Some(f),
             _ => None,
         }
     }
@@ -51,6 +64,22 @@ impl Cache {
             }
             self.items.insert(key.clone(), Media::Loading);
             let client = client.clone();
+            if let Key::Gif(id) = &key {
+                let id = id.clone();
+                tasks.push(Task::perform(
+                    async move {
+                        let bytes = client.file(&id).await.map_err(|e| e.to_string());
+                        // Decoding every frame takes a moment: not on the UI thread.
+                        let frames = match bytes {
+                            Ok(b) => tokio::task::spawn_blocking(move || crate::animated::Frames::decode(&b)).await.map_err(|e| e.to_string()).and_then(|r| r),
+                            Err(e) => Err(e),
+                        };
+                        (key, frames.map(std::sync::Arc::new))
+                    },
+                    |(key, r)| Message::Animation(key, r),
+                ));
+                continue;
+            }
             tasks.push(
                 Task::perform(
                     async move {
@@ -59,6 +88,7 @@ impl Cache {
                             Key::Preview(id) => client.file_preview(id).await,
                             Key::Full(id) => client.file(id).await,
                             Key::Emoji(id) => client.emoji_image(id).await,
+                            Key::Gif(_) => unreachable!("fetched above"),
                         };
                         (key, bytes.map_err(|e| e.to_string()))
                     },
@@ -71,6 +101,17 @@ impl Cache {
     /// Drop the full-size images (the viewer closed).
     pub fn forget_full(&mut self) {
         self.items.retain(|k, _| !matches!(k, Key::Full(_)));
+    }
+
+    pub fn animation(&mut self, key: Key, result: Result<std::sync::Arc<crate::animated::Frames>, String>) {
+        let media = match result {
+            Ok(frames) => Media::Animated(frames),
+            Err(e) => {
+                tracing::warn!("media {key:?}: {e}");
+                Media::Failed
+            }
+        };
+        self.items.insert(key, media);
     }
 
     pub fn loaded(&mut self, key: Key, result: Result<Vec<u8>, String>) {

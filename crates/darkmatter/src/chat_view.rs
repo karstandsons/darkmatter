@@ -1077,11 +1077,13 @@ impl Chat {
         if crate::lightbox::is_image(f) {
             let open = Message::Lightbox(crate::lightbox::Msg::Open(f.id.clone(), post_id.to_string()));
             let (w, h) = media::preview_size(f.width, f.height);
-            let key = media::Key::Preview(f.id.clone());
-            let inner: Element<'_, Message> = match self.media.get(&key) {
+            let gif = crate::lightbox::is_gif(f);
+            let key = if gif { media::Key::Gif(f.id.clone()) } else { media::Key::Preview(f.id.clone()) };
+            let inner: Element<'_, Message> = match (self.media.frames(&key), self.media.get(&key)) {
+                (Some(frames), _) => crate::animated::animated(frames, w).into(),
                 // Height follows the width the pane allows, keeping the aspect ratio.
-                Some(handle) => image(handle.clone()).width(w).height(Length::Shrink).border_radius(6).into(),
-                None => container(
+                (None, Some(handle)) => image(handle.clone()).width(w).height(Length::Shrink).border_radius(6).into(),
+                (None, None) => container(
                     text(if self.media.failed(&key) { "Preview unavailable" } else { "Loading…" }).size(12).color(c.muted),
                 )
                 .center_x(w)

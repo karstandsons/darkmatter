@@ -186,6 +186,8 @@ pub enum Message {
     Edit(bool, iced::widget::text_editor::Action),
     SendReply,
     Media(crate::media::Key, Result<Vec<u8>, String>),
+    /// A GIF's frames, decoded.
+    Animation(crate::media::Key, Result<std::sync::Arc<crate::animated::Frames>, String>),
     OpenFile(String, String),
     /// The image viewer.
     Lightbox(crate::lightbox::Msg),
@@ -648,7 +650,7 @@ impl App {
             match &message {
                 // Login input carries the password; never log it.
                 Message::Login(..) => {}
-                Message::Ws(_) | Message::Tick | Message::Media(..) | Message::History(..) | Message::Thread(..) | Message::JumpWindow(..) | Message::Newer(..) => {}
+                Message::Ws(_) | Message::Tick | Message::Media(..) | Message::Animation(..) | Message::History(..) | Message::Thread(..) | Message::JumpWindow(..) | Message::Newer(..) => {}
                 Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                     tracing::debug!("key {key:?} {modifiers:?}")
                 }

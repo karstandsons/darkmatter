@@ -41,7 +41,12 @@ pub struct Lightbox {
 }
 
 pub fn is_image(f: &FileInfo) -> bool {
-    f.mime_type.starts_with("image/") && f.has_preview_image
+    f.mime_type.starts_with("image/") && (f.has_preview_image || is_gif(f))
+}
+
+/// A GIF, shown from the file itself (the server makes no preview of it).
+pub fn is_gif(f: &FileInfo) -> bool {
+    f.mime_type == "image/gif" && f.width > 0 && f.height > 0
 }
 
 impl Lightbox {
@@ -117,7 +122,7 @@ impl Lightbox {
         let f = self.current();
         let full = MediaKey::Full(f.id.clone());
         // The preview you were looking at, until the full image arrives.
-        let handle = media.get(&full).or_else(|| media.get(&MediaKey::Preview(f.id.clone())));
+        let handle = media.get(&full).or_else(|| media.get(&MediaKey::Preview(f.id.clone()))).or_else(|| media.get(&MediaKey::Gif(f.id.clone())));
         let lb = |m: Msg| Message::Lightbox(m);
         let picture: Element<'_, Message> = match handle {
             Some(h) => zoom::zoom(h.clone(), self.natural(), self.view, move |v| lb(Msg::View(v)), move |s| lb(Msg::Area(s)))
