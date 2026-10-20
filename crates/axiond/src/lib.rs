@@ -13,6 +13,7 @@ mod db;
 mod error;
 mod hub;
 mod ids;
+mod limits;
 
 use std::ops::Deref;
 use std::sync::Arc;
@@ -32,6 +33,7 @@ pub struct State {
     pub db: db::Db,
     hub: hub::Hub,
     guard: auth::Guard,
+    limiter: limits::Limiter,
 }
 
 impl Deref for App {
@@ -46,13 +48,14 @@ impl App {
     /// Opens the database in the configured data folder.
     pub async fn open(config: Config) -> anyhow::Result<Self> {
         let db = db::open(&config.data_dir).await?;
-        Ok(App(Arc::new(State { config, db, hub: Default::default(), guard: Default::default() })))
+        Ok(App(Arc::new(State { config, db, hub: Default::default(), guard: Default::default(), limiter: Default::default() })))
     }
 
     /// Serves the API on `listener` until Ctrl+C or SIGTERM.
     pub async fn serve(self, listener: TcpListener) -> anyhow::Result<()> {
         let db = self.db.clone();
-        axum::serve(listener, api::router(self)).with_graceful_shutdown(shutdown()).await?;
+        let service = api::router(self).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        axum::serve(listener, service).with_graceful_shutdown(shutdown()).await?;
         db.close().await;
         Ok(())
     }

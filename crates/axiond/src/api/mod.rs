@@ -88,7 +88,10 @@ pub fn router(app: App) -> Router {
         .route("/emoji/{id}/image", get(images::emoji_image))
         .route("/websocket", get(ws::websocket))
         .fallback(not_yet);
-    Router::new().nest("/api/v4", api).with_state(app)
+    Router::new()
+        .nest("/api/v4", api)
+        .layer(axum::middleware::from_fn_with_state(app.clone(), crate::limits::by_address))
+        .with_state(app)
 }
 
 /// What end-to-end encryption this server offers. Darkmatter uses it to

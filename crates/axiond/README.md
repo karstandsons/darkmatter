@@ -21,6 +21,10 @@ exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
 - Blocking someone (no direct messages either way, no notifications from
   them) and reporting messages or people to the admins (`axiond reports`).
 - An audit log of what admins did (`axiond audit`).
+- Rate limits: every address gets 300 requests at once and 30 a second
+  after that; logging in and signing up get 10, then one every 6 seconds;
+  each person can send 30 messages at once, then 5 a second. Behind a proxy,
+  the address is the last one in `X-Forwarded-For`.
 - Teams, public channels and direct messages: joining, leaving, and finding
   channels by name.
 - Messages: posting, threads, editing, deleting and reactions.

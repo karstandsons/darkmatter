@@ -745,3 +745,38 @@ async fn invites_blocking_reports_and_deleting() {
     assert_eq!(log.last().unwrap().actor, "alice");
     let _ = dm;
 }
+
+#[tokio::test]
+async fn rate_limits() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let http = reqwest::Client::new();
+    let try_login = |who: String, forwarded: &'static str| {
+        http.post(format!("{}/api/v4/users/login", s.url))
+            .header("x-forwarded-for", forwarded)
+            .json(&serde_json::json!({ "login_id": who, "password": "x" }))
+            .send()
+    };
+    // Ten tries from one address (one was Alice's login), then it has to
+    // wait. Not behind a proxy, a made-up X-Forwarded-For changes nothing.
+    for i in 0..9 {
+        let status = try_login(format!("nobody{i}"), if i % 2 == 0 { "1.2.3.4" } else { "5.6.7.8" }).await.unwrap().status();
+        assert_eq!(status, 401, "try {i}");
+    }
+    let blocked = try_login("someone".into(), "9.9.9.9").await.unwrap();
+    assert_eq!(blocked.status(), 429);
+    assert!(blocked.headers()["retry-after"].to_str().unwrap().parse::<u64>().unwrap() >= 1);
+
+    // Posting too fast is refused until it slows down.
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let mut refused = 0;
+    for i in 0..40 {
+        let new = NewPost { channel_id: town.clone(), message: format!("spam {i}"), ..Default::default() };
+        if let Err(e) = alice.create_post(&new).await {
+            assert!(format!("{e:?}").contains("429"), "{e:?}");
+            refused += 1;
+        }
+    }
+    assert!(refused > 0);
+}

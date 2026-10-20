@@ -48,6 +48,9 @@ pub struct Create {
 }
 
 pub async fn create(State(app): State<App>, me: Me, Json(body): Json<Create>) -> Result<(StatusCode, Json<Post>)> {
+    if app.limiter.take(&format!("post {}", me.user_id), crate::limits::POSTS).is_err() {
+        return Err(Error::too_many("You're sending messages too fast. Wait a moment."));
+    }
     let message = body.message.trim_end().to_string();
     if message.trim().is_empty() && body.file_ids.is_empty() {
         return Err(Error::bad_request("A message can't be empty."));
