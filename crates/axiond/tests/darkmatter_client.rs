@@ -948,3 +948,53 @@ async fn housekeeping_removes_deleted_files() {
     assert!(!stored(&posted.id).exists() && !stored(&unposted.id).exists());
     assert!(!s.app.config.data_dir.join("files").join(&posted.id[..2]).join(format!("{}_thumb.jpg", posted.id)).exists());
 }
+
+/// Databases made by released versions of axiond, oldest first. Each must
+/// open with today's code (its migrations run) and still hold its messages.
+/// Make one for a new release with
+/// `AXIOND_FIXTURE=x.y.z cargo test -p axiond --test darkmatter_client make_upgrade_fixture -- --ignored`.
+const UPGRADE_FIXTURES: &[&str] = &["0.1.0"];
+
+#[tokio::test]
+#[ignore = "writes tests/fixtures/axiond-<version>.db; run by hand for a release"]
+async fn make_upgrade_fixture() {
+    let version = std::env::var("AXIOND_FIXTURE").expect("set AXIOND_FIXTURE to the release, e.g. 0.1.0");
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let bob_id = bob.me().await.unwrap().id;
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let rust = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "rust").unwrap().id;
+    let root = alice.create_post(&NewPost { channel_id: rust.clone(), message: "fixture: a thread @bob".into(), ..Default::default() }).await.unwrap();
+    bob.create_post(&NewPost { channel_id: rust.clone(), root_id: root.id.clone(), message: "fixture: a reply".into(), ..Default::default() }).await.unwrap();
+    bob.add_reaction(&bob_id, &root.id, "+1").await.unwrap();
+    let file = alice.upload_file(&rust, "fixture.png", png(4, 4)).await.unwrap().file_infos.remove(0);
+    alice.create_post(&NewPost { channel_id: rust.clone(), message: "fixture: a file".into(), file_ids: vec![file.id], ..Default::default() }).await.unwrap();
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/axiond-{version}.db"));
+    axiond::backup::snapshot_db(&s.app.db, &out).await.unwrap();
+    println!("wrote {}", out.display());
+}
+
+#[tokio::test]
+async fn databases_from_older_versions_open() {
+    for version in UPGRADE_FIXTURES {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/axiond-{version}.db"));
+        std::fs::copy(&fixture, dir.path().join("axiond.db")).unwrap();
+        let app = App::open(Config { data_dir: dir.path().into(), ..Config::default() }).await.unwrap_or_else(|e| panic!("{version}: {e:#}"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(app.serve(listener));
+        let mut alice = Client::new(&url).unwrap();
+        alice.login("alice", PASSWORD, None).await.unwrap_or_else(|e| panic!("{version}: {e}"));
+        let team = alice.my_teams().await.unwrap()[0].id.clone();
+        let rust = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "rust").unwrap().id;
+        let page = alice.posts(&rust, PostsQuery::Page { page: 0, per_page: 50 }, true).await.unwrap();
+        let messages: Vec<&str> = page.chronological().iter().map(|p| p.message.as_str()).collect();
+        assert_eq!(messages, ["fixture: a thread @bob", "fixture: a file"], "{version}");
+        let root = page.chronological()[0].clone();
+        assert_eq!((root.reply_count, root.metadata.reactions.len()), (1, 1), "{version}");
+        assert_eq!(page.chronological()[1].metadata.files.len(), 1, "{version}");
+        assert!(alice.search_posts(&team, "reply").await.unwrap().order.len() == 1, "{version}: search index");
+    }
+}
