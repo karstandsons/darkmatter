@@ -27,6 +27,10 @@ The release workflow uses each version's section here as its release notes.
   conversations unless you tick "May read encrypted conversations" for
   them in the Plugins window, and every plugin request now says which
   server it's for.
+- **With axiond:** search finds messages in encrypted conversations too.
+  The server can't read them, so Darkmatter keeps its own index of what
+  it has decrypted, inside its encrypted database, and shows its finds
+  beside the server's.
 - **Fixed:** clicking a link in a message did nothing.
 
 ## [0.4.3] - 2026-10-20

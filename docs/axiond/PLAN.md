@@ -443,7 +443,7 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
      - this happens once per connection, and again after the connection drops;
      - catching up for a message stops at that message's epoch;
      - sending and live handshakes wait for the backlog too.
-8. **Local search** over decrypted messages, merged with the server's results.
+8. **Local search** over decrypted messages, merged with the server's results. *(done 2026-10-20; checked in the app)* An FTS5 index inside the vault (SQLCipher) holds each decrypted message as last shown: it's written as messages are decrypted, edits replace it and deletes remove it. Ctrl+F searches it beside the server and shows both, newest first; `from:` and `in:` narrow it too, and if the server can't be reached, this device's results still show. Messages decrypted before this step are indexed when they're next shown.
 9. **Devices:**
    - linking a new device by QR or code;
    - the devices page and revocation;

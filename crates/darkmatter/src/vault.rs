@@ -44,7 +44,48 @@ enum Write {
     Identity { user_id: String, key: String },
     Text { key: String, channel_id: String, content: String },
     ForgetTexts { post_id: String, pending_post_id: String },
+    Index(Found),
     Flush(oneshot::Sender<()>),
+}
+
+/// A decrypted message, as local search keeps and finds it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Found {
+    pub post_id: String,
+    pub channel_id: String,
+    pub user_id: String,
+    pub root_id: String,
+    pub create_at: i64,
+    pub message: String,
+}
+
+/// Search terms as an FTS5 query: every word (or "quoted phrase") must be
+/// there, each word also matching longer ones (`deploy` finds `deployed`).
+/// Nothing in the terms is FTS syntax, so they can't make a bad query.
+pub fn fts_query(terms: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    let mut rest = terms;
+    while let Some(start) = rest.find(|c: char| !c.is_whitespace()) {
+        rest = &rest[start..];
+        let (phrase, quoted, after) = match rest.strip_prefix('"') {
+            Some(q) => match q.find('"') {
+                Some(end) => (&q[..end], true, &q[end + 1..]),
+                None => (q, true, ""),
+            },
+            None => {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                (&rest[..end], false, &rest[end..])
+            }
+        };
+        rest = after;
+        let words: String = phrase.chars().map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' }).collect();
+        let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+        if words.is_empty() {
+            continue;
+        }
+        parts.push(if quoted { format!("\"{words}\"") } else { words.split(' ').map(|w| format!("\"{w}\"*")).collect::<Vec<_>>().join(" ") });
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 impl Writer {
@@ -74,6 +115,11 @@ impl Writer {
     }
 
     /// Forgets a deleted post's kept content: its text, edits and events.
+    /// Keeps a decrypted message searchable, as shown now.
+    pub fn index(&self, found: Found) {
+        let _ = self.0.send(Write::Index(found));
+    }
+
     pub fn forget_texts(&self, post_id: &str, pending_post_id: &str) {
         let _ = self.0.send(Write::ForgetTexts { post_id: post_id.into(), pending_post_id: pending_post_id.into() });
     }
@@ -236,6 +282,30 @@ impl Vault {
         sqlx::query_scalar("SELECT content FROM texts WHERE k = ?").bind(key).fetch_optional(&self.pool).await.ok().flatten()
     }
 
+    /// Decrypted messages matching the terms, newest first: in these channels,
+    /// if any are given.
+    pub async fn search(&self, terms: &str, channels: &[String], limit: i64) -> Vec<Found> {
+        let Some(query) = fts_query(terms) else { return Vec::new() };
+        let rows = sqlx::query(
+            "SELECT i.post_id, i.channel_id, i.user_id, i.root_id, i.create_at, s.message
+             FROM search s JOIN indexed i ON i.id = s.rowid
+             WHERE search MATCH ?1
+             ORDER BY i.create_at DESC",
+        )
+        .bind(query)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("local search failed: {e}");
+            Vec::new()
+        });
+        rows.iter()
+            .map(|r| Found { post_id: r.get(0), channel_id: r.get(1), user_id: r.get(2), root_id: r.get(3), create_at: r.get(4), message: r.get(5) })
+            .filter(|f| channels.is_empty() || channels.contains(&f.channel_id))
+            .take(limit.max(0) as usize)
+            .collect()
+    }
+
     /// Forgets this device's encryption state (it's gone from the server).
     pub async fn clear_device(&self) -> sqlx::Result<()> {
         self.writer.flush().await;
@@ -311,6 +381,35 @@ async fn apply(pool: &SqlitePool, write: Write) -> sqlx::Result<()> {
                 .bind(like("event"))
                 .execute(pool)
                 .await?;
+            let id: Option<i64> = sqlx::query_scalar("DELETE FROM indexed WHERE post_id = ? RETURNING id").bind(&post_id).fetch_optional(pool).await?;
+            if let Some(id) = id {
+                sqlx::query("DELETE FROM search WHERE rowid = ?").bind(id).execute(pool).await?;
+            }
+        }
+        Write::Index(f) => {
+            let hash = sha2::Sha256::digest(f.message.as_bytes()).to_vec();
+            let known: Option<(i64, Vec<u8>)> = sqlx::query_as("SELECT id, hash FROM indexed WHERE post_id = ?").bind(&f.post_id).fetch_optional(pool).await?;
+            match known {
+                Some((_, h)) if h == hash => {}
+                Some((id, _)) => {
+                    sqlx::query("UPDATE indexed SET hash = ? WHERE id = ?").bind(&hash).bind(id).execute(pool).await?;
+                    sqlx::query("UPDATE search SET message = ? WHERE rowid = ?").bind(&f.message).bind(id).execute(pool).await?;
+                }
+                None => {
+                    let id: i64 = sqlx::query_scalar(
+                        "INSERT INTO indexed (post_id, channel_id, user_id, root_id, create_at, hash) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+                    )
+                    .bind(&f.post_id)
+                    .bind(&f.channel_id)
+                    .bind(&f.user_id)
+                    .bind(&f.root_id)
+                    .bind(f.create_at)
+                    .bind(&hash)
+                    .fetch_one(pool)
+                    .await?;
+                    sqlx::query("INSERT INTO search (rowid, message) VALUES (?, ?)").bind(id).bind(&f.message).execute(pool).await?;
+                }
+            }
         }
         Write::Flush(done) => {
             let _ = done.send(());
@@ -330,6 +429,37 @@ mod tests {
             "queued_at": 1,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn search_terms_become_safe_queries() {
+        assert_eq!(fts_query("deploy friday").as_deref(), Some("\"deploy\"* \"friday\"*"));
+        assert_eq!(fts_query("\"door code\" 44").as_deref(), Some("\"door code\" \"44\"*"));
+        // FTS syntax in the terms is just text.
+        assert_eq!(fts_query("a OR b* NEAR(x) -c \"").as_deref(), Some("\"a\"* \"OR\"* \"b\"* \"NEAR\"* \"x\"* \"c\"*"));
+        assert_eq!(fts_query("  * : ( "), None);
+    }
+
+    #[tokio::test]
+    async fn finds_what_it_decrypted_as_last_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Vault::open(&dir.path().join("v.db"), &[9u8; 32]).await.unwrap();
+        let found = |id: &str, channel: &str, message: &str, at| Found { post_id: id.into(), channel_id: channel.into(), user_id: "bob".into(), root_id: String::new(), create_at: at, message: message.into() };
+        v.writer().index(found("p1", "c1", "The door code is 4471", 1));
+        v.writer().index(found("p2", "c2", "Doors open at seven", 2));
+        v.writer().index(found("p3", "c1", "nothing to see", 3));
+        v.writer().flush().await;
+        let ids = |r: Vec<Found>| r.into_iter().map(|f| f.post_id).collect::<Vec<_>>();
+        assert_eq!(ids(v.search("door", &[], 50).await), ["p2", "p1"], "newest first, prefixes match");
+        assert_eq!(ids(v.search("door", &["c1".into()], 50).await), ["p1"]);
+        assert_eq!(ids(v.search("\"door code\"", &[], 50).await), ["p1"]);
+        assert_eq!(ids(v.search("dôor", &[], 50).await), ["p2", "p1"], "accents don't matter");
+        // An edit replaces what's found; a delete takes it away.
+        v.writer().index(found("p1", "c1", "changed my mind", 1));
+        v.writer().forget_texts("p2", "");
+        v.writer().flush().await;
+        assert!(v.search("door", &[], 50).await.is_empty());
+        assert_eq!(ids(v.search("mind", &[], 50).await), ["p1"]);
     }
 
     #[tokio::test]

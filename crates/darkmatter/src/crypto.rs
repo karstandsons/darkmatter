@@ -131,6 +131,17 @@ pub async fn open(crypto: &Shared, posts: &mut [&mut Post]) {
                 // The files as the sender described them; the server knows
                 // them only as blobs (thumbnails included).
                 post.metadata.files = files.iter().map(|k| crate::media::file_info(k, post)).collect();
+                // Searchable here, since the server can't search it.
+                if let Some(c) = crypto.as_ref().filter(|_| !post.id.is_empty()) {
+                    c.store().0.writer().index(crate::vault::Found {
+                        post_id: post.id.clone(),
+                        channel_id: post.channel_id.clone(),
+                        user_id: post.user_id.clone(),
+                        root_id: post.root_id.clone(),
+                        create_at: post.create_at,
+                        message: message.clone(),
+                    });
+                }
                 message
             }
             Decrypted::Text(_) => "🔒 *Not a message this app shows yet.*".into(),

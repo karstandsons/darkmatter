@@ -245,7 +245,6 @@ pub struct Chat {
     /// What axiond says about itself; `None` on plain Mattermost.
     pub axiond: Option<mm_api::models::AxiondInfo>,
     /// The account's encrypted local database.
-    #[expect(dead_code, reason = "local search reads it: M2 step 8")]
     pub vault: Option<std::sync::Arc<crate::vault::Vault>>,
     /// End-to-end encryption on this device (axiond), and how it stands.
     pub crypto: crate::crypto::Shared,
@@ -1527,13 +1526,48 @@ impl Chat {
     fn search(&mut self, terms: String, mentions: bool) -> Task<Message> {
         self.panel = Some(Panel::Search(SearchPane { input: terms.clone(), terms: terms.clone(), mentions, results: None }));
         let (client, team) = (self.client.clone(), self.team.clone());
+        let local = self.vault.clone().zip(self.local_search(&terms));
         Task::perform(
             async move {
-                let r = client.search_posts(&team, &terms).await.map_err(err);
-                (terms, r)
+                let server = client.search_posts(&team, &terms);
+                let local = async {
+                    let Some((vault, (words, channels, user))) = local else { return Vec::new() };
+                    let found = vault.search(&words, &channels, 200).await;
+                    found.into_iter().filter(|f| user.as_ref().is_none_or(|u| *u == f.user_id)).take(40).collect()
+                };
+                let (server, local) = tokio::join!(server, local);
+                (terms, merge_results(server.map_err(err), local))
             },
             |(terms, r)| Message::SearchResults(terms, r),
         )
+    }
+
+    /// What to look for in this device's decrypted messages: the words, the
+    /// encrypted channels to look in (this team's, and DMs), and the author.
+    /// `from:` and `in:` narrow it as they do on the server. None when
+    /// there's nowhere to look.
+    fn local_search(&self, terms: &str) -> Option<(String, Vec<String>, Option<String>)> {
+        let (mut words, mut user, mut only) = (Vec::new(), None, None);
+        for t in terms.split_whitespace() {
+            if let Some(name) = t.strip_prefix("from:") {
+                let name = name.trim_start_matches('@');
+                user = Some(self.store.users.values().find(|u| u.username.eq_ignore_ascii_case(name))?.id.clone());
+            } else if let Some(name) = t.strip_prefix("in:") {
+                let name = name.trim_start_matches('~');
+                only = Some(self.store.channels.values().find(|c| c.name.eq_ignore_ascii_case(name) || self.store.channel_label(c).eq_ignore_ascii_case(name))?.id.clone());
+            } else {
+                words.push(t);
+            }
+        }
+        let channels: Vec<String> = self
+            .store
+            .channels
+            .values()
+            .filter(|c| c.encrypted && (c.team_id == self.team || c.team_id.is_empty()))
+            .filter(|c| only.as_ref().is_none_or(|o| *o == c.id))
+            .map(|c| c.id.clone())
+            .collect();
+        (!channels.is_empty()).then(|| (words.join(" "), channels, user))
     }
 
     /// Fetch users we don't know yet (e.g. authors of search results).
@@ -3015,6 +3049,32 @@ impl Chat {
     }
 }
 
+/// The server's search results and this device's, as one list, newest
+/// first. The server can't search encrypted conversations, so they don't
+/// overlap; a failed server search still shows what was found here.
+fn merge_results(server: Result<mm_api::models::PostList, String>, local: Vec<crate::vault::Found>) -> Result<mm_api::models::PostList, String> {
+    let mut list = match server {
+        Ok(list) => list,
+        Err(e) if local.is_empty() => return Err(e),
+        Err(e) => {
+            tracing::warn!("server search failed ({e}); showing this device's results");
+            Default::default()
+        }
+    };
+    for f in local {
+        let post = Post { id: f.post_id, channel_id: f.channel_id, user_id: f.user_id, root_id: f.root_id, create_at: f.create_at, message: f.message, ..Default::default() };
+        if !list.posts.contains_key(&post.id) {
+            list.order.push(post.id.clone());
+        }
+        list.posts.insert(post.id.clone(), post);
+    }
+    let at = |id: &String| list.posts.get(id).map_or(0, |p| p.create_at);
+    let mut order = std::mem::take(&mut list.order);
+    order.sort_by_key(|id| std::cmp::Reverse(at(id)));
+    list.order = order;
+    Ok(list)
+}
+
 /// Find the jump target in the timeline, as the offset from the bottom that
 /// puts it a little below the top of the view.
 fn locate(pv: &PaneView) -> Task<Message> {
@@ -3155,6 +3215,35 @@ pub(crate) mod tests {
 
         chat.plugins = std::sync::Arc::new(plugins::Plugins { list: vec![plugin(true)], ..Default::default() });
         assert_eq!(chat.plugin_context(&target).draft, "a private draft", "allowed");
+    }
+
+    #[test]
+    fn search_merges_this_devices_results_with_the_servers() {
+        let found = |id: &str, at| crate::vault::Found { post_id: id.into(), channel_id: "enc".into(), create_at: at, message: "door".into(), ..Default::default() };
+        let mut server = mm_api::models::PostList::default();
+        server.posts.insert("s1".into(), Post { id: "s1".into(), create_at: 5, ..Default::default() });
+        server.order.push("s1".into());
+        let list = merge_results(Ok(server), vec![found("l1", 9), found("l2", 1)]).unwrap();
+        assert_eq!(list.order, ["l1", "s1", "l2"], "newest first");
+        // The server failing still shows what this device found.
+        assert_eq!(merge_results(Err("down".into()), vec![found("l1", 9)]).unwrap().order, ["l1"]);
+        assert!(merge_results(Err("down".into()), vec![]).is_err());
+    }
+
+    #[test]
+    fn local_search_looks_in_encrypted_channels_with_from_and_in() {
+        let mut chat = chat();
+        assert!(chat.local_search("door").is_none(), "no encrypted channels: nowhere to look");
+        chat.store.add_channels(
+            vec![Channel { id: "enc".into(), name: "family".into(), encrypted: true, ..Default::default() }, Channel { id: "enc2".into(), name: "secret".into(), encrypted: true, ..Default::default() }],
+            vec![ChannelMember { channel_id: "enc".into(), ..Default::default() }, ChannelMember { channel_id: "enc2".into(), ..Default::default() }],
+        );
+        chat.store.add_users(vec![User { id: "u-bob".into(), username: "bob".into(), ..Default::default() }]);
+        let (words, mut channels, user) = chat.local_search("door from:@bob code").unwrap();
+        channels.sort();
+        assert_eq!((words.as_str(), channels, user.as_deref()), ("door code", vec!["enc".to_string(), "enc2".into()], Some("u-bob")));
+        assert_eq!(chat.local_search("door in:~family").unwrap().1, ["enc"]);
+        assert!(chat.local_search("door from:nobody").is_none(), "no such person: nothing");
     }
 
     #[test]

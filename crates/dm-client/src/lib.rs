@@ -258,6 +258,11 @@ pub struct E2ee<S> {
 }
 
 impl<S: LocalStore> E2ee<S> {
+    /// Where this device keeps its state (the app's own store).
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
     fn new(api: Client, user_id: &str, device: Device<MemoryStorage>, identity: IdentityKey, server: ServerKey, store: S, saved: HashMap<Vec<u8>, Vec<u8>>) -> Self {
         E2ee { api, user_id: user_id.into(), device, identity, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false, file_keys: Default::default(), caught_up: Default::default() }
     }
