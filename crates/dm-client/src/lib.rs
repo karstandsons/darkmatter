@@ -603,10 +603,7 @@ impl<S: LocalStore> E2ee<S> {
         let mut out = Vec::new();
         for user in users {
             let known = self.known(user).await;
-            let changed = match self.change(user).await {
-                Some(new) => Some(known.as_ref().is_some_and(|(k, v)| *v && *k != new)),
-                None => None,
-            };
+            let changed = self.change(user).await.map(|new| known.as_ref().is_some_and(|(k, v)| *v && *k != new));
             out.push(Standing { user_id: user.clone(), verified: known.is_some_and(|(_, v)| v) && changed != Some(true), changed });
         }
         out

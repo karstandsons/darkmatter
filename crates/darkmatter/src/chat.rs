@@ -522,7 +522,7 @@ impl Chat {
                 }
             }
         });
-        join.then(|_| Task::done(Message::ReloadOpen))
+        Task::batch([join.then(|_| Task::done(Message::ReloadOpen)), Task::done(Message::Account(crate::account::Msg::EncryptionReady))])
     }
 
     /// `/verify [@someone]`: your safety number with them; in a direct
@@ -541,7 +541,8 @@ impl Chat {
         }
         let name = self.store.users.get(&user).map_or_else(|| user.clone(), |u| u.username.clone());
         self.verify = Some(crate::verify::Verify { user_id: user.clone(), name, safety: None, busy: false });
-        Task::perform(async move { crypto.safety(&user).await }, |r| Message::Verify(crate::verify::Msg::Loaded(r)))
+        let load = Task::perform(async move { crypto.safety(&user).await }, |r| Message::Verify(crate::verify::Msg::Loaded(r)));
+        Task::batch([load, crate::account::unfocus()])
     }
 
     fn verify_update(&mut self, msg: crate::verify::Msg) -> Task<Message> {

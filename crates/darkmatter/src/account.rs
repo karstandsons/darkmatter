@@ -54,6 +54,8 @@ pub enum Msg {
     RecoverPassphrase,
     StartOverPassword(String),
     StartOver,
+    /// This device was just set up (linked or recovered).
+    EncryptionReady,
 }
 
 /// What a device waiting to be linked can do instead (handled by the chat,
@@ -156,6 +158,12 @@ fn qr(url: &str) -> Option<image::Handle> {
     Some(image::Handle::from_rgba(side as u32, side as u32, rgba))
 }
 
+/// Takes the keyboard from whatever has it (the message box), for a window
+/// opened over it.
+pub fn unfocus<T: Send + 'static>() -> Task<T> {
+    iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::unfocus::<()>()).discard()
+}
+
 /// Handles a message for the window; `logout` is set once the account is gone.
 pub fn update(state: &mut Option<Account>, client: &Client, axiond: bool, crypto: &crate::crypto::Shared, msg: Msg) -> (Task<Message>, bool) {
     if let Some(a) = state {
@@ -189,7 +197,8 @@ pub fn update(state: &mut Option<Account>, client: &Client, axiond: bool, crypto
             Some(c) => Task::perform(async move { c.backups().await }, |r| Message::Account(Msg::Backups(r))),
             None => Task::none(),
         };
-        return (Task::batch([load(client.clone(), axiond), backups]), false);
+        // Typing goes to the window, not the message box behind it.
+        return (Task::batch([load(client.clone(), axiond), backups, unfocus()]), false);
     }
     if let Msg::Close = msg {
         *state = None;
@@ -317,6 +326,10 @@ pub fn update(state: &mut Option<Account>, client: &Client, axiond: bool, crypto
                 c.approve_link(&link).await?;
                 Ok("Linked. The new device sets itself up in a moment.".to_string())
             })
+        }
+        Msg::EncryptionReady => {
+            let Some(c) = a.crypto.clone() else { return (Task::none(), false) };
+            Task::perform(async move { c.backups().await }, |r| Message::Account(Msg::Backups(r)))
         }
         Msg::Backups(r) => {
             match r {
@@ -551,10 +564,6 @@ impl Account {
                 .spacing(8),
             );
         }
-        if let Some((is_err, msg)) = &self.status {
-            body = body.push(text(msg).size(12).color(if *is_err { c.red } else { c.green }));
-        }
-        body = body.push(text("Esc close").size(11).color(c.muted));
         self.frame(body, c)
     }
 
@@ -704,7 +713,13 @@ impl Account {
     }
 
     fn frame<'a>(&'a self, body: Column<'a, Message>, c: Colors) -> Element<'a, Message> {
-        let panel = container(scrollable(body).height(Length::Shrink)).padding(16).width(560).max_height(720).style(move |_: &Theme| container::Style {
+        // What the last action did stays in view below the scrolling part.
+        let mut panel = column![scrollable(body).height(Length::Shrink).spacing(10)].spacing(10);
+        if let Some((is_err, msg)) = &self.status {
+            panel = panel.push(text(msg).size(12).color(if *is_err { c.red } else { c.green }));
+        }
+        panel = panel.push(text("Esc close").size(11).color(c.muted));
+        let panel = container(panel).padding(16).width(560).max_height(720).style(move |_: &Theme| container::Style {
             background: Some(Background::Color(c.sidebar)),
             border: Border { radius: 10.0.into(), width: 1.0, color: c.selection },
             ..Default::default()
