@@ -492,7 +492,8 @@ mod tests {
         assert!(Vault::open(&path, &[8u8; 32]).await.is_err());
         // And nothing in the files is readable as text.
         for entry in std::fs::read_dir(dir.path()).unwrap() {
-            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            // SQLite may still be removing a closed connection's -wal or -shm.
+            let Ok(bytes) = std::fs::read(entry.unwrap().path()) else { continue };
             for needle in [&b"secret unsent"[..], b"device.id", b"KEY1", b"SQLite format"] {
                 assert!(!bytes.windows(needle.len()).any(|w| w == needle), "{:?} found in plain text", std::str::from_utf8(needle));
             }
@@ -500,7 +501,8 @@ mod tests {
         #[cfg(unix)]
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let entry = entry.unwrap();
-            assert_eq!(std::os::unix::fs::PermissionsExt::mode(&entry.metadata().unwrap().permissions()) & 0o777, 0o600, "{:?}", entry.file_name());
+            let Ok(meta) = entry.metadata() else { continue };
+            assert_eq!(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777, 0o600, "{:?}", entry.file_name());
         }
     }
 }
