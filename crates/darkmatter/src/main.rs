@@ -30,6 +30,7 @@ mod text;
 mod theme_picker;
 mod update;
 mod vault;
+mod verify;
 mod viewer;
 mod zoom;
 

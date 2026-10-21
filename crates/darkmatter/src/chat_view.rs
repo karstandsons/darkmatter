@@ -359,6 +359,13 @@ impl Chat {
                 _ => "End-to-end encrypted: the first message sets it up for everyone here".into(),
             };
             header = header.push(tooltip(text("🔒").size(13), container(text(who).size(11)).padding([2, 6]).style(c.panel(c.surface)), tooltip::Position::Bottom));
+            // A direct message with someone you verified.
+            if let Some(other) = channel.dm_partner(&self.store.me.id).filter(|u| *u != self.store.me.id)
+                && self.standing.get(other).is_some_and(|s| s.verified)
+            {
+                let tip = container(text("You compared safety numbers: /verify").size(11)).padding([2, 6]).style(c.panel(c.surface));
+                header = header.push(tooltip(text("✓ verified").size(12).color(c.green), tip, tooltip::Position::Bottom));
+            }
         }
         // The title bar hides a title that doesn't fit beside the controls,
         // so keep the topic short.
@@ -370,6 +377,24 @@ impl Chat {
             header = header.push(text(short).size(13).color(c.muted));
         }
         header.into()
+    }
+
+    /// People here whose identity key changed and you haven't checked.
+    fn key_change_note<'a>(&'a self, channel: &str, c: Colors) -> Option<Element<'a, Message>> {
+        let members = self.group_members.get(channel)?;
+        let mut rows = Vec::new();
+        for (user, _) in members {
+            let Some(held) = self.standing.get(user).and_then(|s| s.changed) else { continue };
+            let name = self.store.users.get(user).map_or_else(|| user.clone(), |u| u.username.clone());
+            let what = if held {
+                format!("⚠ @{name}'s safety number changed since you verified it: nothing is sent here until you check it.")
+            } else {
+                format!("⚠ @{name}'s safety number changed: a new install, or someone in the middle.")
+            };
+            let check = button(text("Check").size(12)).padding([2, 10]).on_press(Message::Verify(crate::verify::Msg::Open(user.clone()))).style(c.chip(false));
+            rows.push(row![text(what).size(12).color(if held { c.red } else { c.yellow }).width(Length::Fill), check].spacing(8).align_y(iced::Center).into());
+        }
+        (!rows.is_empty()).then(|| container(iced::widget::Column::with_children(rows).spacing(4)).padding([4, 20]).into())
     }
 
     /// The ✕ at the right of a pane's title bar, when there are other panes.
@@ -550,7 +575,7 @@ impl Chat {
         let here = pv.n == self.focused().n;
         let error = self.error.as_ref().filter(|_| here).map(|e| container(text(e).size(12).color(c.red)).padding([4, 20]).into());
         let note = self.notice.as_ref().filter(|_| here).map(|n| container(text(n).size(12).color(c.muted)).padding([4, 20]).into());
-        let col = column![rule::horizontal(1), timeline, slot(older), slot(error), slot(note)];
+        let col = column![rule::horizontal(1), timeline, slot(older), slot(error), slot(note), slot(self.key_change_note(&pv.channel, c))];
         let composer = row![self.plus_button(false, c), composer].spacing(8).align_y(iced::Center);
         let typing = self.editing_note(&pv.channel, c).unwrap_or_else(|| self.typing_line(&pv.channel, "", c));
         let mut footer = column![typing].spacing(6);

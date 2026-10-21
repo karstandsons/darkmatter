@@ -244,6 +244,9 @@ pub enum Message {
     Linked(Result<Option<std::sync::Arc<crate::crypto::Crypto>>, String>),
     /// Load the open channels' history again (now that it can be decrypted).
     ReloadOpen,
+    Verify(crate::verify::Msg),
+    /// Where you stand with people in encrypted conversations.
+    Standing(Vec<dm_client::Standing>),
     PickFiles,
     /// Attach files to the thread's reply box.
     PickReplyFiles,
@@ -1665,6 +1668,11 @@ impl App {
         }
         if let Some(r) = &self.report {
             body = body.push(r.view(c));
+        }
+        if let Screen::Chat(chat) = &shown.screen
+            && let Some(v) = &chat.verify
+        {
+            body = body.push(v.view(c));
         }
         if let Some((m, at, entry)) = menu_entry {
             body = body.push(crate::rail::menu(m, at, entry, c));

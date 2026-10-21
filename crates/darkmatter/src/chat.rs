@@ -256,6 +256,10 @@ pub struct Chat {
     /// Who each encrypted channel's group holds, as the group says: for the
     /// lock's tooltip. Refreshed when the channel opens or the group changes.
     pub group_members: HashMap<String, Vec<(String, usize)>>,
+    /// Where you stand with people in encrypted conversations, by user id.
+    pub standing: HashMap<String, dm_client::Standing>,
+    /// Someone's safety number, open.
+    pub verify: Option<crate::verify::Verify>,
     /// Installed plugins (`~/.config/darkmatter/plugins`).
     pub plugins: std::sync::Arc<Plugins>,
     /// A plugin's picker, opened from the + menu.
@@ -479,14 +483,87 @@ impl Chat {
         Task::batch([self.update(Message::OpenThread(root)), locate(self.pv())])
     }
 
-    /// Reads who an encrypted channel's group holds, for the lock's tooltip.
+    /// Reads who an encrypted channel's group holds, for the lock's tooltip,
+    /// and where you stand with them.
     fn refresh_group(&self, channel_id: &str) -> Task<Message> {
         let Some(crypto) = self.crypto.clone().filter(|_| self.store.channels.get(channel_id).is_some_and(|c| c.encrypted)) else { return Task::none() };
         let ch = channel_id.to_string();
-        Task::perform(async move { crypto.group_members(&ch) }, {
+        let members = Task::perform({
+            let crypto = crypto.clone();
+            async move { crypto.group_members(&ch) }
+        }, {
             let ch = channel_id.to_string();
             move |m| Message::GroupMembers(ch.clone(), m)
-        })
+        });
+        let ch = channel_id.to_string();
+        let me = self.store.me.id.clone();
+        let standing = Task::perform(
+            async move {
+                let users: Vec<String> = crypto.group_members(&ch).unwrap_or_default().into_iter().map(|(u, _)| u).filter(|u| *u != me).collect();
+                crypto.standing(&users).await
+            },
+            Message::Standing,
+        );
+        Task::batch([members, standing])
+    }
+
+    /// `/verify [@someone]`: your safety number with them; in a direct
+    /// message, with the other person.
+    fn open_verify(&mut self, arg: &str) -> Task<Message> {
+        let Some(crypto) = self.crypto.clone() else { return self.notify("Safety numbers are for encrypted conversations, on axiond, once this device is set up.".into()) };
+        let name = arg.trim().trim_start_matches('@').to_lowercase();
+        let user = if name.is_empty() {
+            self.store.channels.get(&self.pv().channel).and_then(|c| c.dm_partner(&self.store.me.id)).filter(|u| *u != self.store.me.id).map(str::to_string)
+        } else {
+            self.store.users.values().find(|u| u.username.to_lowercase() == name).map(|u| u.id.clone())
+        };
+        let Some(user) = user else { return self.notify("Whose? /verify @name, or use it in a direct message.".into()) };
+        if user == self.store.me.id {
+            return self.notify("That's you: compare your number from someone else's /verify.".into());
+        }
+        let name = self.store.users.get(&user).map_or_else(|| user.clone(), |u| u.username.clone());
+        self.verify = Some(crate::verify::Verify { user_id: user.clone(), name, safety: None, busy: false });
+        Task::perform(async move { crypto.safety(&user).await }, |r| Message::Verify(crate::verify::Msg::Loaded(r)))
+    }
+
+    fn verify_update(&mut self, msg: crate::verify::Msg) -> Task<Message> {
+        use crate::verify::Msg as V;
+        let Some(v) = &mut self.verify else { return Task::none() };
+        match msg {
+            V::Open(user) => {
+                let name = self.store.users.get(&user).map_or(user, |u| u.username.clone());
+                self.open_verify(&name)
+            }
+            V::Loaded(r) => {
+                v.safety = Some(r);
+                Task::none()
+            }
+            V::Mark(on) => {
+                let (Some(crypto), Some(Ok(s))) = (self.crypto.clone(), &v.safety) else { return Task::none() };
+                v.busy = true;
+                let (user, key) = (v.user_id.clone(), s.key.clone());
+                Task::perform(async move { crypto.set_verified(&user, &key, on).await }, |r| Message::Verify(V::Done(r)))
+            }
+            V::Done(r) => {
+                v.busy = false;
+                let user = v.user_id.clone();
+                match r {
+                    Err(e) => v.safety = Some(Err(e)),
+                    Ok(()) => v.safety = None,
+                }
+                let Some(crypto) = self.crypto.clone() else { return Task::none() };
+                let again = Task::perform({
+                    let (crypto, user) = (crypto.clone(), user.clone());
+                    async move { crypto.safety(&user).await }
+                }, |r| Message::Verify(V::Loaded(r)));
+                let standing = Task::perform(async move { crypto.standing(&[user]).await }, Message::Standing);
+                Task::batch([again, standing])
+            }
+            V::Close => {
+                self.verify = None;
+                self.update(Message::FocusComposer)
+            }
+        }
     }
 
     /// `/create [private] <name>`: makes the channel and opens it.
@@ -673,6 +750,8 @@ impl Chat {
             linking: b.linking,
             link_checking: false,
             group_members: HashMap::new(),
+            standing: HashMap::new(),
+            verify: None,
             plugins: Default::default(),
             plugin_picker: None,
             editors: HashMap::new(),
@@ -901,6 +980,7 @@ impl Chat {
                 None => Task::none(),
             },
             C::CreateChannel => self.create_channel(&arg),
+            C::Verify => self.open_verify(&arg),
             C::Attach => self.update(Message::PickFiles),
             C::ReactLatest => match self.latest_post().map(|p| p.id.clone()) {
                 Some(id) => self.update(Message::OpenEmoji(id)),
@@ -1770,8 +1850,10 @@ impl Chat {
             Message::Delivered(id, Err((e, true))) => {
                 // Offline or the server's trouble: it stays queued and shows why.
                 tracing::info!("message not sent yet: {e}");
+                // Held for a changed key: show who, where you're looking.
+                let held = e.contains("changed since you verified");
                 self.outbox.failed(&id, e);
-                Task::none()
+                if held { self.refresh_group(&self.focused().channel.clone()) } else { Task::none() }
             }
             Message::Delivered(id, Err((e, false))) => {
                 // Refused for good: back into its box (unless a new message
@@ -2163,6 +2245,20 @@ impl Chat {
             Message::CloseShortcuts => {
                 self.shortcuts = None;
                 operation::focus(self.pv().composer())
+            }
+            Message::Escape if self.verify.is_some() => self.verify_update(crate::verify::Msg::Close),
+            Message::Verify(m) => {
+                if let crate::verify::Msg::Open(user) = &m
+                    && self.verify.is_none()
+                {
+                    let name = self.store.users.get(user).map_or_else(|| user.clone(), |u| u.username.clone());
+                    return self.open_verify(&name);
+                }
+                self.verify_update(m)
+            }
+            Message::Standing(list) => {
+                self.standing.extend(list.into_iter().map(|s| (s.user_id.clone(), s)));
+                Task::none()
             }
             Message::Escape if self.shortcuts.is_some() => self.update(Message::CloseShortcuts),
             Message::Escape if self.slash.is_some() => {

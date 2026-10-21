@@ -346,6 +346,15 @@ pub struct E2ee<S> {
     changes: Mutex<HashMap<String, String>>,
 }
 
+/// Where you stand with someone, as this device knows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Standing {
+    pub user_id: String,
+    pub verified: bool,
+    /// As in [`Safety::changed`].
+    pub changed: Option<bool>,
+}
+
 /// Where you stand with someone's identity key (E2EE.md §12).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Safety {
@@ -486,6 +495,21 @@ impl<S: LocalStore> E2ee<S> {
         self.trust(user_id, key, verified);
         self.note_change(user_id, "");
         Ok(())
+    }
+
+    /// Where you stand with each of these people, from what this device
+    /// knows (no server call): verified, and any key change not dealt with.
+    pub async fn standing(&self, users: &[String]) -> Vec<Standing> {
+        let mut out = Vec::new();
+        for user in users {
+            let known = self.known(user).await;
+            let changed = match self.change(user).await {
+                Some(new) => Some(known.as_ref().is_some_and(|(k, v)| *v && *k != new)),
+                None => None,
+            };
+            out.push(Standing { user_id: user.clone(), verified: known.is_some_and(|(_, v)| v) && changed != Some(true), changed });
+        }
+        out
     }
 
     /// Of these people, those whose key changed and you haven't dealt with
