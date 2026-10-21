@@ -21,6 +21,7 @@ mod plugin_manager;
 mod plugins;
 mod report;
 mod session;
+mod shared_inbox;
 mod shortcuts;
 mod store;
 mod style;

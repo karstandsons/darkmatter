@@ -13,6 +13,9 @@ The release workflow uses each version's section here as its release notes.
   from. Clicking a notification opens the message on its server.
   Right-click an icon to rename, mute, reorder, sign out or remove it.
   Your current login moves over by itself.
+- **One inbox for every server:** 📥 at the top of the rail (Ctrl+Shift+I,
+  `/all`) lists your unread direct messages and mentions from all your
+  servers, newest first; opening one goes to its server and conversation.
 - Links to a channel or message on any server you're signed into open in
   Darkmatter, on that server.
 - Notifications from encrypted conversations no longer show the message

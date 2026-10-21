@@ -898,7 +898,7 @@ impl Chat {
             // The app's: they change its config.
             C::Themes | C::Plugins | C::Account | C::ThreadLayout | C::Logout | C::ToggleDensity | C::Compact | C::Cozy | C::ToggleSidebar | C::About => Task::none(),
             // The app's: they're about servers.
-            C::PrevServer | C::NextServer | C::MentionServer | C::Server | C::AddServer => Task::none(),
+            C::PrevServer | C::NextServer | C::MentionServer | C::Server | C::AddServer | C::AllInbox => Task::none(),
         }
     }
 

@@ -75,15 +75,33 @@ const ICON: f32 = 40.0;
 const ROW: f32 = 52.0;
 
 /// The rail; no tooltips while its menu is open, so they don't cover it.
-pub fn view(entries: Vec<Entry>, menu_open: bool, c: Colors) -> Element<'static, Message> {
+/// `inbox`: the shared inbox is open, and what's waiting elsewhere.
+pub fn view(entries: Vec<Entry>, inbox: (bool, i64), menu_open: bool, c: Colors) -> Element<'static, Message> {
     let icons = entries.into_iter().enumerate().map(|(i, e)| icon(i, e, !menu_open, c));
+    let (open, waiting) = inbox;
+    let face = button(text("📥").size(18).center().width(Length::Fill))
+        .width(ICON)
+        .height(ICON)
+        .padding([8, 0])
+        .on_press(Message::Run(crate::commands::Command::AllInbox, String::new()))
+        .style(icon_style(if open { c.selection } else { c.surface }, c.fg, open));
+    let mut marks = stack![face].width(ICON + 6.0).height(ICON + 6.0);
+    if waiting > 0 {
+        let n = if waiting > 99 { "99+".to_string() } else { waiting.to_string() };
+        let badge = container(text(n).size(10).font(bold())).padding([0, 5]).style(badge(c.red, c.fg_bright));
+        marks = marks.push(container(badge).width(Length::Fill).height(Length::Fill).align_right(Length::Fill).align_bottom(Length::Fill));
+    }
+    let bar = container(space().width(4).height(if open { 24.0 } else { 0.0 })).style(badge(c.fg_bright, c.fg_bright));
+    let tip = format!("Direct messages and mentions from every server  ·  {}", crate::commands::key_label(crate::commands::Command::AllInbox).unwrap_or_default());
+    let entry: Element<'static, Message> = if menu_open { marks.into() } else { tooltip(marks, container(text(tip).size(12)).padding([4, 8]).style(c.panel(c.surface)), tooltip::Position::Right).into() };
+    let inbox_entry = row![container(bar).width(8).height(ICON).center_y(ICON), entry, space().width(4)].align_y(iced::Center);
     let add = tooltip(
         button(text("+").size(20).center().width(Length::Fill)).width(ICON).height(ICON).padding([6, 0]).on_press(Message::Rail(Msg::Add)).style(icon_style(c.surface, c.fg, false)),
         container(text("Add a server").size(12)).padding([4, 8]).style(c.panel(c.surface)),
         tooltip::Position::Right,
     );
     let list = Column::with_children(icons).spacing(ROW - ICON).align_x(iced::Center);
-    container(column![list, space().height(ROW - ICON), add].align_x(iced::Center))
+    container(column![inbox_entry, space().height(ROW - ICON), list, space().height(ROW - ICON), add].align_x(iced::Center))
         .width(WIDTH)
         .height(Length::Fill)
         .padding([10, 0])

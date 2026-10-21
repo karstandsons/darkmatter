@@ -19,6 +19,8 @@ pub enum Command {
     MentionServer,
     Server,
     AddServer,
+    /// The shared inbox: DMs and mentions from every server.
+    AllInbox,
     SplitRight,
     SplitDown,
     ClosePane,
@@ -127,6 +129,7 @@ pub const ALL: &[Spec] = &[
     spec(C::MentionServer, "Next server with mentions", Group::Go, &[ctrl_alt("a")], &[], ""),
     spec(C::Server, "Go to a server", Group::Go, &[], &["server"], "[name]"),
     spec(C::AddServer, "Add a server", Group::Go, &[], &["server add"], ""),
+    spec(C::AllInbox, "DMs and mentions from every server", Group::Go, &[ctrl_shift("i")], &["all"], ""),
     spec(C::SplitRight, "Split right", Group::View, &[ctrl("d")], &["split", "split right"], ""),
     spec(C::SplitDown, "Split down", Group::View, &[ctrl_shift("d")], &["split down"], ""),
     spec(C::ClosePane, "Close pane", Group::View, &[ctrl("w")], &["close"], ""),

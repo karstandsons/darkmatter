@@ -40,6 +40,8 @@ pub struct App {
     next_key: u64,
     /// The rail's menu for one account.
     rail_menu: Option<crate::rail::Menu>,
+    /// The shared inbox is on screen, with this item highlighted.
+    shared_inbox: Option<usize>,
     /// Installed plugins, for every account.
     plugins: std::sync::Arc<crate::plugins::Plugins>,
     /// A newer release, found by the update check, and installing it.
@@ -127,6 +129,8 @@ pub enum Message {
     Report(report::Msg),
     /// The server rail and its menu.
     Rail(crate::rail::Msg),
+    /// Open a conversation from the shared inbox: (account key, channel).
+    SharedInboxOpen(u64, String),
     Login(LoginField, String),
     /// Enter in a login field: next field, or sign in from the last one.
     LoginNext(LoginField),
@@ -390,6 +394,7 @@ impl App {
             active,
             target: None,
             rail_menu: None,
+            shared_inbox: None,
             accounts,
             ephemeral: from_env.is_some(),
             plugins,
@@ -522,8 +527,12 @@ impl App {
 
     /// Puts an account on screen.
     fn show(&mut self, i: usize) -> Task<Message> {
-        if i >= self.servers.len() || i == self.active {
+        let from_inbox = self.shared_inbox.take().is_some();
+        if i >= self.servers.len() || (i == self.active && !from_inbox) {
             return Task::none();
+        }
+        if i == self.active {
+            return Task::done(Message::FocusComposer.to(self.servers[i].key));
         }
         if let Screen::Chat(chat) = &mut self.servers[self.active].screen {
             chat.shown = false;
@@ -610,6 +619,72 @@ impl App {
             Screen::Loading => Task::none(),
         });
         Task::batch(tasks)
+    }
+
+    /// Every account's unread DMs and mentions, newest first.
+    fn shared_items(&self) -> Vec<crate::shared_inbox::Item> {
+        let all = self.servers.iter().filter_map(|s| {
+            let Screen::Chat(chat) = &s.screen else { return None };
+            let label = self.accounts.get(&s.id).map_or_else(|| "This server".into(), Saved::label);
+            Some(crate::shared_inbox::items(&chat.store, s.key, &label, &s.id))
+        });
+        crate::shared_inbox::merge(all.flatten().collect())
+    }
+
+    /// The shared inbox's messages, and its keys while it's open.
+    fn update_shared_inbox(&mut self, message: Message) -> ControlFlow<Task<Message>, Message> {
+        let task = match message {
+            Message::SharedInboxOpen(key, channel) => {
+                let Some(i) = self.servers.iter().position(|s| s.key == key) else { return ControlFlow::Break(Task::none()) };
+                self.shared_inbox = Some(0); // so showing it focuses its box
+                // Already open there: showing the account is enough (opening
+                // it again would lose its "New messages" line).
+                let open = match &self.servers[i].screen {
+                    Screen::Chat(chat) if chat.focused().channel == channel => Task::none(),
+                    _ => Task::done(Message::SelectChannel(channel).to(key)),
+                };
+                Task::batch([self.show(i), open])
+            }
+            Message::Escape if self.shared_inbox.is_some() => {
+                self.shared_inbox = None;
+                Task::done(Message::FocusComposer.to(self.servers[self.active].key))
+            }
+            Message::Key(keyboard::Event::KeyPressed { ref key, modifiers, .. })
+                if self.shared_inbox.is_some()
+                    && modifiers.is_empty()
+                    && matches!(key.as_ref(), Key::Named(Named::ArrowDown | Named::ArrowUp | Named::Enter) | Key::Character("j" | "k")) =>
+            {
+                let items = self.shared_items();
+                let last = items.len().saturating_sub(1);
+                let at = self.shared_inbox.unwrap_or(0).min(last);
+                match key.as_ref() {
+                    Key::Named(Named::ArrowDown) | Key::Character("j") => self.shared_inbox = Some((at + 1).min(last)),
+                    Key::Named(Named::ArrowUp) | Key::Character("k") => self.shared_inbox = Some(at.saturating_sub(1)),
+                    _ => {
+                        let Some(item) = items.into_iter().nth(at) else { return ControlFlow::Break(Task::none()) };
+                        return self.update_shared_inbox(Message::SharedInboxOpen(item.key, item.channel));
+                    }
+                }
+                Task::none()
+            }
+            // The chat underneath is hidden: its keys would act unseen. A
+            // command of its own closes the inbox first; the rail's and the
+            // app's work as ever.
+            Message::Key(keyboard::Event::KeyPressed { ref key, modifiers, .. }) if self.shared_inbox.is_some() => {
+                use crate::commands::Command as C;
+                match crate::commands::for_key(key, modifiers) {
+                    Some(C::AllInbox | C::NextServer | C::PrevServer | C::MentionServer | C::AddServer | C::Themes | C::Plugins) => return ControlFlow::Continue(message),
+                    Some(_) => {
+                        self.shared_inbox = None;
+                        return ControlFlow::Continue(message);
+                    }
+                    None => Task::none(),
+                }
+            }
+            Message::Key(_) if self.shared_inbox.is_some() => Task::none(),
+            other => return ControlFlow::Continue(other),
+        };
+        ControlFlow::Break(task)
     }
 
     /// Rail messages, and keys while its menu is open.
@@ -756,7 +831,7 @@ impl App {
                     id: s.id.clone(),
                     label: saved.map_or_else(|| "New server".into(), Saved::label),
                     initials: saved.map_or_else(|| "+".into(), Saved::initials),
-                    shown: i == self.active,
+                    shown: i == self.active && self.shared_inbox.is_none(),
                     state,
                     mentions,
                     unread,
@@ -1118,6 +1193,10 @@ impl App {
             ControlFlow::Break(task) => return task,
             ControlFlow::Continue(message) => message,
         };
+        let message = match self.update_shared_inbox(message) {
+            ControlFlow::Break(task) => return task,
+            ControlFlow::Continue(message) => message,
+        };
         let message = match self.update_plugin_manager(message) {
             ControlFlow::Break(task) => return task,
             ControlFlow::Continue(message) => message,
@@ -1166,7 +1245,7 @@ impl App {
                     && command != C::Leave
                 {
                     chat.menu = false;
-                    refocus = !matches!(command, C::QuickSwitcher | C::Search | C::Shortcuts | C::Themes | C::Plugins | C::Account | C::Logout | C::AddServer | C::Server | C::NextServer | C::PrevServer | C::MentionServer);
+                    refocus = !matches!(command, C::QuickSwitcher | C::Search | C::Shortcuts | C::Themes | C::Plugins | C::Account | C::Logout | C::AddServer | C::Server | C::NextServer | C::PrevServer | C::MentionServer | C::AllInbox);
                 }
                 let task = self.run(command, arg);
                 if refocus { Task::batch([task, Task::done(Message::FocusComposer)]) } else { task }
@@ -1414,6 +1493,15 @@ impl App {
                 _ => false,
             }),
             C::AddServer => self.add_server(),
+            C::AllInbox if self.shared_inbox.is_some() => {
+                self.shared_inbox = None;
+                Task::done(Message::FocusComposer.to(self.servers[self.active].key))
+            }
+            C::AllInbox => {
+                self.shared_inbox = Some(0);
+                self.rail_menu = None;
+                Task::none()
+            }
             C::Server if !arg.is_empty() => {
                 let best = self
                     .servers
@@ -1530,6 +1618,12 @@ impl App {
             Screen::Chat(chat) => chat.view(c, &self.iced_theme),
         };
         let body = body.map(move |m| m.to(key));
+        let items = (self.shared_inbox.is_some() || self.servers.len() > 1).then(|| self.shared_items());
+        let waiting = items.as_deref().map_or(0, |items| crate::shared_inbox::badge(items, key));
+        let body = match (self.shared_inbox, items) {
+            (Some(selected), Some(items)) => crate::shared_inbox::view(items, selected, c),
+            _ => body,
+        };
         // The rail, once there's more than one server.
         let entries = (self.servers.len() > 1).then(|| self.rail_entries());
         let menu_entry = self.rail_menu.as_ref().zip(entries.as_ref()).and_then(|(m, entries)| {
@@ -1537,7 +1631,7 @@ impl App {
             Some((m, at, entries[at].clone()))
         });
         let body: Element<'_, Message> = match entries {
-            Some(entries) => iced::widget::row![crate::rail::view(entries, self.rail_menu.is_some(), c), body].into(),
+            Some(entries) => iced::widget::row![crate::rail::view(entries, (self.shared_inbox.is_some(), waiting), self.rail_menu.is_some(), c), body].into(),
             None => body,
         };
         // Always a stack, so opening or closing the picker keeps the state
@@ -1903,6 +1997,7 @@ mod tests {
             active: 0,
             target: None,
             rail_menu: None,
+            shared_inbox: None,
             accounts: Accounts::default(),
             ephemeral: true,
             plugins: Default::default(),
@@ -2074,5 +2169,45 @@ mod tests {
         let pane = chat.focus;
         let _ = app.update(Message::InPane(pane, Box::new(Message::Link("https://home.x/family/pl/p1".into()))));
         assert_eq!(app.active, 1);
+    }
+
+    fn key(k: Key, modifiers: keyboard::Modifiers) -> Message {
+        Message::Key(keyboard::Event::KeyPressed {
+            modified_key: k.clone(),
+            key: k,
+            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    #[test]
+    fn the_shared_inbox_opens_conversations_on_their_server() {
+        use mm_api::models::{Channel, ChannelMember, ChannelType};
+        let mut home = crate::chat::tests::chat();
+        home.account = "home".into();
+        let dm = Channel { id: "dm".into(), kind: ChannelType::Direct, display_name: "mum".into(), total_msg_count_root: 2, last_post_at: 9, ..Default::default() };
+        home.store.add_channels(vec![dm], vec![ChannelMember { channel_id: "dm".into(), ..Default::default() }]);
+        let mut app = app(vec![crate::chat::tests::chat(), home]);
+        assert_eq!(app.shared_items().iter().map(|i| i.channel.as_str()).collect::<Vec<_>>(), ["dm"]);
+
+        let _ = app.update(key(Key::Character("i".into()), keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT));
+        assert_eq!(app.shared_inbox, Some(0));
+        // A vim key doesn't reach the chat hidden underneath.
+        let Screen::Chat(work) = &app.servers[0].screen else { panic!() };
+        let selected = work.focused().selected.clone();
+        let _ = app.update(key(Key::Character("g".into()), keyboard::Modifiers::empty()));
+        let _ = app.update(key(Key::Character("g".into()), keyboard::Modifiers::empty()));
+        let Screen::Chat(work) = &app.servers[0].screen else { panic!() };
+        assert_eq!(work.focused().selected, selected);
+
+        let _ = app.update(key(Key::Named(Named::Enter), keyboard::Modifiers::empty()));
+        assert_eq!((app.shared_inbox, app.active), (None, 1), "closed, on the DM's server");
+        // Esc closes it where you were.
+        let _ = app.update(Message::Run(crate::commands::Command::AllInbox, String::new()));
+        let _ = app.update(Message::Escape);
+        assert_eq!((app.shared_inbox, app.active), (None, 1));
     }
 }
