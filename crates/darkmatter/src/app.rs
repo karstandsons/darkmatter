@@ -239,6 +239,11 @@ pub enum Message {
     /// The image viewer.
     Lightbox(crate::lightbox::Msg),
     Opened(Result<(), String>),
+    /// This device waiting to be linked: is it approved yet?
+    LinkCheck,
+    Linked(Result<Option<std::sync::Arc<crate::crypto::Crypto>>, String>),
+    /// Load the open channels' history again (now that it can be decrypted).
+    ReloadOpen,
     PickFiles,
     /// Attach files to the thread's reply box.
     PickReplyFiles,
@@ -348,6 +353,8 @@ pub struct Bootstrap {
     pub outbox: Vec<crate::outbox::Queued>,
     pub crypto_status: crate::crypto::Status,
     pub crypto: Option<std::sync::Arc<crate::crypto::Crypto>>,
+    /// Waiting to be linked from another device.
+    pub linking: Option<dm_client::Linking>,
 }
 
 pub(crate) fn err(e: mm_api::Error) -> String {
@@ -892,7 +899,10 @@ impl App {
         };
         let i = self.cur();
         let Screen::Chat(chat) = &mut self.servers[i].screen else { return ControlFlow::Break(Task::none()) };
-        let (task, gone) = account::update(&mut self.account, &chat.client, chat.axiond.is_some(), msg);
+        let (task, gone) = account::update(&mut self.account, &chat.client, chat.axiond.is_some(), &chat.crypto, msg);
+        if let Some(a) = &mut self.account {
+            a.prepare(&chat.crypto_status);
+        }
         if let Some(blocked) = self.account.as_ref().and_then(Account::blocked_ids) {
             chat.store.blocked = blocked.into_iter().collect();
         }
@@ -1597,6 +1607,9 @@ impl App {
             if chat.layout_dirty {
                 subs.push(every_second().map(|(key, _)| Message::SaveLayout.to(key)));
             }
+            if chat.linking.is_some() {
+                subs.push(iced::time::every(Duration::from_secs(5)).with(server.key).map(|(key, _)| Message::LinkCheck.to(key)));
+            }
             if !chat.typing.is_empty() || chat.panes.iter().any(|(_, p)| p.highlight.is_some()) || !chat.outbox.is_empty() {
                 subs.push(every_second().map(|(key, _)| Message::Tick.to(key)));
             }
@@ -1748,7 +1761,7 @@ pub(crate) fn bootstrap(session: Session, account: String) -> Task<Message> {
                     None
                 }
             };
-            let (outbox, crypto_status, crypto) = match &vault {
+            let (outbox, crypto_status, crypto, linking) = match &vault {
                 Some(v) => {
                     let mut outbox = v.outbox().await;
                     let legacy = crate::outbox::take_legacy(&session.server);
@@ -1757,7 +1770,7 @@ pub(crate) fn bootstrap(session: Session, account: String) -> Task<Message> {
                         outbox.extend(legacy);
                         v.writer().outbox(outbox.clone());
                     }
-                    let (status, crypto) = crate::crypto::setup(&client, &me.id, v, axiond.as_ref()).await;
+                    let (status, crypto, linking) = crate::crypto::setup(&client, &me.id, v, axiond.as_ref()).await;
                     // Join (a new device) or catch up on each encrypted
                     // channel's group.
                     if let Some(c) = &crypto {
@@ -1767,7 +1780,7 @@ pub(crate) fn bootstrap(session: Session, account: String) -> Task<Message> {
                             }
                         }
                     }
-                    (outbox, status, crypto)
+                    (outbox, status, crypto, linking)
                 }
                 None => {
                     let status = if axiond.as_ref().is_some_and(|a| a.enabled) {
@@ -1775,10 +1788,10 @@ pub(crate) fn bootstrap(session: Session, account: String) -> Task<Message> {
                     } else {
                         crate::crypto::Status::Off
                     };
-                    (crate::outbox::take_legacy(&session.server), status, None)
+                    (crate::outbox::take_legacy(&session.server), status, None, None)
                 }
             };
-            Ok(Box::new(Bootstrap { session, account, me, teams, channels, members, users, server_config, axiond, blocked, vault, outbox, crypto_status, crypto }))
+            Ok(Box::new(Bootstrap { session, account, me, teams, channels, members, users, server_config, axiond, blocked, vault, outbox, crypto_status, crypto, linking }))
         },
         Message::Bootstrapped,
     )

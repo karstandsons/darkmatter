@@ -86,6 +86,24 @@ impl<'de> Deserialize<'de> for IdentityKey {
     }
 }
 
+/// The safety number two people compare (E2EE.md §12): 60 digits from both
+/// identity keys, the same for each of them. As Signal's: each key with its
+/// user id hashed 5200 times with SHA-512, 30 digits from each, the smaller
+/// first. Written in twelve groups of five.
+pub fn safety_number(a: (&str, &IdentityKey), b: (&str, &IdentityKey)) -> String {
+    let half = |(user, key): (&str, &IdentityKey)| {
+        use sha2::{Digest, Sha512};
+        let mut digest = Sha512::new().chain_update(0u16.to_be_bytes()).chain_update(key.0).chain_update(user.as_bytes()).finalize();
+        for _ in 0..5200 {
+            digest = Sha512::new().chain_update(digest).chain_update(key.0).finalize();
+        }
+        digest[..30].chunks(5).map(|c| format!("{:05}", c.iter().fold(0u64, |n, b| (n << 8) | u64::from(*b)) % 100_000)).collect::<String>()
+    };
+    let (x, y) = (half(a), half(b));
+    let digits = if x <= y { x + &y } else { y + &x };
+    digits.as_bytes().chunks(5).map(|c| std::str::from_utf8(c).expect("digits")).collect::<Vec<_>>().join(" ")
+}
+
 /// `{user_id, device_id, device signature key, created_at}`, signed by the
 /// user's identity key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,7 +183,7 @@ pub fn verify_member(credential: &Credential, signature_key: &[u8], directory: &
     Ok((user, device))
 }
 
-mod b64 {
+pub(crate) mod b64 {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as B64;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -207,6 +225,17 @@ mod tests {
         let mut b = a.clone();
         (b.user_id, b.device_id) = ("a".into(), "bc".into());
         assert!(b.verify(&alice.public()).is_err());
+    }
+
+    #[test]
+    fn safety_numbers_match_both_ways_and_change_with_a_key() {
+        let (alice, bob) = (UserIdentity::generate().public(), UserIdentity::generate().public());
+        let n = safety_number(("alice", &alice), ("bob", &bob));
+        assert_eq!(n, safety_number(("bob", &bob), ("alice", &alice)));
+        assert_eq!((n.len(), n.split(' ').count()), (71, 12));
+        assert!(n.split(' ').all(|g| g.len() == 5 && g.bytes().all(|c| c.is_ascii_digit())));
+        let new = UserIdentity::generate().public();
+        assert_ne!(safety_number(("alice", &alice), ("bob", &new)), n);
     }
 
     #[test]

@@ -42,6 +42,7 @@ enum Write {
     Outbox(Vec<Queued>),
     Mls { put: Vec<(Vec<u8>, Vec<u8>)>, delete: Vec<Vec<u8>> },
     Identity { user_id: String, key: String },
+    SetIdentity { user_id: String, key: String, verified: bool },
     Text { key: String, channel_id: String, content: String },
     ForgetTexts { post_id: String, pending_post_id: String },
     Index(Found),
@@ -107,6 +108,11 @@ impl Writer {
     /// Remembers someone's identity key, if we hadn't seen one for them.
     pub fn remember_identity(&self, user_id: &str, key: &str) {
         let _ = self.0.send(Write::Identity { user_id: user_id.into(), key: key.into() });
+    }
+
+    /// Trusts this key for them from now on, verified or not.
+    pub fn set_identity(&self, user_id: &str, key: &str, verified: bool) {
+        let _ = self.0.send(Write::SetIdentity { user_id: user_id.into(), key: key.into(), verified });
     }
 
     /// Keeps a decrypted message's content.
@@ -360,6 +366,18 @@ async fn apply(pool: &SqlitePool, write: Write) -> sqlx::Result<()> {
                 .execute(pool)
                 .await?;
         }
+        Write::SetIdentity { user_id, key, verified } => {
+            sqlx::query(
+                "INSERT INTO identities (user_id, identity_key, first_seen, verified) VALUES (?, ?, ?, ?) \
+                 ON CONFLICT (user_id) DO UPDATE SET identity_key = excluded.identity_key, verified = excluded.verified",
+            )
+            .bind(user_id)
+            .bind(key)
+            .bind(chrono::Utc::now().timestamp_millis())
+            .bind(verified)
+            .execute(pool)
+            .await?;
+        }
         Write::Text { key, channel_id, content } => {
             sqlx::query("INSERT INTO texts (k, channel_id, content, create_at) VALUES (?, ?, ?, ?) ON CONFLICT (k) DO UPDATE SET content = excluded.content")
                 .bind(key)
@@ -482,6 +500,9 @@ mod tests {
             assert_eq!(v.outbox().await.iter().map(|q| q.post.pending_post_id.as_str()).collect::<Vec<_>>(), ["b"]);
             assert_eq!(v.mls().await, HashMap::from([(b"k1".to_vec(), b"v1b".to_vec())]));
             assert_eq!(v.identity("bob").await, Some(("KEY1".into(), false)), "the first key seen stays");
+            w.set_identity("bob", "KEY2", true);
+            w.flush().await;
+            assert_eq!(v.identity("bob").await, Some(("KEY2".into(), true)), "until one's accepted");
             v.pool.close().await;
         }
         // Reopened with its key, everything is there.

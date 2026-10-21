@@ -9,7 +9,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use dm_crypto::ds::Refusal;
 use dm_crypto::{DeviceCertificate, IdentityKey};
-use mm_api::models::{AxiondInfo, ClaimedKeyPackage, E2eeEvent, E2eeIdentity, GroupState, HandshakeEntry, NewE2eeEvent, NewHandshake, PendingWelcome};
+use mm_api::models::{AxiondInfo, ClaimedKeyPackage, E2eeEvent, E2eeIdentity, E2eeLink, E2eeLinkApproval, GroupState, HandshakeEntry, NewE2eeEvent, NewHandshake, PendingWelcome};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -130,6 +130,7 @@ pub async fn publish_device(State(app): State<App>, me: Me, Json(body): Json<New
                 .bind(ids::now())
                 .execute(&app.db)
                 .await?;
+            sqlx::query("DELETE FROM e2ee_links WHERE user_id = ? AND device_id = ?").bind(&me.user_id).bind(&me.device_id).execute(&app.db).await?;
             app.hub.send(&teammates(&app, &me.user_id).await?, &Event::new("device_added", json!({ "user_id": me.user_id, "device_id": me.device_id })));
             super::ok()
         }
@@ -161,6 +162,115 @@ pub async fn revoke_device(State(app): State<App>, me: Me, Path(device_id): Path
     }
     e2ee::device_gone(&app, &me.user_id, &device_id).await?;
     super::ok()
+}
+
+/// A pending link is good for this long.
+const LINK_TTL_MS: i64 = 60 * 60 * 1000;
+
+#[derive(Deserialize)]
+pub struct NewLink {
+    signature_key: String,
+    link_key: String,
+}
+
+/// A new device of yours asks to be linked: its keys, which its link code
+/// is a hash of. Asking again replaces the request.
+pub async fn request_link(State(app): State<App>, me: Me, Json(body): Json<NewLink>) -> Result<Json<Value>> {
+    let set_up: Option<i64> = sqlx::query_scalar("SELECT revoked_at FROM e2ee_devices WHERE user_id = ? AND device_id = ?")
+        .bind(&me.user_id)
+        .bind(&me.device_id)
+        .fetch_optional(&app.db)
+        .await?;
+    if set_up.is_some() {
+        return Err(Error::bad_request("This device is set up already."));
+    }
+    let (signature_key, link_key) = (decode("signature key", &body.signature_key)?, decode("link key", &body.link_key)?);
+    if signature_key.len() != 32 || link_key.len() != 32 {
+        return Err(Error::bad_request("Those keys aren't the right size."));
+    }
+    sqlx::query("INSERT OR REPLACE INTO e2ee_links (user_id, device_id, signature_key, link_key, create_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(&me.user_id)
+        .bind(&me.device_id)
+        .bind(B64.encode(&signature_key))
+        .bind(B64.encode(&link_key))
+        .bind(ids::now())
+        .execute(&app.db)
+        .await?;
+    app.hub.send(std::slice::from_ref(&me.user_id), &Event::new("link_requested", json!({ "device_id": me.device_id })));
+    super::ok()
+}
+
+/// Your new devices waiting to be linked, still signed in.
+pub async fn links(State(app): State<App>, me: Me) -> Result<Json<Vec<E2eeLink>>> {
+    let rows: Vec<(String, String, String, i64, String)> = sqlx::query_as(
+        "SELECT l.device_id, l.signature_key, l.link_key, l.create_at, \
+         (SELECT s.user_agent FROM sessions s WHERE s.user_id = l.user_id AND s.device_id = l.device_id ORDER BY s.last_activity_at DESC LIMIT 1) \
+         FROM e2ee_links l WHERE l.user_id = ? AND l.certificate = '' AND l.create_at > ? AND l.device_id != ? \
+         AND EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = l.user_id AND s.device_id = l.device_id) ORDER BY l.create_at DESC",
+    )
+    .bind(&me.user_id)
+    .bind(ids::now() - LINK_TTL_MS)
+    .bind(&me.device_id)
+    .fetch_all(&app.db)
+    .await?;
+    Ok(Json(rows.into_iter().map(|(device_id, signature_key, link_key, create_at, user_agent)| E2eeLink { device_id, signature_key, link_key, user_agent, create_at }).collect()))
+}
+
+#[derive(Deserialize)]
+pub struct Approval {
+    certificate: DeviceCertificate,
+    sealed: Value,
+}
+
+/// Approves a new device from one already set up: its certificate (which
+/// must vouch for the key it asked with) and the identity key sealed to it.
+pub async fn approve_link(State(app): State<App>, me: Me, Path(device_id): Path<String>, Json(body): Json<Approval>) -> Result<Json<Value>> {
+    let approver: Option<i64> = sqlx::query_scalar("SELECT revoked_at FROM e2ee_devices WHERE user_id = ? AND device_id = ?")
+        .bind(&me.user_id)
+        .bind(&me.device_id)
+        .fetch_optional(&app.db)
+        .await?;
+    if approver != Some(0) {
+        return Err(Error::bad_request("Only a device with encryption set up can link another."));
+    }
+    let pending: Option<(String, String)> = sqlx::query_as("SELECT signature_key, certificate FROM e2ee_links WHERE user_id = ? AND device_id = ? AND create_at > ?")
+        .bind(&me.user_id)
+        .bind(&device_id)
+        .bind(ids::now() - LINK_TTL_MS)
+        .fetch_optional(&app.db)
+        .await?;
+    let Some((signature_key, done)) = pending else { return Err(Error::not_found("link request")) };
+    if !done.is_empty() {
+        return super::ok();
+    }
+    let cert = body.certificate;
+    if cert.user_id != me.user_id || cert.device_id != device_id || B64.encode(&cert.signature_key) != signature_key {
+        return Err(Error::bad_request("That certificate isn't for the device that asked."));
+    }
+    let identity: Option<String> = sqlx::query_scalar("SELECT identity_key FROM e2ee_identities WHERE user_id = ?").bind(&me.user_id).fetch_optional(&app.db).await?;
+    let identity = IdentityKey::from_slice(&B64.decode(identity.ok_or_else(Error::internal)?).map_err(|_| Error::internal())?).map_err(|_| Error::internal())?;
+    cert.verify(&identity).map_err(refused)?;
+    sqlx::query("UPDATE e2ee_links SET certificate = ?, sealed = ? WHERE user_id = ? AND device_id = ?")
+        .bind(serde_json::to_string(&cert).map_err(|_| Error::internal())?)
+        .bind(body.sealed.to_string())
+        .bind(&me.user_id)
+        .bind(&device_id)
+        .execute(&app.db)
+        .await?;
+    app.hub.send(std::slice::from_ref(&me.user_id), &Event::new("link_approved", json!({ "device_id": device_id })));
+    super::ok()
+}
+
+/// This device's approval, once another of your devices gave it.
+pub async fn my_link(State(app): State<App>, me: Me) -> Result<Json<E2eeLinkApproval>> {
+    let row: Option<(String, String)> = sqlx::query_as("SELECT certificate, sealed FROM e2ee_links WHERE user_id = ? AND device_id = ? AND certificate != ''")
+        .bind(&me.user_id)
+        .bind(&me.device_id)
+        .fetch_optional(&app.db)
+        .await?;
+    let (certificate, sealed) = row.ok_or_else(|| Error::not_found("approval"))?;
+    let parse = |s: &str| serde_json::from_str(s).map_err(|_| Error::internal());
+    Ok(Json(E2eeLinkApproval { certificate: parse(&certificate)?, sealed: parse(&sealed)? }))
 }
 
 #[derive(Deserialize)]

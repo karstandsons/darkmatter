@@ -457,6 +457,28 @@ pub struct E2eeIdentity {
     pub revoked: Vec<String>,
 }
 
+/// A new device asking to be linked (E2EE.md §12), as the user's other
+/// devices see it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct E2eeLink {
+    pub device_id: Id,
+    /// Base64: its MLS signature key and its one-off HPKE key.
+    pub signature_key: String,
+    pub link_key: String,
+    /// The signed-in app it is, from its session.
+    pub user_agent: String,
+    pub create_at: i64,
+}
+
+/// What a new device finds once another of its user's devices approved it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct E2eeLinkApproval {
+    pub certificate: serde_json::Value,
+    pub sealed: serde_json::Value,
+}
+
 /// One key package claimed for one device.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]

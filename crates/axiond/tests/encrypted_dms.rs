@@ -158,6 +158,91 @@ async fn nobody_is_sent_a_message_they_cant_read() {
     assert!(matches!(read(&carol_laptop, &sent).await, Decrypted::Unreadable(why) if why.contains("before this device joined")));
 }
 
+#[tokio::test]
+async fn a_new_device_is_linked_from_another() {
+    let s = server().await;
+    let (alice_api, laptop) = device(&s, "alice", MemoryStore::default()).await;
+    let (bob_api, bob) = device(&s, "bob", MemoryStore::default()).await;
+    let dm = alice_api.create_direct(&laptop.user_id, &bob.user_id).await.unwrap();
+    send(&alice_api, &laptop, &dm.id, "before the phone").await;
+
+    // The phone signs in: the identity key is on the laptop, so it asks.
+    let mut phone_api = Client::new(&s.url).unwrap();
+    let me = phone_api.login("alice", PASSWORD, None).await.unwrap();
+    let info = phone_api.axiond().await.unwrap().unwrap();
+    let phone_store = MemoryStore::default();
+    assert!(matches!(dm_client::setup(phone_api.clone(), &me.id, phone_store.clone(), &info).await.unwrap(), Setup::NeedsLink));
+    let linking = dm_client::start_link(phone_api.clone(), &me.id, &info).await.unwrap();
+    assert!(linking.finish(phone_store.clone()).await.unwrap().is_none(), "not approved yet");
+
+    // On the laptop the code finds it, typed any old way; a wrong one doesn't.
+    let typed = linking.code().to_lowercase().replace('-', " ");
+    let found = laptop.find_link(&typed).await.unwrap().expect("the phone's request");
+    assert!(found.user_agent.is_empty() || !found.device_id.is_empty());
+    let mut wrong = linking.code().to_string();
+    wrong.replace_range(0..1, if wrong.starts_with('A') { "B" } else { "A" });
+    assert!(laptop.find_link(&wrong).await.unwrap().is_none());
+    // Bob can't see alice's requests, let alone approve one.
+    assert!(bob.find_link(linking.code()).await.unwrap().is_none());
+    laptop.approve_link(&found).await.unwrap();
+
+    // The phone is set up with alice's identity key and joins her groups.
+    let Some(Setup::Ready(phone)) = linking.finish(phone_store.clone()).await.unwrap() else { panic!("not linked") };
+    assert_eq!(phone.identity, laptop.identity);
+    assert!(laptop.find_link(linking.code()).await.unwrap().is_none(), "done with");
+    phone.sync(&dm.id).await.unwrap();
+    let after = send(&bob_api, &bob, &dm.id, "hello phone").await;
+    assert_eq!(text(read(&phone, &after).await), "hello phone");
+    assert_eq!(text(read(&laptop, &after).await), "hello phone");
+    // Started again, it's simply ready.
+    assert!(matches!(dm_client::setup(phone_api, &me.id, phone_store, &info).await.unwrap(), Setup::Ready(_)));
+}
+
+#[tokio::test]
+async fn safety_numbers_and_a_swapped_key() {
+    let s = server().await;
+    let (alice_api, alice) = device(&s, "alice", MemoryStore::default()).await;
+    let (_bob_api, bob) = device(&s, "bob", MemoryStore::default()).await;
+    let (_carol_api, carol) = device(&s, "carol", MemoryStore::default()).await;
+    let team = alice_api.my_teams().await.unwrap()[0].id.clone();
+    let plans = alice_api.create_channel(&team, "plans", "Plans", true).await.unwrap();
+    run(&alice_api, &plans.id, "/invite @bob").await;
+    run(&alice_api, &plans.id, "/invite @carol").await;
+    send(&alice_api, &alice, &plans.id, "hello").await;
+
+    // Both ends see the same number; alice verifies bob's.
+    let theirs = alice.safety(&bob.user_id).await.unwrap();
+    assert_eq!(theirs.number, bob.safety(&alice.user_id).await.unwrap().number);
+    assert_eq!((theirs.verified, theirs.changed), (false, None));
+    alice.set_verified(&bob.user_id, &theirs.key, true).await.unwrap();
+    assert!(alice.safety(&bob.user_id).await.unwrap().verified);
+
+    // The server swaps in keys of its own for bob and carol.
+    for user in [&bob.user_id, &carol.user_id] {
+        let fake = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, dm_crypto::UserIdentity::generate().public().0);
+        sqlx::query("UPDATE e2ee_identities SET identity_key = ? WHERE user_id = ?").bind(fake).bind(user).execute(&s._app.db).await.unwrap();
+    }
+    // Bob was verified: nothing more goes to the channel until alice deals with it.
+    let post = NewPost { channel_id: plans.id.clone(), message: "secret".into(), pending_post_id: "alice:secret".into(), ..Default::default() };
+    let held = alice.encrypt_post(&post).await.unwrap_err();
+    assert!(held.contains("@bob") && held.contains("changed since you verified"), "{held}");
+    let now = alice.safety(&bob.user_id).await.unwrap();
+    assert_ne!(now.number, theirs.number);
+    assert_eq!((now.verified, now.changed), (false, Some(true)));
+    let mut changes = alice.key_changes(&[bob.user_id.clone(), carol.user_id.clone()]).await;
+    changes.sort();
+    let mut expected = vec![(bob.user_id.clone(), true), (carol.user_id.clone(), false)];
+    expected.sort();
+    assert_eq!(changes, expected, "carol wasn't verified: her change is only noted");
+
+    // Accepting bob's new key lifts the hold.
+    assert!(alice.set_verified(&bob.user_id, &theirs.key, false).await.is_err(), "not the key he has now");
+    alice.set_verified(&bob.user_id, &now.key, false).await.unwrap();
+    alice.set_verified(&carol.user_id, &alice.safety(&carol.user_id).await.unwrap().key, false).await.unwrap();
+    assert!(alice.key_changes(&[bob.user_id.clone(), carol.user_id.clone()]).await.is_empty());
+    alice.encrypt_post(&post).await.unwrap();
+}
+
 /// A store that hasn't written anything yet: its writes happen later, in
 /// the background, as Darkmatter's do.
 struct Behind(MemoryStore);
@@ -178,11 +263,14 @@ impl LocalStore for Behind {
     async fn clear_device(&self) {
         self.0.clear_device().await
     }
-    async fn identity(&self, user_id: &str) -> Option<String> {
+    async fn identity(&self, user_id: &str) -> Option<(String, bool)> {
         self.0.identity(user_id).await
     }
     fn remember_identity(&self, user_id: &str, key: &str) {
         self.0.remember_identity(user_id, key)
+    }
+    fn set_identity(&self, user_id: &str, key: &str, verified: bool) {
+        self.0.set_identity(user_id, key, verified)
     }
     async fn text(&self, _key: &str) -> Option<String> {
         None

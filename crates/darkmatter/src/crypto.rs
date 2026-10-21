@@ -24,9 +24,9 @@ pub enum Status {
     Off,
     /// Set up: this is your identity key's fingerprint.
     Ready { fingerprint: String },
-    /// Your account's identity key is on another device: this one has to be
-    /// linked from there.
-    NeedsLink,
+    /// Your account's identity key is on another device: this one asked to
+    /// be linked from there, and shows this code until it's approved.
+    Linking { code: String },
     /// Something went wrong setting it up.
     Failed(String),
 }
@@ -58,12 +58,16 @@ impl LocalStore for VaultStore {
         }
     }
 
-    async fn identity(&self, user_id: &str) -> Option<String> {
-        self.0.identity(user_id).await.map(|(key, _)| key)
+    async fn identity(&self, user_id: &str) -> Option<(String, bool)> {
+        self.0.identity(user_id).await
     }
 
     fn remember_identity(&self, user_id: &str, key: &str) {
         self.0.writer().remember_identity(user_id, key);
+    }
+
+    fn set_identity(&self, user_id: &str, key: &str, verified: bool) {
+        self.0.writer().set_identity(user_id, key, verified);
     }
 
     async fn text(&self, key: &str) -> Option<String> {
@@ -86,16 +90,31 @@ pub fn fingerprint(key: &IdentityKey) -> String {
 }
 
 /// Sets this device up for encryption, or picks up where it was. On plain
-/// Mattermost, or when axiond has it off, there's nothing to do.
-pub async fn setup(client: &Client, user_id: &str, vault: &Arc<Vault>, info: Option<&AxiondInfo>) -> (Status, Shared) {
-    let Some(info) = info.filter(|i| i.enabled) else { return (Status::Off, None) };
+/// Mattermost, or when axiond has it off, there's nothing to do. A new
+/// device of an account set up elsewhere asks to be linked.
+pub async fn setup(client: &Client, user_id: &str, vault: &Arc<Vault>, info: Option<&AxiondInfo>) -> (Status, Shared, Option<dm_client::Linking>) {
+    let Some(info) = info.filter(|i| i.enabled) else { return (Status::Off, None, None) };
     match dm_client::setup(client.clone(), user_id, VaultStore(vault.clone()), info).await {
-        Ok(Setup::Ready(e2ee)) => (Status::Ready { fingerprint: fingerprint(&e2ee.identity) }, Some(Arc::new(*e2ee))),
-        Ok(Setup::NeedsLink) => (Status::NeedsLink, None),
+        Ok(Setup::Ready(e2ee)) => (Status::Ready { fingerprint: fingerprint(&e2ee.identity) }, Some(Arc::new(*e2ee)), None),
+        Ok(Setup::NeedsLink) => match dm_client::start_link(client.clone(), user_id, info).await {
+            Ok(linking) => (Status::Linking { code: linking.code().into() }, None, Some(linking)),
+            Err(e) => {
+                tracing::warn!("couldn't ask to link this device: {e}");
+                (Status::Failed(format!("couldn't ask to link this device: {e}")), None, None)
+            }
+        },
         Err(e) => {
             tracing::warn!("encryption isn't set up: {e}");
-            (Status::Failed(e), None)
+            (Status::Failed(e), None, None)
         }
+    }
+}
+
+/// Encryption on this device, once another of yours approved it.
+pub async fn finish_link(linking: dm_client::Linking, vault: Arc<Vault>) -> Result<Option<Arc<Crypto>>, String> {
+    match linking.finish(VaultStore(vault)).await? {
+        Some(Setup::Ready(e2ee)) => Ok(Some(Arc::new(*e2ee))),
+        _ => Ok(None),
     }
 }
 
@@ -203,7 +222,7 @@ mod tests {
         store.save_text("p1", "c1", r#"{"t":"post","message":"hi"}"#);
         vault.writer().flush().await;
         assert_eq!(store.get("seq.c1").await.unwrap(), b"7");
-        assert_eq!(store.identity("bob").await.as_deref(), Some("KEY"));
+        assert_eq!(store.identity("bob").await, Some(("KEY".into(), false)));
         assert_eq!(store.text("p1").await.as_deref(), Some(r#"{"t":"post","message":"hi"}"#));
         store.clear_device().await;
         assert!(store.get("seq.c1").await.is_none() && store.mls().await.is_empty());

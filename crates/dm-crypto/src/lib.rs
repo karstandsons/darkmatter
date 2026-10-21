@@ -9,21 +9,24 @@
 //! - [`wire`]: what goes on the wire (`props.dm_e2ee`), the plaintext inside
 //!   and the authenticated data that ties a message to its place;
 //! - [`file`]: encrypting attachments, each under its own key;
+//! - [`link`]: handing the identity key to a new device of the same user;
 //! - [`ds`]: the server's side, which checks handshake messages without
 //!   seeing any secrets and may propose removals.
 //!
 //! No primitive here is our own. Anything beyond MLS uses a named, reviewed
-//! construction (Ed25519 for device certificates) and says so.
+//! construction (Ed25519 for device certificates, HPKE for linking a
+//! device) and says so.
 
 pub mod device;
 pub mod ds;
 pub mod file;
 pub mod identity;
+pub mod link;
 mod provider;
 pub mod wire;
 
 pub use device::{Device, Handshake, Incoming};
-pub use identity::{DeviceCertificate, Directory, IdentityKey, UserIdentity};
+pub use identity::{DeviceCertificate, Directory, IdentityKey, UserIdentity, safety_number};
 pub use provider::Provider;
 
 use openmls::prelude::Ciphersuite;

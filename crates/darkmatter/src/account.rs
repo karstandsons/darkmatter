@@ -1,16 +1,17 @@
-//! The Account window: your signed-in apps, two-factor codes, the people
-//! you've blocked, and deleting your account. The last two exist only on
-//! axiond.
+//! The Account window: your signed-in apps, encryption (linking a new
+//! device), two-factor codes, the people you've blocked, and deleting your
+//! account. Encryption and the last two exist only on axiond.
 
 use iced::widget::{Column, button, center, checkbox, column, container, image, mouse_area, opaque, row, scrollable, space, text, text_input};
 use iced::{Background, Border, Color, Element, Length, Task, Theme};
 use mm_api::Client;
-use mm_api::models::{MfaSecret, Session, User};
+use mm_api::models::{E2eeLink, MfaSecret, Session, User};
 
 use crate::app::Message;
 use crate::style::{Colors, bold};
 
 pub const CODE: &str = "account-code";
+pub const LINK_CODE: &str = "account-link-code";
 
 #[derive(Debug, Clone)]
 pub enum Msg {
@@ -32,6 +33,11 @@ pub enum Msg {
     /// First press asks to confirm, the second deletes.
     Delete,
     Deleted(Result<(), String>),
+    /// Linking a new device: its code as typed, looking it up, approving it.
+    LinkCode(String),
+    LinkFind,
+    LinkFound(Result<Option<E2eeLink>, String>),
+    LinkApprove,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -60,6 +66,12 @@ pub struct Account {
     confirm_delete: bool,
     busy: bool,
     status: Option<(bool, String)>,
+    crypto: crate::crypto::Shared,
+    link_code: String,
+    /// The new device the code found, waiting for "Link it".
+    link_found: Option<E2eeLink>,
+    /// The QR code of this device's own link code, while it waits.
+    link_qr: Option<(String, image::Handle)>,
 }
 
 fn load(client: Client, axiond: bool) -> Task<Message> {
@@ -111,7 +123,10 @@ fn qr(url: &str) -> Option<image::Handle> {
 }
 
 /// Handles a message for the window; `logout` is set once the account is gone.
-pub fn update(state: &mut Option<Account>, client: &Client, axiond: bool, msg: Msg) -> (Task<Message>, bool) {
+pub fn update(state: &mut Option<Account>, client: &Client, axiond: bool, crypto: &crate::crypto::Shared, msg: Msg) -> (Task<Message>, bool) {
+    if let Some(a) = state {
+        a.crypto = crypto.clone();
+    }
     if let Msg::Open = msg {
         *state = Some(Account {
             client: client.clone(),
@@ -124,6 +139,10 @@ pub fn update(state: &mut Option<Account>, client: &Client, axiond: bool, msg: M
             confirm_delete: false,
             busy: false,
             status: None,
+            crypto: crypto.clone(),
+            link_code: String::new(),
+            link_found: None,
+            link_qr: None,
         });
         return (load(client.clone(), axiond), false);
     }
@@ -225,6 +244,35 @@ pub fn update(state: &mut Option<Account>, client: &Client, axiond: bool, msg: M
             *state = None;
             return (Task::none(), true);
         }
+        Msg::LinkCode(code) => {
+            a.link_code = code;
+            a.link_found = None;
+            Task::none()
+        }
+        Msg::LinkFind => {
+            let Some(c) = a.crypto.clone() else { return (Task::none(), false) };
+            a.busy = true;
+            let code = a.link_code.clone();
+            Task::perform(async move { c.find_link(&code).await }, |r| Message::Account(Msg::LinkFound(r)))
+        }
+        Msg::LinkFound(r) => {
+            a.busy = false;
+            match r {
+                Ok(Some(link)) => a.link_found = Some(link),
+                Ok(None) => a.status = Some((true, "No device of yours is waiting with that code. Check it, or sign in on the new device again for a new one.".into())),
+                Err(e) => a.status = Some((true, e)),
+            }
+            Task::none()
+        }
+        Msg::LinkApprove => {
+            let (Some(c), Some(link)) = (a.crypto.clone(), a.link_found.take()) else { return (Task::none(), false) };
+            a.busy = true;
+            a.link_code.clear();
+            act(&a.client, move |_| async move {
+                c.approve_link(&link).await?;
+                Ok("Linked. The new device sets itself up in a moment.".to_string())
+            })
+        }
         Msg::Deleted(Err(e)) => {
             a.busy = false;
             a.confirm_delete = false;
@@ -286,15 +334,28 @@ impl Account {
             crate::crypto::Status::Off => None,
             crate::crypto::Status::Ready { fingerprint } => Some(
                 column![
-                    text("Set up on this device. Your identity key (comparing it with others' apps comes with verification, in a later update):").size(13),
+                    text("Set up on this device. Your identity key:").size(13),
                     text(fingerprint).size(12).font(iced::Font::MONOSPACE).color(c.fg_bright),
+                    self.link_view(c),
                 ]
                 .spacing(6)
                 .into(),
             ),
-            crate::crypto::Status::NeedsLink => Some(
-                text("Your encryption keys are on another of your devices. Linking this one to it comes in a later update.").size(13).color(c.muted).into(),
-            ),
+            crate::crypto::Status::Linking { code } => {
+                let mut col = column![
+                    text("Your encryption keys are on another of your devices. On it, open Account, choose Link a new device and type this code:").size(13),
+                    text(code).size(20).font(iced::Font::MONOSPACE).color(c.fg_bright),
+                ]
+                .spacing(8);
+                if let Some((_, picture)) = self.link_qr.as_ref().filter(|(for_code, _)| for_code == code) {
+                    col = col.push(container(image(picture.clone()).width(150).height(150)).padding(6).style(move |_: &Theme| container::Style {
+                        background: Some(Background::Color(Color::WHITE)),
+                        border: Border { radius: 6.0.into(), ..Default::default() },
+                        ..Default::default()
+                    }));
+                }
+                Some(col.push(text("This device sets itself up as soon as it's approved. Until then it can't read encrypted conversations.").size(12).color(c.muted)).into())
+            }
             crate::crypto::Status::Failed(why) => Some(text(format!("Couldn't set it up on this device: {why}")).size(13).color(c.red).into()),
         };
         if let Some(e) = encryption {
@@ -372,6 +433,54 @@ impl Account {
         }
         body = body.push(text("Esc close").size(11).color(c.muted));
         self.frame(body, c)
+    }
+
+    /// Linking a new device from this one: type its code, check it's the
+    /// one you mean, link it.
+    fn link_view<'a>(&'a self, c: Colors) -> Element<'a, Message> {
+        let busy = self.busy;
+        let found = self.link_found.as_ref().map(|link| {
+            let app = if link.user_agent.is_empty() { "A new device".to_string() } else { link.user_agent.clone() };
+            let when = ago(link.create_at).replace("active ", "asked ");
+            column![
+                text(format!("{app}, {when}. Link it only if it's yours: it will read your encrypted conversations from now on.")).size(13),
+                small(c, "Link it", (!busy).then_some(Message::Account(Msg::LinkApprove))),
+            ]
+            .spacing(6)
+        });
+        let ready = !busy && dm_crypto::link::normalize(&self.link_code).is_some();
+        let mut col = column![
+            text("Link a new device").size(13).font(bold()).color(c.fg_bright),
+            text("Signed in on another computer or phone? It shows a code to type here.").size(12).color(c.muted),
+            row![
+                text_input("ABCD-EFGH-JKLM-NPQR-STUV", &self.link_code)
+                    .id(LINK_CODE)
+                    .on_input(|v| Message::Account(Msg::LinkCode(v)))
+                    .on_submit_maybe(ready.then_some(Message::Account(Msg::LinkFind)))
+                    .padding(8)
+                    .size(13)
+                    .font(iced::Font::MONOSPACE)
+                    .style(c.input()),
+                small(c, "Find", ready.then_some(Message::Account(Msg::LinkFind))),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        ]
+        .spacing(6)
+        .padding(iced::Padding { top: 8.0, ..Default::default() });
+        if let Some(f) = found {
+            col = col.push(f);
+        }
+        col.into()
+    }
+
+    /// Keeps the QR code of this device's link code ready to show.
+    pub fn prepare(&mut self, status: &crate::crypto::Status) {
+        if let crate::crypto::Status::Linking { code } = status
+            && self.link_qr.as_ref().is_none_or(|(c, _)| c != code)
+        {
+            self.link_qr = qr(&format!("darkmatter-link:{code}")).map(|q| (code.clone(), q));
+        }
     }
 
     fn code_row<'a>(&'a self, c: Colors, action: &'a str) -> Element<'a, Message> {

@@ -18,9 +18,13 @@ pub trait LocalStore: Send + Sync + 'static {
     /// Forgets the previous device's state (its session ended).
     fn clear_device(&self) -> impl Future<Output = ()> + Send;
 
-    /// The identity key first seen for someone (base64), and remembering one.
-    fn identity(&self, user_id: &str) -> impl Future<Output = Option<String>> + Send;
+    /// The identity key trusted for someone (base64), first seen or
+    /// accepted since, and whether it was verified.
+    fn identity(&self, user_id: &str) -> impl Future<Output = Option<(String, bool)>> + Send;
+    /// Remembers someone's key if none was known for them.
     fn remember_identity(&self, user_id: &str, key: &str);
+    /// Trusts this key for them from now on (a change accepted, or verified).
+    fn set_identity(&self, user_id: &str, key: &str, verified: bool);
 
     /// A decrypted post's content (JSON), by post id, or `pending:<id>` for
     /// this device's own messages before the server has numbered them.
@@ -39,7 +43,7 @@ pub struct MemoryStore(Arc<Mutex<Memory>>);
 struct Memory {
     kv: HashMap<String, Vec<u8>>,
     mls: HashMap<Vec<u8>, Vec<u8>>,
-    identities: HashMap<String, String>,
+    identities: HashMap<String, (String, bool)>,
     texts: HashMap<String, String>,
 }
 
@@ -70,12 +74,16 @@ impl LocalStore for MemoryStore {
         m.kv.retain(|k, _| !k.starts_with("device.") && !k.starts_with("seq.") && !k.starts_with("joined.") && !k.starts_with("updated."));
     }
 
-    async fn identity(&self, user_id: &str) -> Option<String> {
+    async fn identity(&self, user_id: &str) -> Option<(String, bool)> {
         self.0.lock().unwrap().identities.get(user_id).cloned()
     }
 
     fn remember_identity(&self, user_id: &str, key: &str) {
-        self.0.lock().unwrap().identities.entry(user_id.into()).or_insert_with(|| key.into());
+        self.0.lock().unwrap().identities.entry(user_id.into()).or_insert_with(|| (key.into(), false));
+    }
+
+    fn set_identity(&self, user_id: &str, key: &str, verified: bool) {
+        self.0.lock().unwrap().identities.insert(user_id.into(), (key.into(), verified));
     }
 
     async fn text(&self, key: &str) -> Option<String> {

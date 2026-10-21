@@ -432,6 +432,30 @@ impl Client {
         self.send_unit(Method::POST, "e2ee/devices", Some(&json!({ "certificate": certificate }))).await
     }
 
+    /// Asks to link this device to the account's others (base64 keys).
+    pub async fn request_link(&self, signature_key: &str, link_key: &str) -> Result<(), Error> {
+        self.send_unit(Method::POST, "e2ee/links", Some(&json!({ "signature_key": signature_key, "link_key": link_key }))).await
+    }
+
+    /// Devices of yours waiting to be linked.
+    pub async fn links(&self) -> Result<Vec<E2eeLink>, Error> {
+        self.get("e2ee/links").await
+    }
+
+    /// Approves one: its certificate, and the identity key sealed to it.
+    pub async fn approve_link(&self, device_id: &str, certificate: &serde_json::Value, sealed: &serde_json::Value) -> Result<(), Error> {
+        self.send_unit(Method::POST, &format!("e2ee/links/{device_id}/approve"), Some(&json!({ "certificate": certificate, "sealed": sealed }))).await
+    }
+
+    /// This device's approval, once there is one.
+    pub async fn link_approval(&self) -> Result<Option<E2eeLinkApproval>, Error> {
+        match self.get("e2ee/links/mine").await {
+            Ok(a) => Ok(Some(a)),
+            Err(Error::Api(e)) if e.status_code == 404 => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Takes out another of your devices.
     pub async fn revoke_device(&self, device_id: &str) -> Result<(), Error> {
         self.send_unit(Method::DELETE, &format!("e2ee/devices/{device_id}"), None::<&()>).await

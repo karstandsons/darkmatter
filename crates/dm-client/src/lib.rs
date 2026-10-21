@@ -3,7 +3,8 @@
 //! MLS work in `dm-crypto`.
 //!
 //! - [`setup`]: the identity key on an account's first device, then this
-//!   device's certificate and key packages.
+//!   device's certificate and key packages; [`start_link`] when the key is
+//!   on another device, which approves this one ([`E2ee::approve_link`]).
 //! - [`E2ee`]: one device at work. It creates or joins each encrypted
 //!   channel's group, catches up on its handshakes, encrypts posts and
 //!   decrypts them, exactly once each, keeping the text in the app's
@@ -73,6 +74,9 @@ struct Keys {
     /// Revoked devices' certificates too: they check old commits.
     certificates: HashMap<(String, String), DeviceCertificate>,
     revoked: HashSet<(String, String)>,
+    /// People you verified whose identity key has changed since: nothing
+    /// is sent to them until you accept the new one.
+    blocked: Vec<String>,
 }
 
 impl Keys {
@@ -85,6 +89,7 @@ impl Keys {
         self.identities.extend(other.identities);
         self.certificates.extend(other.certificates);
         self.revoked.extend(other.revoked);
+        self.blocked.extend(other.blocked);
     }
 }
 
@@ -213,15 +218,26 @@ pub async fn setup<S: LocalStore>(api: Client, user_id: &str, store: S, info: &A
         store.clear_device().await;
         let device = Device::create(user_id, &device_id, MemoryStorage::default()).map_err(s)?;
         let cert = identity.certify(user_id, &device_id, device.signature_key(), now());
-        api.publish_device(&serde_json::to_value(&cert).map_err(s)?).await.map_err(s)?;
-        store.set(DEVICE_ID, device_id.as_bytes().to_vec());
-        store.set(DEVICE_KEY, device.signature_key().to_vec());
-        let e2ee = E2ee::new(api, user_id, device, public, server, store, HashMap::new());
-        e2ee.upload_key_packages(KEY_PACKAGES, true).await?;
-        e2ee.persist();
-        tracing::info!("encryption set up for this device ({device_id})");
-        e2ee
+        new_device(api, user_id, device, &cert, public, server, store).await?
     };
+    ready(e2ee).await
+}
+
+/// A device's first start, with its certificate.
+async fn new_device<S: LocalStore>(api: Client, user_id: &str, device: Device<MemoryStorage>, cert: &DeviceCertificate, public: IdentityKey, server: ServerKey, store: S) -> Result<E2ee<S>, String> {
+    api.publish_device(&serde_json::to_value(cert).map_err(s)?).await.map_err(s)?;
+    let device_id = cert.device_id.clone();
+    store.set(DEVICE_ID, device_id.as_bytes().to_vec());
+    store.set(DEVICE_KEY, device.signature_key().to_vec());
+    let e2ee = E2ee::new(api, user_id, device, public, server, store, HashMap::new());
+    e2ee.upload_key_packages(KEY_PACKAGES, true).await?;
+    e2ee.persist();
+    tracing::info!("encryption set up for this device ({device_id})");
+    Ok(e2ee)
+}
+
+/// The last of setting up, for every device.
+async fn ready<S: LocalStore>(e2ee: E2ee<S>) -> Result<Setup<S>, String> {
     // Away for more than a day: refresh every group's key as it syncs.
     let last_seen = e2ee.store.get("last_seen").await.and_then(|v| String::from_utf8(v).ok()).and_then(|v| v.parse::<i64>().ok());
     let mut e2ee = e2ee;
@@ -229,6 +245,69 @@ pub async fn setup<S: LocalStore>(api: Client, user_id: &str, store: S, info: &A
     e2ee.store.set("last_seen", now().to_string().into_bytes());
     e2ee.top_up().await?;
     Ok(Setup::Ready(Box::new(e2ee)))
+}
+
+/// A device waiting to be linked to its account's others (E2EE.md §12):
+/// it shows [`Linking::code`] until one of them approves it. Cheap to clone.
+#[derive(Clone)]
+pub struct Linking(std::sync::Arc<LinkingInner>);
+
+struct LinkingInner {
+    api: Client,
+    user_id: String,
+    device_id: String,
+    code: String,
+    key: dm_crypto::link::LinkKey,
+    server: ServerKey,
+    device: Mutex<Option<Device<MemoryStorage>>>,
+}
+
+impl std::fmt::Debug for Linking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Linking").field("device_id", &self.0.device_id).field("code", &self.0.code).finish()
+    }
+}
+
+/// Asks to link this device (after [`setup`] said [`Setup::NeedsLink`]).
+pub async fn start_link(api: Client, user_id: &str, info: &AxiondInfo) -> Result<Linking, String> {
+    let server = ServerKey { signature_key: B64.decode(&info.external_sender).map_err(|_| "the server's key isn't valid")? };
+    let device_id = api.my_device().await.map_err(s)?;
+    let device = Device::create(user_id, &device_id, MemoryStorage::default()).map_err(s)?;
+    let key = dm_crypto::link::LinkKey::generate().map_err(s)?;
+    api.request_link(&B64.encode(device.signature_key()), &B64.encode(key.public())).await.map_err(s)?;
+    let code = dm_crypto::link::code(user_id, &device_id, device.signature_key(), key.public());
+    Ok(Linking(std::sync::Arc::new(LinkingInner { api, user_id: user_id.into(), device_id, code, key, server, device: Mutex::new(Some(device)) })))
+}
+
+impl Linking {
+    /// What to type on the other device.
+    pub fn code(&self) -> &str {
+        &self.0.code
+    }
+
+    /// Set up, once another device approved this one; `None` until then.
+    pub async fn finish<S: LocalStore>(&self, store: S) -> Result<Option<Setup<S>>, String> {
+        let l = &self.0;
+        let Some(approval) = l.api.link_approval().await.map_err(s)? else { return Ok(None) };
+        let cert: DeviceCertificate = serde_json::from_value(approval.certificate).map_err(s)?;
+        let sealed: dm_crypto::link::Sealed = serde_json::from_value(approval.sealed).map_err(s)?;
+        let identity = l.key.open(&sealed, &l.user_id, &l.device_id).map_err(s)?;
+        let public = identity.public();
+        // The key it was given must be the account's, and vouch for this device.
+        let on_server = l.api.identity(&l.user_id).await.map_err(s)?;
+        if B64.decode(&on_server.identity_key).ok().and_then(|k| IdentityKey::from_slice(&k).ok()) != Some(public) {
+            return Err("the key this device was given isn't your account's".into());
+        }
+        let Some(device) = l.device.lock().unwrap_or_else(|e| e.into_inner()).take() else { return Err("this device was linked already".into()) };
+        if cert.user_id != l.user_id || cert.device_id != l.device_id || cert.signature_key != device.signature_key() || cert.verify(&public).is_err() {
+            return Err("the approval isn't for this device".into());
+        }
+        store.clear_device().await;
+        store.set(IDENTITY, identity.secret().to_vec());
+        store.remember_identity(&l.user_id, &B64.encode(public.0));
+        let e2ee = new_device(l.api.clone(), &l.user_id, device, &cert, public, l.server.clone(), store).await?;
+        ready(e2ee).await.map(Some)
+    }
 }
 
 fn now() -> i64 {
@@ -259,6 +338,25 @@ pub struct E2ee<S> {
     /// background, and a message read twice before then would fail the
     /// second time: each message key is used once.
     recent: Mutex<Recent>,
+    /// The identity keys trusted for people, as last given to the store
+    /// (which writes in the background): `(key, verified)`.
+    known: Mutex<HashMap<String, (String, bool)>>,
+    /// Key changes not dealt with yet, by user: the new key ("" once dealt
+    /// with), as last given to the store.
+    changes: Mutex<HashMap<String, String>>,
+}
+
+/// Where you stand with someone's identity key (E2EE.md §12).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Safety {
+    /// The 60 digits you and they compare.
+    pub number: String,
+    /// The key it's for (base64): verifying is for this one.
+    pub key: String,
+    pub verified: bool,
+    /// Their key changed since you last saw it: `Some(true)` if you had
+    /// verified them, and nothing is sent to them until you accept it.
+    pub changed: Option<bool>,
 }
 
 /// The last [`RECENT`] texts kept, newest last.
@@ -278,7 +376,7 @@ impl<S: LocalStore> E2ee<S> {
     }
 
     fn new(api: Client, user_id: &str, device: Device<MemoryStorage>, identity: IdentityKey, server: ServerKey, store: S, saved: HashMap<Vec<u8>, Vec<u8>>) -> Self {
-        E2ee { api, user_id: user_id.into(), device, identity, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false, file_keys: Default::default(), caught_up: Default::default(), recent: Default::default() }
+        E2ee { api, user_id: user_id.into(), device, identity, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false, file_keys: Default::default(), caught_up: Default::default(), recent: Default::default(), known: Default::default(), changes: Default::default() }
     }
 
     /// Gives the store whatever openmls changed since the last time.
@@ -304,6 +402,105 @@ impl<S: LocalStore> E2ee<S> {
         Ok(stored)
     }
 
+    /// The new device of yours whose link code this is, if it's waiting.
+    pub async fn find_link(&self, typed: &str) -> Result<Option<mm_api::models::E2eeLink>, String> {
+        let Some(code) = dm_crypto::link::normalize(typed) else { return Err("a link code is 20 letters and digits".into()) };
+        for link in self.api.links().await.map_err(s)? {
+            let (Ok(sig), Ok(key)) = (B64.decode(&link.signature_key), B64.decode(&link.link_key)) else { continue };
+            if dm_crypto::link::code(&self.user_id, &link.device_id, &sig, &key) == code {
+                return Ok(Some(link));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Links it: certifies it and gives it the identity key, sealed to it.
+    pub async fn approve_link(&self, link: &mm_api::models::E2eeLink) -> Result<(), String> {
+        let secret = self.store.get(IDENTITY).await.and_then(|s| <[u8; 32]>::try_from(s.as_slice()).ok()).ok_or("this device doesn't hold your identity key")?;
+        let identity = UserIdentity::from_secret(&secret);
+        let (sig, key) = (B64.decode(&link.signature_key).map_err(s)?, B64.decode(&link.link_key).map_err(s)?);
+        let (cert, sealed) = dm_crypto::link::approve(&identity, &self.user_id, &link.device_id, &sig, &key, now()).map_err(s)?;
+        self.api.approve_link(&link.device_id, &serde_json::to_value(&cert).map_err(s)?, &serde_json::to_value(&sealed).map_err(s)?).await.map_err(s)
+    }
+
+    /// The identity key trusted for someone, and whether it's verified.
+    async fn known(&self, user_id: &str) -> Option<(String, bool)> {
+        let cached = self.known.lock().unwrap_or_else(|e| e.into_inner()).get(user_id).cloned();
+        match cached {
+            Some(k) => Some(k),
+            None => {
+                let stored = self.store.identity(user_id).await?;
+                self.known.lock().unwrap_or_else(|e| e.into_inner()).insert(user_id.into(), stored.clone());
+                Some(stored)
+            }
+        }
+    }
+
+    /// Their key changed to `new` ("": dealt with).
+    fn note_change(&self, user_id: &str, new: &str) {
+        self.changes.lock().unwrap_or_else(|e| e.into_inner()).insert(user_id.into(), new.into());
+        self.store.set(&format!("changed.{user_id}"), new.as_bytes().to_vec());
+    }
+
+    /// The new key of a change not dealt with yet.
+    async fn change(&self, user_id: &str) -> Option<String> {
+        let cached = self.changes.lock().unwrap_or_else(|e| e.into_inner()).get(user_id).cloned();
+        let note = match cached {
+            Some(n) => n,
+            None => self.store.get(&format!("changed.{user_id}")).await.and_then(|n| String::from_utf8(n).ok()).unwrap_or_default(),
+        };
+        (!note.is_empty()).then_some(note)
+    }
+
+    fn trust(&self, user_id: &str, key: &str, verified: bool) {
+        self.known.lock().unwrap_or_else(|e| e.into_inner()).insert(user_id.into(), (key.into(), verified));
+        self.store.set_identity(user_id, key, verified);
+    }
+
+    /// Your safety number with someone, from the key the server has for
+    /// them now, and where you stand with it.
+    pub async fn safety(&self, user_id: &str) -> Result<Safety, String> {
+        let theirs = self.api.identity(user_id).await.map_err(s)?;
+        let key = B64.decode(&theirs.identity_key).ok().and_then(|k| IdentityKey::from_slice(&k).ok()).ok_or("they haven't set up encryption yet")?;
+        let known = self.known(user_id).await;
+        let changed = match &known {
+            Some((k, verified)) if *k != theirs.identity_key => Some(*verified),
+            _ => self.change(user_id).await.map(|_| false),
+        };
+        Ok(Safety {
+            number: dm_crypto::safety_number((&self.user_id, &self.identity), (user_id, &key)),
+            verified: known.as_ref().is_some_and(|(k, v)| *v && *k == theirs.identity_key),
+            key: theirs.identity_key,
+            changed,
+        })
+    }
+
+    /// Marks someone's key as verified (you compared the safety number for
+    /// `key`), or not; either way it's the one trusted for them now, and any
+    /// change to it is dealt with.
+    pub async fn set_verified(&self, user_id: &str, key: &str, verified: bool) -> Result<(), String> {
+        let now = self.api.identity(user_id).await.map_err(s)?;
+        if now.identity_key != key {
+            return Err("their key changed again: look at the new safety number".into());
+        }
+        self.trust(user_id, key, verified);
+        self.note_change(user_id, "");
+        Ok(())
+    }
+
+    /// Of these people, those whose key changed and you haven't dealt with
+    /// it: `true` for those you had verified (sending to them is held).
+    pub async fn key_changes(&self, users: &[String]) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        for user in users {
+            if let Some(new) = self.change(user).await {
+                let verified = self.known(user).await.is_some_and(|(k, v)| v && k != new);
+                out.push((user.clone(), verified));
+            }
+        }
+        out
+    }
+
     /// Keeps enough one-time key packages on the server for others to add
     /// this device.
     pub async fn top_up(&self) -> Result<(), String> {
@@ -323,15 +520,26 @@ impl<S: LocalStore> E2ee<S> {
             if id.identity_key.is_empty() {
                 continue;
             }
-            match self.store.identity(user).await {
-                Some(known) if known != id.identity_key => {
-                    // Verification and accepting a new key come with the
-                    // devices page; until then a changed key isn't trusted.
-                    tracing::warn!("{user}'s identity key changed; not trusting their devices");
+            match self.known(user).await {
+                // Verified, then changed: not trusted until you accept it.
+                Some((known, true)) if known != id.identity_key => {
+                    tracing::warn!("{user}'s identity key changed since you verified it; not trusting their devices");
+                    self.note_change(user, &id.identity_key);
+                    keys.blocked.push(user.clone());
                     continue;
                 }
+                // Changed, unverified: trusted, as Signal does, and said in
+                // their conversations.
+                Some((known, false)) if known != id.identity_key => {
+                    tracing::warn!("{user}'s identity key changed");
+                    self.trust(user, &id.identity_key, false);
+                    self.note_change(user, &id.identity_key);
+                }
                 Some(_) => {}
-                None => self.store.remember_identity(user, &id.identity_key),
+                None => {
+                    self.known.lock().unwrap_or_else(|e| e.into_inner()).insert(user.clone(), (id.identity_key.clone(), false));
+                    self.store.remember_identity(user, &id.identity_key);
+                }
             }
             if let Some(key) = B64.decode(&id.identity_key).ok().and_then(|k| IdentityKey::from_slice(&k).ok()) {
                 keys.identities.insert(user.clone(), key);
@@ -504,6 +712,16 @@ impl<S: LocalStore> E2ee<S> {
         // has never set up encryption has no device to encrypt for.
         let members = self.members(channel_id).await?;
         let keys = self.keys(&members).await?;
+        if !keys.blocked.is_empty() {
+            let names: Vec<String> = match self.api.users_by_ids(&keys.blocked).await {
+                Ok(users) => users.into_iter().map(|u| format!("@{}", u.username)).collect(),
+                Err(_) => keys.blocked.clone(),
+            };
+            return Err(format!(
+                "{}'s identity key changed since you verified it. Compare the new safety number with them, then accept it, before sending here",
+                names.join(", ")
+            ));
+        }
         let unable: Vec<String> = members.iter().filter(|u| !keys.active().any(|(cu, _)| cu == *u)).cloned().collect();
         if !unable.is_empty() {
             let names: Vec<String> = match self.api.users_by_ids(&unable).await {

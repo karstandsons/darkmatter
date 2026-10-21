@@ -249,6 +249,10 @@ pub struct Chat {
     /// End-to-end encryption on this device (axiond), and how it stands.
     pub crypto: crate::crypto::Shared,
     pub crypto_status: crate::crypto::Status,
+    /// Waiting to be linked from another of your devices, and whether a
+    /// check is out.
+    pub linking: Option<dm_client::Linking>,
+    link_checking: bool,
     /// Who each encrypted channel's group holds, as the group says: for the
     /// lock's tooltip. Refreshed when the channel opens or the group changes.
     pub group_members: HashMap<String, Vec<(String, usize)>>,
@@ -651,7 +655,7 @@ impl Chat {
             last_in_thread: false,
             next_local_id: 0,
             error: None,
-            notice: None,
+            notice: b.linking.is_some().then(|| "To read encrypted conversations here, link this device: Account (☰) shows its code.".to_string()),
             shortcuts: None,
             slash: None,
             compact: false,
@@ -666,6 +670,8 @@ impl Chat {
             vault: b.vault,
             crypto: b.crypto,
             crypto_status: b.crypto_status,
+            linking: b.linking,
+            link_checking: false,
             group_members: HashMap::new(),
             plugins: Default::default(),
             plugin_picker: None,
@@ -2219,6 +2225,50 @@ impl Chat {
             Message::OpenFile(id, name) => {
                 Task::perform(media::open_file(self.client.clone(), self.crypto.clone(), self.account.clone(), id, name), Message::Opened)
             }
+            Message::LinkCheck => {
+                let (Some(linking), Some(vault)) = (self.linking.clone(), self.vault.clone()) else { return Task::none() };
+                if self.link_checking {
+                    return Task::none();
+                }
+                self.link_checking = true;
+                Task::perform(crate::crypto::finish_link(linking, vault), Message::Linked)
+            }
+            Message::Linked(Ok(None)) => {
+                self.link_checking = false;
+                Task::none()
+            }
+            Message::Linked(Ok(Some(crypto))) => {
+                self.link_checking = false;
+                self.linking = None;
+                self.crypto_status = crate::crypto::Status::Ready { fingerprint: crate::crypto::fingerprint(&crypto.identity) };
+                self.crypto = Some(crypto.clone());
+                self.notice = Some("This device is linked: new encrypted messages show here from now on.".into());
+                // Into every encrypted channel's group, then show them again.
+                let channels: Vec<String> = self.store.channels.values().filter(|c| c.encrypted).map(|c| c.id.clone()).collect();
+                let join = Task::future(async move {
+                    for ch in channels {
+                        if let Err(e) = crypto.sync(&ch).await {
+                            tracing::warn!("couldn't sync the encryption of {ch}: {e}");
+                        }
+                    }
+                });
+                join.then(|_| Task::done(Message::ReloadOpen))
+            }
+            Message::ReloadOpen => {
+                self.store.timelines.clear();
+                let mut channels: Vec<String> = self.panes.iter().map(|(_, p)| p.channel.clone()).filter(|c| !c.is_empty()).collect();
+                channels.sort();
+                channels.dedup();
+                Task::batch(channels.into_iter().map(|c| self.load_history(c)))
+            }
+            Message::Linked(Err(e)) => {
+                self.link_checking = false;
+                tracing::warn!("linking this device: {e}");
+                self.error = Some(format!("Couldn't finish linking this device: {e}"));
+                self.linking = None;
+                self.crypto_status = crate::crypto::Status::Failed(e);
+                Task::none()
+            }
             Message::Opened(Err(e)) => {
                 self.error = Some(format!("Couldn't open file: {e}"));
                 Task::none()
@@ -3166,6 +3216,7 @@ pub(crate) mod tests {
             vault: None,
             outbox: vec![],
             crypto_status: crate::crypto::Status::Off,
+            linking: None,
             crypto: None,
         };
         let (mut chat, _) = Chat::start(b).unwrap();
