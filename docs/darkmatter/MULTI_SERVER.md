@@ -1,6 +1,18 @@
 # Darkmatter: several servers at once
 
-Status: planned (2026-10-20). Decided with the user:
+Status: built (2026-10-20), for Darkmatter 0.5.0: commits 84cf8ca (accounts),
+3f0a495 (rail), b7196e2 (notifications and links), 85277c5 (shared inbox),
+3f4ddf4 (plugins, encrypted text). Where it differs from the plan below:
+- Next/previous server is **Ctrl+Tab / Ctrl+Shift+Tab**: Ctrl+Alt+↑/↓ were
+  already the panes' keys.
+- Reordering is Move up / Move down in an icon's menu; dragging isn't built.
+- Text from encrypted conversations can only be copied out of a message box
+  (messages can't be selected), so that's what the paste check watches.
+- Not built yet: dropping a background account's media cache after a while;
+  a notification click was only tested in unit tests (the desktop's popups
+  can't be clicked from a script).
+
+Decided with the user:
 - **A server rail** on the left, not tabs along the top.
 - **Separate layouts** per server. Panes that mix servers may come later.
 - **One account per server.** More than one account on a server may be
