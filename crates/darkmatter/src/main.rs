@@ -12,6 +12,7 @@ mod layout;
 mod lightbox;
 mod media;
 mod outbox;
+mod notify;
 mod pane;
 mod rail;
 mod panels;

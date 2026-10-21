@@ -5,6 +5,21 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **Several servers at once.** Add another Mattermost or axiond server
+  with + on the new server rail (or ☰ → Add a server…) and switch with
+  Ctrl+1…9, Ctrl+Tab or a click. Each keeps its own layout and stays
+  connected in the background: its icon counts your mentions, the window
+  title adds up all of them, and notifications say which server they're
+  from. Clicking a notification opens the message on its server.
+  Right-click an icon to rename, mute, reorder, sign out or remove it.
+  Your current login moves over by itself.
+- Links to a channel or message on any server you're signed into open in
+  Darkmatter, on that server.
+- Notifications from encrypted conversations no longer show the message
+  (it would stay in the desktop's notification history unencrypted):
+  `[notifications] encrypted_previews = true` brings it back.
+- **Fixed:** clicking a link in a message did nothing.
+
 ## [0.4.3] - 2026-10-20
 
 - **Code in the message box.** Enter inside an open ``` block starts a

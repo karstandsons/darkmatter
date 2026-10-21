@@ -156,6 +156,14 @@ pub enum Message {
     ShowAllReplies(String),
     /// Go to a message in its channel: (channel id, thread root id, post id).
     JumpTo(String, String, String),
+    /// A link to a message on this server (`/<team>/pl/<post id>`).
+    OpenPermalink(String),
+    /// Where it is: (channel, thread root, post).
+    PermalinkFound(Result<(String, String, String), String>),
+    /// A link to a channel on this server, by its name.
+    OpenChannelNamed(String),
+    /// A click on a notification.
+    NotificationClicked(crate::notify::Click),
     /// Where the jump target sits, as a timeline offset from the bottom.
     JumpLocated(Option<f32>),
     /// Posts around a jump target: (channel, root, (before, after, thread)).
@@ -441,6 +449,20 @@ impl App {
         self.accounts.save();
     }
 
+    /// What each chat needs to know about its server: its name for
+    /// notifications (once there are several), and whether it's muted.
+    fn sync_servers(&mut self) {
+        let many = self.servers.len() > 1;
+        let previews = self.config.notifications.encrypted_previews == Some(true);
+        for s in &mut self.servers {
+            let Screen::Chat(chat) = &mut s.screen else { continue };
+            let saved = self.accounts.get(&s.id);
+            chat.server_name = saved.filter(|_| many).map(Saved::label);
+            chat.muted = saved.is_some_and(|a| a.muted);
+            chat.encrypted_previews = previews;
+        }
+    }
+
     /// Each chat's sidebar shows the update notice.
     fn sync_updates(&mut self) {
         let (release, updating) = (self.new_release.clone(), self.updating.clone());
@@ -694,7 +716,17 @@ impl App {
                 Task::none()
             }
         };
+        self.sync_servers();
         ControlFlow::Break(task)
+    }
+
+    /// Signed-in accounts' keys and server addresses, for links.
+    fn signed_in(&self) -> Vec<(u64, String)> {
+        self.servers
+            .iter()
+            .filter(|s| matches!(s.screen, Screen::Chat(_)))
+            .filter_map(|s| Some((s.key, self.accounts.get(&s.id)?.server.clone())))
+            .collect()
     }
 
     /// The rail's icons.
@@ -1059,9 +1091,10 @@ impl App {
             }
         }
         // Keys a message box passes on (shortcuts, menu keys) are the app's,
-        // like keys no widget took, not the pane's; so are the app's windows.
+        // like keys no widget took, not the pane's; so are the app's windows
+        // and links.
         let message = match message {
-            Message::InPane(_, m) if matches!(*m, Message::Key(_) | Message::Report(_) | Message::Account(_)) => *m,
+            Message::InPane(_, m) if matches!(*m, Message::Key(_) | Message::Report(_) | Message::Account(_) | Message::Link(_)) => *m,
             m => m,
         };
         // While an image is shown, keys are its: zoom, step, close.
@@ -1148,6 +1181,21 @@ impl App {
             }
             // `mention:` links are @usernames; a profile popover can hook in here later.
             Message::Link(uri) if uri.starts_with("mention:") => Task::none(),
+            Message::Link(uri) if let Some((key, to)) = link_target(&uri, self.signed_in()) => {
+                let Some(i) = self.servers.iter().position(|s| s.key == key) else { return Task::none() };
+                let open = match to {
+                    LinkTo::Post(id) => Message::OpenPermalink(id),
+                    LinkTo::Channel(name) => Message::OpenChannelNamed(name),
+                };
+                Task::batch([self.show(i), Task::done(open.to(key))])
+            }
+            Message::NotificationClicked(click) => {
+                let Some(i) = self.servers.iter().position(|s| s.id == click.account) else { return Task::none() };
+                let key = self.servers[i].key;
+                let raise = iced::window::latest().and_then(iced::window::gain_focus);
+                let open = Message::JumpTo(click.channel, click.root, click.post).to(key);
+                Task::batch([raise, self.show(i), Task::done(open)])
+            }
             Message::Link(uri) => {
                 if let Err(e) = open::that_detached(&uri) {
                     tracing::warn!("couldn't open {uri}: {e}");
@@ -1422,6 +1470,7 @@ impl App {
         chat.shown = self.cur() == self.active;
         let task = Task::batch([task, chat.open_panes()]);
         *self.screen() = Screen::Chat(Box::new(chat));
+        self.sync_servers();
         task
     }
 
@@ -1445,6 +1494,7 @@ impl App {
                 _ => None,
             }),
         ];
+        subs.push(Subscription::run(crate::notify::clicks).map(Message::NotificationClicked));
         if self.config.updates.check != Some(false) {
             subs.push(iced::time::every(Duration::from_secs(24 * 60 * 60)).map(|_| Message::CheckUpdate));
         }
@@ -1510,6 +1560,29 @@ impl App {
             body = body.push(crate::rail::menu(m, at, entry, c));
         }
         container(body).width(Length::Fill).height(Length::Fill).style(c.panel(c.bg)).into()
+    }
+}
+
+/// Where a link to a Mattermost or axiond page goes in Darkmatter.
+#[derive(Debug, PartialEq, Eq)]
+enum LinkTo {
+    Post(String),
+    Channel(String),
+}
+
+/// A link to a message or channel on one of the signed-in servers: which,
+/// and where. Other links open in the browser.
+fn link_target(uri: &str, servers: Vec<(u64, String)>) -> Option<(u64, LinkTo)> {
+    let (key, path) = servers.iter().find_map(|(key, server)| {
+        let rest = uri.strip_prefix(server.trim_end_matches('/'))?;
+        rest.starts_with('/').then_some((*key, rest))
+    })?;
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    match parts.as_slice() {
+        [_team, "pl", id] => Some((key, LinkTo::Post((*id).to_string()))),
+        [_team, "channels", name] => Some((key, LinkTo::Channel((*name).to_string()))),
+        _ => None,
     }
 }
 
@@ -1952,5 +2025,54 @@ mod tests {
         let _ = app.update(Message::Rail(crate::rail::Msg::Move(1)));
         assert_eq!(app.servers.iter().map(|s| s.key).collect::<Vec<_>>(), [keys[1], keys[2], keys[0]]);
         assert_eq!(app.servers[app.active].key, keys[0]);
+    }
+
+    #[test]
+    fn links_to_signed_in_servers_open_here() {
+        let servers = || vec![(1, "https://work.example.com".to_string()), (2, "http://127.0.0.1:8068".to_string())];
+        assert_eq!(link_target("https://work.example.com/dev/pl/abc123", servers()), Some((1, LinkTo::Post("abc123".into()))));
+        assert_eq!(link_target("http://127.0.0.1:8068/home/channels/town-square?x=1#y", servers()), Some((2, LinkTo::Channel("town-square".into()))));
+        // Other pages there, and other sites, go to the browser.
+        assert_eq!(link_target("https://work.example.com/admin_console", servers()), None);
+        assert_eq!(link_target("https://work.example.com.evil.net/dev/pl/abc", servers()), None);
+        assert_eq!(link_target("https://elsewhere.org/dev/pl/abc", servers()), None);
+    }
+
+    #[test]
+    fn a_notification_click_opens_its_server() {
+        let mut home = crate::chat::tests::chat();
+        home.account = "home".into();
+        let mut app = app(vec![crate::chat::tests::chat(), home]);
+        let click = crate::notify::Click { account: "home".into(), channel: "c1".into(), root: "p1".into(), post: "p1".into() };
+        let _ = app.update(Message::NotificationClicked(click));
+        assert_eq!(app.active, 1);
+        // One for an account that's gone does nothing.
+        let gone = crate::notify::Click { account: "gone".into(), channel: "c1".into(), root: "p1".into(), post: "p1".into() };
+        let _ = app.update(Message::NotificationClicked(gone));
+        assert_eq!(app.active, 1);
+    }
+
+    #[test]
+    fn muted_servers_say_so_to_their_chat() {
+        let mut home = crate::chat::tests::chat();
+        home.account = "home".into();
+        let mut app = app(vec![crate::chat::tests::chat(), home]);
+        app.accounts.list = vec![Saved { id: "a1".into(), server: "https://work.x".into(), ..Default::default() }, Saved { id: "home".into(), server: "https://home.x".into(), name: "Home".into(), muted: true, ..Default::default() }];
+        app.sync_servers();
+        let chats: Vec<(Option<String>, bool)> = app.chats().map(|c| (c.server_name.clone(), c.muted)).collect();
+        assert_eq!(chats, [(Some("work.x".into()), false), (Some("Home".into()), true)]);
+    }
+
+    #[test]
+    fn a_link_in_a_message_opens_on_its_server() {
+        let mut home = crate::chat::tests::chat();
+        home.account = "home".into();
+        let mut app = app(vec![crate::chat::tests::chat(), home]);
+        app.accounts.list = vec![Saved { id: "a1".into(), server: "https://work.x".into(), ..Default::default() }, Saved { id: "home".into(), server: "https://home.x".into(), ..Default::default() }];
+        // As a message's link arrives: from inside its pane.
+        let Screen::Chat(chat) = &app.servers[0].screen else { panic!() };
+        let pane = chat.focus;
+        let _ = app.update(Message::InPane(pane, Box::new(Message::Link("https://home.x/family/pl/p1".into()))));
+        assert_eq!(app.active, 1);
     }
 }

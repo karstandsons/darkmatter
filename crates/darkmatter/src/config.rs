@@ -13,6 +13,17 @@ pub struct Config {
     pub keys: KeysConfig,
     pub updates: UpdatesConfig,
     pub plugins: PluginsConfig,
+    pub notifications: NotificationsConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    /// Show the text of messages from encrypted conversations in
+    /// notifications. Off unless true: it would stay in the desktop's
+    /// notification history, unencrypted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_previews: Option<bool>,
 }
 
 /// `[plugins]`: `off = ["gif"]` switches plugins off; `[plugins.<name>]`

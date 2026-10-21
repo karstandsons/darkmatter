@@ -163,6 +163,12 @@ pub struct Chat {
     pub account: String,
     /// On screen: another account's isn't, so its messages stay unread.
     pub shown: bool,
+    /// Its name in notifications, once there's more than one server.
+    pub server_name: Option<String>,
+    /// Its notifications are muted.
+    pub muted: bool,
+    /// Notifications show the text of encrypted messages (`[notifications]`).
+    pub encrypted_previews: bool,
     pub client: Client,
     pub store: Store,
     pub team: String,
@@ -316,6 +322,22 @@ impl Chat {
     /// Whether any pane shows `channel`.
     pub fn showing(&self, channel: &str) -> bool {
         self.shown && self.panes.iter().any(|(_, p)| p.channel == channel)
+    }
+
+    /// A desktop notification for a message that mentions you; a click
+    /// opens it.
+    fn notify_mention(&self, post: &Post) {
+        let channel = self.store.channels.get(&post.channel_id);
+        let note = crate::notify::note(
+            self.server_name.as_deref(),
+            &self.store.display_name(post),
+            &channel.map(|c| self.store.channel_label(c)).unwrap_or_default(),
+            &post.message,
+            channel.is_some_and(|c| c.encrypted),
+            self.encrypted_previews,
+        );
+        let root = if post.root_id.is_empty() { post.id.clone() } else { post.root_id.clone() };
+        crate::notify::show(note, crate::notify::Click { account: self.account.clone(), channel: post.channel_id.clone(), root, post: post.id.clone() });
     }
 
     /// Back on screen: what came to its open channels meanwhile is seen now,
@@ -581,6 +603,9 @@ impl Chat {
             session: b.session,
             account: b.account,
             shown: true,
+            server_name: None,
+            muted: false,
+            encrypted_previews: false,
             client,
             store,
             team,
@@ -1729,6 +1754,27 @@ impl Chat {
                 }
                 Task::batch([group, if in_thread { to_latest(THREAD) } else { to_latest(self.pv().timeline()) }])
             }
+            Message::OpenPermalink(id) => {
+                let client = self.client.clone();
+                Task::perform(
+                    async move {
+                        let thread = client.thread(&id).await.map_err(err)?;
+                        let post = thread.posts.get(&id).ok_or("it isn't there any more")?;
+                        let root = if post.root_id.is_empty() { id.clone() } else { post.root_id.clone() };
+                        Ok((post.channel_id.clone(), root, id))
+                    },
+                    Message::PermalinkFound,
+                )
+            }
+            Message::PermalinkFound(Ok((channel, root, post))) => self.update(Message::JumpTo(channel, root, post)),
+            Message::PermalinkFound(Err(e)) => self.notify(format!("Couldn't open that message: {e}")),
+            Message::OpenChannelNamed(name) => {
+                if !self.store.channels.values().any(|c| c.name == name) {
+                    return self.notify(format!("You aren't in ~{name} here: /join {name} joins it"));
+                }
+                self.pending_goto = Some(name);
+                self.goto_pending()
+            }
             Message::JumpTo(channel, root, post) => {
                 // Set first: select_channel skips loading the newest page for it.
                 self.pv_mut().jump = Some(Jump { channel: channel.clone(), root, post, window_requested: false });
@@ -2803,8 +2849,8 @@ impl Chat {
                 }
                 self.typing.retain(|(ch, user, _), _| !(*ch == post.channel_id && *user == post.user_id));
                 let notify = self.store.posted(*post.clone(), &mentions, viewing);
-                if notify {
-                    notify_mention(&self.store, &post);
+                if notify && !self.muted {
+                    self.notify_mention(&post);
                 }
                 // Bottom-anchored lists stay on the newest post by themselves, and
                 // someone reading further up isn't yanked down.
@@ -2892,18 +2938,6 @@ impl Chat {
             M::Event(_) => Task::none(),
         }
     }
-}
-
-fn notify_mention(store: &Store, post: &Post) {
-    let channel = store.channels.get(&post.channel_id).map(|c| store.channel_label(c)).unwrap_or_default();
-    let title = format!("{} in {channel}", store.display_name(post));
-    let body = post.message.clone();
-    // D-Bus / macOS notification calls block briefly; keep them off the UI thread.
-    std::thread::spawn(move || {
-        if let Err(e) = notify_rust::Notification::new().appname("Darkmatter").summary(&title).body(&body).show() {
-            tracing::warn!("notification failed: {e}");
-        }
-    });
 }
 
 /// Find the jump target in the timeline, as the offset from the bottom that
