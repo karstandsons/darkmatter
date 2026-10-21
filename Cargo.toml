@@ -4,7 +4,7 @@ members = ["crates/omarchy-theme", "crates/mm-api", "crates/darkmatter", "crates
 
 [workspace.package]
 edition = "2024"
-version = "0.4.3"
+version = "0.5.0"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]

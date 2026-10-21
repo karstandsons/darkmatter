@@ -5,6 +5,8 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-21
+
 - **Several servers at once.** Add another Mattermost or axiond server
   with + on the new server rail (or ☰ → Add a server…) and switch with
   Ctrl+1…9, Ctrl+Tab or a click. Each keeps its own layout and stays
