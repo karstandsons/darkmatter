@@ -75,7 +75,7 @@ So the server can't add a device of its own making: it has no user identity key 
 
 **A device is a signed-in session** (as built in M2): signing out, a revoked or expired session, a password reset or deactivation revokes the device and takes it out of every group. Signing in again makes a new device.
 
-**Removing a device** (from the devices page, or because a session is revoked): the user's other device publishes a revocation signed by the identity key, the server stops delivering to the device, and the device is removed from every group ([§4](#4-groups)).
+**Removing a device** (signing it out from Account → Signed-in apps, or because a session is revoked): the server ends its sessions, stops delivering to it, and proposes its removal from every group ([§4](#4-groups)). As built, revocations aren't signed by the identity key: the server can already refuse to deliver to any device, so a signature wouldn't stop a malicious one from cutting a device off, and it can't add one.
 
 ## 4. Groups
 
@@ -206,15 +206,17 @@ The full call design gets its own document before M3.
 
 ## 12. New devices, verification and recovery
 
-**Linking a new device.** The new device logs in, generates its keys and shows a short code and a QR code. One of the user's existing devices scans it or types the code, sees the new device's name and key fingerprint, and approves. Approval means the existing device signs the new device's certificate and sends the identity key to it, encrypted to the new device inside a one-off MLS group between the two. The new device then joins the user's groups by external commit.
+**Linking a new device** (as built in M2 step 9). The new device logs in, makes its MLS signature key and a one-off HPKE key, and sends both to the server as a link request. It shows a **link code**: 20 characters (100 bits) of a SHA-256 hash over the user id, device id and both keys, and a QR code of it. On one of the user's existing devices, Account takes the code, finds the pending request whose keys hash to it, and shows which app it is. "Link it" signs the new device's certificate and seals the identity key to its HPKE key (RFC 9180, X25519 / HKDF-SHA256 / AES-128-GCM, from the same libcrux provider as MLS), bound to the user and device ids. The new device checks the certificate vouches for its own key and that the identity key it got is the account's, then joins the user's groups by external commit. A server that swapped in keys of its own would change the code, so the existing device wouldn't find a match. (This replaces the one-off MLS group first planned: HPKE does the same job with less machinery.)
 
-**Recovery.** At first setup, Darkmatter offers a **recovery key**: 128 random bits shown once as 24 words (or a code to print). From it, HKDF derives a backup key that encrypts:
+**Recovery** (as built in M2 step 10). Account → Recovery offers a **recovery key**: 128 random bits shown once as a 28-character code (26 characters for the key, 2 that catch typing mistakes; a code rather than words, so there's no word list to ship and translate). From it, HKDF-SHA256 with a random salt derives a backup key; a passphrase instead goes through argon2id (64 MiB, three passes; clients refuse settings below OWASP's floor, so a server can't hand out cheap ones). XChaCha20-Poly1305, bound to the user id, encrypts:
 - the user identity key (so a lost-every-device user can sign a new device without breaking everyone's verification);
 - later, an optional **history backup**: the device's decrypted messages, uploaded encrypted in chunks.
 
 The server stores only the ciphertext. A passphrase can be used instead of a recovery key, stretched with argon2id with strong settings, but the app recommends the recovery key.
 
 **With no recovery key and no device left,** the user makes a new identity key. Everyone sees the warning from [§3](#3-identities-and-devices), and the new devices see only messages from then on.
+
+**Starting over** needs the account's password: the server takes out every device, drops the old backups, records it in the audit log and tells the user's teammates (`identity_changed`).
 
 **Verification.**
 - A **safety number** for each pair of users: 60 digits computed from both identity keys (the same idea as Signal's), compared in person or over a call.

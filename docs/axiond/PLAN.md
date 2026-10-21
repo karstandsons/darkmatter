@@ -444,12 +444,12 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
      - catching up for a message stops at that message's epoch;
      - sending and live handshakes wait for the backlog too.
 8. **Local search** over decrypted messages, merged with the server's results. *(done 2026-10-20; checked in the app)* An FTS5 index inside the vault (SQLCipher) holds each decrypted message as last shown: it's written as messages are decrypted, edits replace it and deletes remove it. Ctrl+F searches it beside the server and shows both, newest first; `from:` and `in:` narrow it too, and if the server can't be reached, this device's results still show. Messages decrypted before this step are indexed when they're next shown.
-9. **Devices:**
-   - linking a new device by QR or code;
-   - the devices page and revocation;
-   - safety numbers, verification marks;
-   - blocking sending when a verified key changes.
-10. **Recovery:** the recovery key (offered at first setup) and passphrase backups of the identity key.
+9. **Devices:** *(built 2026-10-21; tested end to end through axiond, the in-app check still to do)*
+   - linking a new device by a 20-character code (and its QR code), approved in Account on another device; the identity key goes over HPKE;
+   - the devices page is Account → Signed-in apps: a device is a session, and signing one out takes it out of every group;
+   - safety numbers (`/verify`), a ✓ on verified direct messages;
+   - a verified person's changed key holds sending where they are until it's accepted; an unverified change is trusted and said in the conversation.
+10. **Recovery:** *(built 2026-10-21; tested end to end through axiond, the in-app check still to do)* a recovery key (a 28-character code) or a passphrase (argon2id) backs up the identity key, from Account → Recovery; a device waiting to be linked can recover from either, or start over with a new key and the account password.
 11. **Proving it:**
     - property tests over group operations;
     - the malicious-server harness;
