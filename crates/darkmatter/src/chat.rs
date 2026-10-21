@@ -507,6 +507,24 @@ impl Chat {
         Task::batch([members, standing])
     }
 
+    /// Encryption is set up on this device now (linked, or recovered): into
+    /// every encrypted channel's group, then show what's open again.
+    fn encryption_ready(&mut self, crypto: std::sync::Arc<crate::crypto::Crypto>, note: &str) -> Task<Message> {
+        self.linking = None;
+        self.crypto_status = crate::crypto::Status::Ready { fingerprint: crate::crypto::fingerprint(&crypto.identity) };
+        self.crypto = Some(crypto.clone());
+        self.notice = Some(note.into());
+        let channels: Vec<String> = self.store.channels.values().filter(|c| c.encrypted).map(|c| c.id.clone()).collect();
+        let join = Task::future(async move {
+            for ch in channels {
+                if let Err(e) = crypto.sync(&ch).await {
+                    tracing::warn!("couldn't sync the encryption of {ch}: {e}");
+                }
+            }
+        });
+        join.then(|_| Task::done(Message::ReloadOpen))
+    }
+
     /// `/verify [@someone]`: your safety number with them; in a direct
     /// message, with the other person.
     fn open_verify(&mut self, arg: &str) -> Task<Message> {
@@ -2333,22 +2351,20 @@ impl Chat {
                 self.link_checking = false;
                 Task::none()
             }
+            Message::Recover(how) => {
+                let (Some(vault), Some(info)) = (self.vault.clone(), self.axiond.clone()) else { return Task::none() };
+                let (client, me) = (self.client.clone(), self.store.me.id.clone());
+                Task::perform(crate::crypto::recover(client, me, vault, info, how), Message::Recovered)
+            }
+            Message::Recovered(Err(e)) => {
+                tracing::warn!("recovering: {e}");
+                self.error = Some(format!("Couldn't set up encryption: {e}"));
+                Task::none()
+            }
+            Message::Recovered(Ok(crypto)) => self.encryption_ready(crypto, "Encryption is set up on this device: new encrypted messages show here from now on."),
             Message::Linked(Ok(Some(crypto))) => {
                 self.link_checking = false;
-                self.linking = None;
-                self.crypto_status = crate::crypto::Status::Ready { fingerprint: crate::crypto::fingerprint(&crypto.identity) };
-                self.crypto = Some(crypto.clone());
-                self.notice = Some("This device is linked: new encrypted messages show here from now on.".into());
-                // Into every encrypted channel's group, then show them again.
-                let channels: Vec<String> = self.store.channels.values().filter(|c| c.encrypted).map(|c| c.id.clone()).collect();
-                let join = Task::future(async move {
-                    for ch in channels {
-                        if let Err(e) = crypto.sync(&ch).await {
-                            tracing::warn!("couldn't sync the encryption of {ch}: {e}");
-                        }
-                    }
-                });
-                join.then(|_| Task::done(Message::ReloadOpen))
+                self.encryption_ready(crypto, "This device is linked: new encrypted messages show here from now on.")
             }
             Message::ReloadOpen => {
                 self.store.timelines.clear();
@@ -3039,6 +3055,23 @@ impl Chat {
                 let channel = if raw.broadcast.channel_id.is_empty() { raw.data["channel_id"].as_str().unwrap_or_default().to_string() } else { raw.broadcast.channel_id.clone() };
                 let about_me = raw.event != "user_added" || raw.data["user_id"].as_str() == Some(self.store.me.id.as_str());
                 if channel.is_empty() || !about_me { Task::none() } else { self.fetch_channel(channel) }
+            }
+            // Someone started over with a new key: look now, so their
+            // conversations say so before anything's sent.
+            M::Event(Event::Other(raw)) if raw.event == "identity_changed" => {
+                let (Some(crypto), Some(user)) = (self.crypto.clone(), raw.data["user_id"].as_str().map(str::to_string)) else { return Task::none() };
+                if user == self.store.me.id {
+                    return Task::none();
+                }
+                Task::perform(
+                    async move {
+                        if let Err(e) = crypto.check_keys(std::slice::from_ref(&user)).await {
+                            tracing::warn!("couldn't check {user}'s new key: {e}");
+                        }
+                        crypto.standing(&[user]).await
+                    },
+                    Message::Standing,
+                )
             }
             M::Event(Event::Other(raw)) if raw.event == "user_removed" => {
                 let channel = raw.data["channel_id"].as_str().unwrap_or_default().to_string();

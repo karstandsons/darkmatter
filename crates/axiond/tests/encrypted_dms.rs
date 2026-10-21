@@ -243,6 +243,61 @@ async fn safety_numbers_and_a_swapped_key() {
     alice.encrypt_post(&post).await.unwrap();
 }
 
+/// A new sign-in for `name`: its own session, so a new device.
+async fn sign_in(s: &Server, name: &str) -> (Client, String, mm_api::models::AxiondInfo) {
+    let mut api = Client::new(&s.url).unwrap();
+    let me = api.login(name, PASSWORD, None).await.unwrap();
+    let info = api.axiond().await.unwrap().unwrap();
+    (api, me.id, info)
+}
+
+#[tokio::test]
+async fn recovering_from_a_backup_and_starting_over() {
+    use dm_client::Recovery;
+    let s = server().await;
+    let (alice_api, laptop) = device(&s, "alice", MemoryStore::default()).await;
+    let (bob_api, bob) = device(&s, "bob", MemoryStore::default()).await;
+    let dm = alice_api.create_direct(&laptop.user_id, &bob.user_id).await.unwrap();
+    send(&bob_api, &bob, &dm.id, "hi").await;
+
+    let code = laptop.back_up_with_key().await.unwrap();
+    laptop.back_up_with_passphrase("a long passphrase of mine").await.unwrap();
+    let mut kinds = laptop.backups().await.unwrap();
+    kinds.sort();
+    assert_eq!(kinds, ["key", "passphrase"]);
+
+    // The laptop is lost. A phone gets the key back from the backup.
+    let (phone_api, me, info) = sign_in(&s, "alice").await;
+    let store = MemoryStore::default();
+    assert!(dm_client::recover(phone_api.clone(), &me, store.clone(), &info, Recovery::Key("AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA")).await.is_err());
+    let Setup::Ready(phone) = dm_client::recover(phone_api.clone(), &me, store, &info, Recovery::Key(&code)).await.unwrap() else { panic!() };
+    assert_eq!(phone.identity, laptop.identity, "the same key: no one sees a change");
+    phone.sync(&dm.id).await.unwrap();
+    let later = send(&bob_api, &bob, &dm.id, "found your phone?").await;
+    assert_eq!(text(read(&phone, &later).await), "found your phone?");
+    // And with the passphrase, on a tablet.
+    let (tablet_api, me, info) = sign_in(&s, "alice").await;
+    assert!(dm_client::recover(tablet_api.clone(), &me, MemoryStore::default(), &info, Recovery::Passphrase("not it")).await.is_err());
+    let Setup::Ready(tablet) = dm_client::recover(tablet_api, &me, MemoryStore::default(), &info, Recovery::Passphrase("a long passphrase of mine")).await.unwrap() else { panic!() };
+    assert_eq!(tablet.identity, laptop.identity);
+
+    // Everything lost, backups too: starting over takes the password.
+    let (fresh_api, me, info) = sign_in(&s, "alice").await;
+    assert!(dm_client::start_over(fresh_api.clone(), &me, MemoryStore::default(), &info, "wrong password").await.is_err());
+    let Setup::Ready(fresh) = dm_client::start_over(fresh_api.clone(), &me, MemoryStore::default(), &info, PASSWORD).await.unwrap() else { panic!() };
+    assert_ne!(fresh.identity, laptop.identity);
+    assert!(fresh.backups().await.unwrap().is_empty(), "the old backups went with the old key");
+    // Bob hadn't verified alice: her new key is trusted, and he's told.
+    let after = send(&bob_api, &bob, &dm.id, "new key?").await;
+    assert_eq!(bob.key_changes(std::slice::from_ref(&me)).await, vec![(me.clone(), false)]);
+    fresh.sync(&dm.id).await.unwrap();
+    let next = send(&bob_api, &bob, &dm.id, "welcome back").await;
+    assert_eq!(text(read(&fresh, &next).await), "welcome back");
+    // The old devices were taken out: they can't read what's sent now.
+    assert!(matches!(read(&phone, &next).await, Decrypted::Unreadable(_)));
+    let _ = after;
+}
+
 /// A store that hasn't written anything yet: its writes happen later, in
 /// the background, as Darkmatter's do.
 struct Behind(MemoryStore);

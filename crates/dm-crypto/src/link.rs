@@ -23,7 +23,7 @@ const CONFIG: HpkeConfig = HpkeConfig(HpkeKemType::DhKem25519, HpkeKdfType::Hkdf
 const CODE_LABEL: &[u8] = b"darkmatter link code v1\0";
 const SEAL_INFO: &[u8] = b"darkmatter link v1";
 /// Letters and digits that can't be mistaken for each other (no I, O, 0, 1).
-const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+pub(crate) const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 /// 20 characters of 5 bits.
 const CODE_LEN: usize = 20;
 
@@ -74,6 +74,11 @@ pub fn approve(identity: &UserIdentity, user_id: &str, device_id: &str, signatur
     Ok((cert, Sealed { kem_output: ct.kem_output.as_slice().to_vec(), ciphertext: ct.ciphertext.as_slice().to_vec() }))
 }
 
+/// Characters in dashed groups of four.
+pub(crate) fn groups(chars: &[u8]) -> String {
+    chars.chunks(4).map(|c| std::str::from_utf8(c).expect("ASCII")).collect::<Vec<_>>().join("-")
+}
+
 fn aad(user_id: &str, device_id: &str) -> Vec<u8> {
     let mut out = Vec::new();
     for field in [user_id.as_bytes(), device_id.as_bytes()] {
@@ -99,7 +104,7 @@ pub fn code(user_id: &str, device_id: &str, signature_key: &[u8], link_key: &[u8
     }
     bits >>= 4;
     let chars: Vec<u8> = (0..CODE_LEN).rev().map(|i| ALPHABET[((bits >> (i * 5)) & 31) as usize]).collect();
-    chars.chunks(4).map(|c| std::str::from_utf8(c).expect("ASCII")).collect::<Vec<_>>().join("-")
+    groups(&chars)
 }
 
 /// A typed code, as [`code`] writes it: any case, spaces or dashes.
@@ -108,7 +113,7 @@ pub fn normalize(typed: &str) -> Option<String> {
     if chars.len() != CODE_LEN || !chars.iter().all(|c| ALPHABET.contains(c)) {
         return None;
     }
-    Some(chars.chunks(4).map(|c| std::str::from_utf8(c).expect("ASCII")).collect::<Vec<_>>().join("-"))
+    Some(groups(&chars))
 }
 
 #[cfg(test)]

@@ -38,6 +38,32 @@ pub enum Msg {
     LinkFind,
     LinkFound(Result<Option<E2eeLink>, String>),
     LinkApprove,
+    /// Recovery: which backups there are, making a key (its code, shown
+    /// once), a passphrase twice, and on a device waiting to be linked,
+    /// what was typed to recover or start over.
+    Backups(Result<Vec<String>, String>),
+    MakeKey,
+    KeyMade(Result<String, String>),
+    KeySaved,
+    PassphraseForm,
+    Pass1(String),
+    Pass2(String),
+    SetPassphrase,
+    Recovery(String),
+    RecoverKey,
+    RecoverPassphrase,
+    StartOverPassword(String),
+    StartOver,
+}
+
+/// What a device waiting to be linked can do instead (handled by the chat,
+/// which has the account's database).
+#[derive(Debug, Clone)]
+pub enum Recover {
+    Key(String),
+    Passphrase(String),
+    /// With your password.
+    StartOver(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -72,6 +98,14 @@ pub struct Account {
     link_found: Option<E2eeLink>,
     /// The QR code of this device's own link code, while it waits.
     link_qr: Option<(String, image::Handle)>,
+    backups: Option<Vec<String>>,
+    /// A new recovery key's code, until you say it's saved.
+    new_key: Option<String>,
+    passphrase_form: bool,
+    pass: (String, String),
+    recovery: String,
+    start_over_password: String,
+    confirm_start_over: bool,
 }
 
 fn load(client: Client, axiond: bool) -> Task<Message> {
@@ -143,8 +177,19 @@ pub fn update(state: &mut Option<Account>, client: &Client, axiond: bool, crypto
             link_code: String::new(),
             link_found: None,
             link_qr: None,
+            backups: None,
+            new_key: None,
+            passphrase_form: false,
+            pass: Default::default(),
+            recovery: String::new(),
+            start_over_password: String::new(),
+            confirm_start_over: false,
         });
-        return (load(client.clone(), axiond), false);
+        let backups = match crypto.clone() {
+            Some(c) => Task::perform(async move { c.backups().await }, |r| Message::Account(Msg::Backups(r))),
+            None => Task::none(),
+        };
+        return (Task::batch([load(client.clone(), axiond), backups]), false);
     }
     if let Msg::Close = msg {
         *state = None;
@@ -273,6 +318,81 @@ pub fn update(state: &mut Option<Account>, client: &Client, axiond: bool, crypto
                 Ok("Linked. The new device sets itself up in a moment.".to_string())
             })
         }
+        Msg::Backups(r) => {
+            match r {
+                Ok(b) => a.backups = Some(b),
+                Err(e) => tracing::warn!("couldn't list the backups: {e}"),
+            }
+            Task::none()
+        }
+        Msg::MakeKey => {
+            let Some(c) = a.crypto.clone() else { return (Task::none(), false) };
+            a.busy = true;
+            Task::perform(async move { c.back_up_with_key().await }, |r| Message::Account(Msg::KeyMade(r)))
+        }
+        Msg::KeyMade(r) => {
+            a.busy = false;
+            match r {
+                Ok(code) => {
+                    a.new_key = Some(code);
+                    a.backups.get_or_insert_with(Vec::new).push("key".into());
+                }
+                Err(e) => a.status = Some((true, e)),
+            }
+            Task::none()
+        }
+        Msg::KeySaved => {
+            a.new_key = None;
+            a.status = Some((false, "Recovery key made. Keep it safe: it opens your encrypted messages' keys.".into()));
+            Task::none()
+        }
+        Msg::PassphraseForm => {
+            a.passphrase_form = !a.passphrase_form;
+            a.pass = Default::default();
+            Task::none()
+        }
+        Msg::Pass1(p) => {
+            a.pass.0 = p;
+            Task::none()
+        }
+        Msg::Pass2(p) => {
+            a.pass.1 = p;
+            Task::none()
+        }
+        Msg::SetPassphrase => {
+            let Some(c) = a.crypto.clone() else { return (Task::none(), false) };
+            let p = std::mem::take(&mut a.pass).0;
+            a.passphrase_form = false;
+            a.busy = true;
+            act(&a.client, move |_| async move {
+                c.back_up_with_passphrase(&p).await?;
+                Ok("Backed up under your passphrase.".to_string())
+            })
+        }
+        Msg::Recovery(r) => {
+            a.recovery = r;
+            Task::none()
+        }
+        Msg::RecoverKey | Msg::RecoverPassphrase => {
+            a.busy = true;
+            let typed = std::mem::take(&mut a.recovery);
+            let how = if matches!(msg, Msg::RecoverKey) { Recover::Key(typed) } else { Recover::Passphrase(typed) };
+            Task::done(Message::Recover(how))
+        }
+        Msg::StartOverPassword(p) => {
+            a.start_over_password = p;
+            a.confirm_start_over = false;
+            Task::none()
+        }
+        Msg::StartOver if !a.confirm_start_over => {
+            a.confirm_start_over = true;
+            Task::none()
+        }
+        Msg::StartOver => {
+            a.busy = true;
+            a.confirm_start_over = false;
+            Task::done(Message::Recover(Recover::StartOver(std::mem::take(&mut a.start_over_password))))
+        }
         Msg::Deleted(Err(e)) => {
             a.busy = false;
             a.confirm_delete = false;
@@ -336,6 +456,7 @@ impl Account {
                 column![
                     text("Set up on this device. Your identity key:").size(13),
                     text(fingerprint).size(12).font(iced::Font::MONOSPACE).color(c.fg_bright),
+                    self.recovery_view(c),
                     self.link_view(c),
                 ]
                 .spacing(6)
@@ -354,7 +475,7 @@ impl Account {
                         ..Default::default()
                     }));
                 }
-                Some(col.push(text("This device sets itself up as soon as it's approved. Until then it can't read encrypted conversations.").size(12).color(c.muted)).into())
+                Some(col.push(text("This device sets itself up as soon as it's approved. Until then it can't read encrypted conversations.").size(12).color(c.muted)).push(self.lost_view(c)).into())
             }
             crate::crypto::Status::Failed(why) => Some(text(format!("Couldn't set it up on this device: {why}")).size(13).color(c.red).into()),
         };
@@ -474,7 +595,86 @@ impl Account {
         col.into()
     }
 
-    /// Keeps the QR code of this device's link code ready to show.
+    /// The identity key's backup, on a device that's set up.
+    fn recovery_view<'a>(&'a self, c: Colors) -> Element<'a, Message> {
+        let busy = self.busy;
+        let mut col = column![text("Recovery").size(13).font(bold()).color(c.fg_bright)].spacing(6).padding(iced::Padding { top: 8.0, ..Default::default() });
+        if let Some(code) = &self.new_key {
+            return col
+                .push(text("Your recovery key. Write it down or keep it in a password manager: it isn't shown again, and anyone with it and your password can read your encrypted messages.").size(12))
+                .push(text(code).size(18).font(iced::Font::MONOSPACE).color(c.fg_bright))
+                .push(small(c, "I've saved it", Some(Message::Account(Msg::KeySaved))))
+                .into();
+        }
+        let has = |k: &str| self.backups.as_ref().is_some_and(|b| b.iter().any(|x| x == k));
+        let said = match (has("key"), has("passphrase")) {
+            (true, true) => "Backed up under a recovery key and a passphrase.",
+            (true, false) => "Backed up under a recovery key.",
+            (false, true) => "Backed up under a passphrase.",
+            (false, false) => "Not backed up. If you lose every device, a recovery key (or a passphrase) brings your encryption back without everyone seeing your key change.",
+        };
+        col = col.push(text(said).size(12).color(if has("key") || has("passphrase") { c.fg } else { c.yellow }));
+        col = col.push(
+            row![
+                small(c, if has("key") { "New recovery key" } else { "Make a recovery key" }, (!busy).then_some(Message::Account(Msg::MakeKey))),
+                small(c, if has("passphrase") { "Change passphrase…" } else { "Use a passphrase…" }, (!busy).then_some(Message::Account(Msg::PassphraseForm))),
+            ]
+            .spacing(8),
+        );
+        if self.passphrase_form {
+            let (p1, p2) = &self.pass;
+            let ok = !busy && p1.chars().count() >= 12 && p1 == p2;
+            col = col
+                .push(text("At least 12 characters; a few unusual words are best.").size(12).color(c.muted))
+                .push(text_input("Passphrase", p1).secure(true).on_input(|p| Message::Account(Msg::Pass1(p))).padding(8).size(13).style(c.input()))
+                .push(
+                    row![
+                        text_input("Again", p2).secure(true).on_input(|p| Message::Account(Msg::Pass2(p))).on_submit_maybe(ok.then_some(Message::Account(Msg::SetPassphrase))).padding(8).size(13).style(c.input()),
+                        small(c, "Save", ok.then_some(Message::Account(Msg::SetPassphrase))),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Center),
+                );
+        }
+        col.into()
+    }
+
+    /// On a device waiting to be linked: recovering instead, or starting over.
+    fn lost_view<'a>(&'a self, c: Colors) -> Element<'a, Message> {
+        let busy = self.busy;
+        let typed = !busy && !self.recovery.trim().is_empty();
+        let mut col = column![
+            text("Lost your other devices?").size(13).font(bold()).color(c.fg_bright),
+            text("Type your recovery key, or your backup passphrase.").size(12).color(c.muted),
+            text_input("Recovery key or passphrase", &self.recovery).secure(true).on_input(|r| Message::Account(Msg::Recovery(r))).padding(8).size(13).style(c.input()),
+            row![small(c, "Use recovery key", typed.then_some(Message::Account(Msg::RecoverKey))), small(c, "Use passphrase", typed.then_some(Message::Account(Msg::RecoverPassphrase)))].spacing(8),
+            text("Nothing left to recover from? Start over with a new key: you won't read old encrypted messages, your other devices are signed out of encryption, and everyone you talk with is told your key changed.").size(12).color(c.muted),
+        ]
+        .spacing(6)
+        .padding(iced::Padding { top: 10.0, ..Default::default() });
+        let ready = !busy && !self.start_over_password.is_empty();
+        let label = if self.confirm_start_over { "Really start over?" } else { "Start over" };
+        col = col.push(
+            row![
+                text_input("Your password", &self.start_over_password).secure(true).on_input(|p| Message::Account(Msg::StartOverPassword(p))).padding(8).size(13).style(c.input()),
+                button(text(label).size(12).color(c.red)).padding([4, 10]).on_press_maybe(ready.then_some(Message::Account(Msg::StartOver))).style(c.chip(self.confirm_start_over)),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        );
+        col.into()
+    }
+
+    /// Recovering finished (or failed): back to normal.
+    pub fn recovered(&mut self, error: Option<String>) {
+        self.busy = false;
+        self.status = Some(match error {
+            Some(e) => (true, e),
+            None => (false, "Encryption is set up on this device.".into()),
+        });
+    }
+
+    /// Keeps the QR code of this device's own link code ready to show.
     pub fn prepare(&mut self, status: &crate::crypto::Status) {
         if let crate::crypto::Status::Linking { code } = status
             && self.link_qr.as_ref().is_none_or(|(c, _)| c != code)

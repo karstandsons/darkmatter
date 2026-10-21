@@ -13,7 +13,7 @@ use mm_api::models::{AxiondInfo, ClaimedKeyPackage, E2eeEvent, E2eeIdentity, E2e
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::auth::Me;
+use crate::auth::{self, Me};
 use crate::e2ee::{self, Keys};
 use crate::error::{Error, Result};
 use crate::hub::Event;
@@ -161,6 +161,95 @@ pub async fn revoke_device(State(app): State<App>, me: Me, Path(device_id): Path
         app.hub.end_session(s);
     }
     e2ee::device_gone(&app, &me.user_id, &device_id).await?;
+    super::ok()
+}
+
+#[derive(Deserialize)]
+pub struct NewBackup {
+    kind: String,
+    data: Value,
+}
+
+/// Keeps your identity key's backup (encrypted on your device), replacing
+/// the one of the same kind. Only from a device that's set up.
+pub async fn put_backup(State(app): State<App>, me: Me, Json(body): Json<NewBackup>) -> Result<Json<Value>> {
+    if !matches!(body.kind.as_str(), "key" | "passphrase") {
+        return Err(Error::bad_request("A backup is under a key or a passphrase."));
+    }
+    let set_up: Option<i64> = sqlx::query_scalar("SELECT revoked_at FROM e2ee_devices WHERE user_id = ? AND device_id = ?")
+        .bind(&me.user_id)
+        .bind(&me.device_id)
+        .fetch_optional(&app.db)
+        .await?;
+    if set_up != Some(0) {
+        return Err(Error::bad_request("Only a device with encryption set up can back it up."));
+    }
+    let data = body.data.to_string();
+    if data.len() > 4096 {
+        return Err(Error::bad_request("That backup is too big."));
+    }
+    sqlx::query("INSERT INTO e2ee_backups (user_id, kind, data, update_at) VALUES (?, ?, ?, ?) ON CONFLICT (user_id, kind) DO UPDATE SET data = excluded.data, update_at = excluded.update_at")
+        .bind(&me.user_id)
+        .bind(&body.kind)
+        .bind(&data)
+        .bind(ids::now())
+        .execute(&app.db)
+        .await?;
+    super::ok()
+}
+
+/// Your backups, for a device that lost the others.
+pub async fn backups(State(app): State<App>, me: Me) -> Result<Json<Vec<Value>>> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as("SELECT kind, data, update_at FROM e2ee_backups WHERE user_id = ? ORDER BY kind").bind(&me.user_id).fetch_all(&app.db).await?;
+    Ok(Json(
+        rows.into_iter()
+            .filter_map(|(kind, data, update_at)| Some(json!({ "kind": kind, "data": serde_json::from_str::<Value>(&data).ok()?, "update_at": update_at })))
+            .collect(),
+    ))
+}
+
+pub async fn delete_backup(State(app): State<App>, me: Me, Path(kind): Path<String>) -> Result<Json<Value>> {
+    sqlx::query("DELETE FROM e2ee_backups WHERE user_id = ? AND kind = ?").bind(&me.user_id).bind(&kind).execute(&app.db).await?;
+    super::ok()
+}
+
+#[derive(Deserialize)]
+pub struct Reset {
+    password: String,
+    identity_key: String,
+}
+
+/// Starts over with a new identity key, when every device that had the old
+/// one is gone and there's no backup. Needs your password. Every device of
+/// yours is taken out, the old backups go, and the people you talk with are
+/// told your key changed.
+pub async fn reset_identity(State(app): State<App>, me: Me, Json(body): Json<Reset>) -> Result<Json<Value>> {
+    let (username, hash): (String, String) = sqlx::query_as("SELECT username, password_hash FROM users WHERE id = ?").bind(&me.user_id).fetch_one(&app.db).await?;
+    if let Some(wait) = app.guard.locked(&username) {
+        return Err(Error::too_many(format!("Too many wrong passwords. Try again in {} minutes.", wait.as_secs().div_ceil(60))));
+    }
+    let password = body.password;
+    let ok = tokio::task::spawn_blocking(move || auth::verify_password(Some(&hash), &password)).await.map_err(|_| Error::internal())?;
+    if !ok {
+        app.guard.failed(&username);
+        return Err(Error::bad_request("That isn't your password."));
+    }
+    let key = IdentityKey::from_slice(&decode("identity key", &body.identity_key)?).map_err(refused)?;
+    e2ee::all_devices_gone(&app, &me.user_id).await?;
+    sqlx::query("DELETE FROM e2ee_backups WHERE user_id = ?").bind(&me.user_id).execute(&app.db).await?;
+    sqlx::query("DELETE FROM e2ee_links WHERE user_id = ?").bind(&me.user_id).execute(&app.db).await?;
+    // This session's device starts again too: it signs in as a new one.
+    sqlx::query("DELETE FROM e2ee_devices WHERE user_id = ? AND device_id = ?").bind(&me.user_id).bind(&me.device_id).execute(&app.db).await?;
+    let now = ids::now();
+    sqlx::query("INSERT INTO e2ee_identities (user_id, identity_key, create_at, update_at) VALUES (?, ?, ?, ?) ON CONFLICT (user_id) DO UPDATE SET identity_key = excluded.identity_key, update_at = excluded.update_at")
+        .bind(&me.user_id)
+        .bind(B64.encode(key.0))
+        .bind(now)
+        .bind(now)
+        .execute(&app.db)
+        .await?;
+    crate::audit::record(&app.db, &me.user_id, "e2ee_identity_reset", &me.user_id, "").await?;
+    app.hub.send(&teammates(&app, &me.user_id).await?, &Event::new("identity_changed", json!({ "user_id": me.user_id })));
     super::ok()
 }
 

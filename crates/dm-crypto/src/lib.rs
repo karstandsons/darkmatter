@@ -10,18 +10,22 @@
 //!   and the authenticated data that ties a message to its place;
 //! - [`file`]: encrypting attachments, each under its own key;
 //! - [`link`]: handing the identity key to a new device of the same user;
+//! - [`recovery`]: the identity key backed up under a recovery key or a
+//!   passphrase;
 //! - [`ds`]: the server's side, which checks handshake messages without
 //!   seeing any secrets and may propose removals.
 //!
 //! No primitive here is our own. Anything beyond MLS uses a named, reviewed
 //! construction (Ed25519 for device certificates, HPKE for linking a
-//! device) and says so.
+//! device, HKDF, argon2id and XChaCha20-Poly1305 for the backup) and says
+//! so.
 
 pub mod device;
 pub mod ds;
 pub mod file;
 pub mod identity;
 pub mod link;
+pub mod recovery;
 mod provider;
 pub mod wire;
 

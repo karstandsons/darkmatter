@@ -456,6 +456,25 @@ impl Client {
         }
     }
 
+    /// Keeps the identity key's backup (`kind`: `key` or `passphrase`).
+    pub async fn put_backup(&self, kind: &str, data: &serde_json::Value) -> Result<(), Error> {
+        self.send_unit(Method::PUT, "e2ee/backup", Some(&json!({ "kind": kind, "data": data }))).await
+    }
+
+    pub async fn backups(&self) -> Result<Vec<E2eeBackup>, Error> {
+        self.get("e2ee/backup").await
+    }
+
+    pub async fn delete_backup(&self, kind: &str) -> Result<(), Error> {
+        self.send_unit(Method::DELETE, &format!("e2ee/backup/{kind}"), None::<&()>).await
+    }
+
+    /// Starts over with a new identity key (base64): every device of yours
+    /// is taken out.
+    pub async fn reset_identity(&self, password: &str, identity_key: &str) -> Result<(), Error> {
+        self.send_unit(Method::POST, "e2ee/identity/reset", Some(&json!({ "password": password, "identity_key": identity_key }))).await
+    }
+
     /// Takes out another of your devices.
     pub async fn revoke_device(&self, device_id: &str) -> Result<(), Error> {
         self.send_unit(Method::DELETE, &format!("e2ee/devices/{device_id}"), None::<&()>).await

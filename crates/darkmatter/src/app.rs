@@ -245,6 +245,9 @@ pub enum Message {
     /// Load the open channels' history again (now that it can be decrypted).
     ReloadOpen,
     Verify(crate::verify::Msg),
+    /// A device waiting to be linked recovers instead, or starts over.
+    Recover(crate::account::Recover),
+    Recovered(Result<std::sync::Arc<crate::crypto::Crypto>, String>),
     /// Where you stand with people in encrypted conversations.
     Standing(Vec<dm_client::Standing>),
     PickFiles,
@@ -895,6 +898,12 @@ impl App {
         let open = self.account.is_some();
         let msg = match message {
             Message::Account(m) => m,
+            Message::Recovered(r) => {
+                if let Some(a) = &mut self.account {
+                    a.recovered(r.as_ref().err().cloned());
+                }
+                return ControlFlow::Continue(Message::Recovered(r));
+            }
             Message::Escape if open => account::Msg::Close,
             // Swallow keys so the chat doesn't react (typing goes to its text boxes).
             Message::Key(_) if open => return ControlFlow::Break(Task::none()),

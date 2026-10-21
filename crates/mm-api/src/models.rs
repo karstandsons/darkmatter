@@ -471,6 +471,16 @@ pub struct E2eeLink {
     pub create_at: i64,
 }
 
+/// The identity key's backup as the server keeps it (encrypted on a device).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct E2eeBackup {
+    /// `key` or `passphrase`.
+    pub kind: String,
+    pub data: serde_json::Value,
+    pub update_at: i64,
+}
+
 /// What a new device finds once another of its user's devices approved it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]

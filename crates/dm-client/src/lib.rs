@@ -174,6 +174,13 @@ fn not_found(e: &mm_api::Error) -> bool {
 
 /// Sets this device up for encryption, or picks up where it was.
 pub async fn setup<S: LocalStore>(api: Client, user_id: &str, store: S, info: &AxiondInfo) -> Result<Setup<S>, String> {
+    let held = store.get(IDENTITY).await.and_then(|s| <[u8; 32]>::try_from(s.as_slice()).ok()).map(|s| UserIdentity::from_secret(&s));
+    setup_with(api, user_id, store, info, held).await
+}
+
+/// [`setup`], with the identity key this device holds (from its store, a
+/// backup, or a fresh start).
+async fn setup_with<S: LocalStore>(api: Client, user_id: &str, store: S, info: &AxiondInfo, held: Option<UserIdentity>) -> Result<Setup<S>, String> {
     let server = ServerKey { signature_key: B64.decode(&info.external_sender).map_err(|_| "the server's key isn't valid")? };
     let device_id = api.my_device().await.map_err(s)?;
     let on_server = api.identity(user_id).await.map_err(s)?;
@@ -182,8 +189,8 @@ pub async fn setup<S: LocalStore>(api: Client, user_id: &str, store: S, info: &A
     // The identity key: ours from before, or a new one on the account's
     // first device. If the account has one we don't hold, this device must
     // be linked from one that does.
-    let identity = match store.get(IDENTITY).await.and_then(|s| <[u8; 32]>::try_from(s.as_slice()).ok()) {
-        Some(secret) => UserIdentity::from_secret(&secret),
+    let identity = match held {
+        Some(id) => id,
         None if server_identity.is_some() => return Ok(Setup::NeedsLink),
         None => {
             let id = UserIdentity::generate();
@@ -211,25 +218,25 @@ pub async fn setup<S: LocalStore>(api: Client, user_id: &str, store: S, info: &A
         *storage.values.write().unwrap() = saved.clone();
         let device = Device::open(user_id, &device_id, &key, storage).map_err(s)?;
         tracing::info!("encryption ready on this device ({device_id})");
-        E2ee::new(api, user_id, device, public, server, store, saved)
+        E2ee::new(api, user_id, device, identity, server, store, saved)
     } else {
         // A new device (a new sign-in): the old one's state went with its
         // session, on the server and here.
         store.clear_device().await;
         let device = Device::create(user_id, &device_id, MemoryStorage::default()).map_err(s)?;
         let cert = identity.certify(user_id, &device_id, device.signature_key(), now());
-        new_device(api, user_id, device, &cert, public, server, store).await?
+        new_device(api, user_id, device, &cert, identity, server, store).await?
     };
     ready(e2ee).await
 }
 
 /// A device's first start, with its certificate.
-async fn new_device<S: LocalStore>(api: Client, user_id: &str, device: Device<MemoryStorage>, cert: &DeviceCertificate, public: IdentityKey, server: ServerKey, store: S) -> Result<E2ee<S>, String> {
+async fn new_device<S: LocalStore>(api: Client, user_id: &str, device: Device<MemoryStorage>, cert: &DeviceCertificate, identity: UserIdentity, server: ServerKey, store: S) -> Result<E2ee<S>, String> {
     api.publish_device(&serde_json::to_value(cert).map_err(s)?).await.map_err(s)?;
     let device_id = cert.device_id.clone();
     store.set(DEVICE_ID, device_id.as_bytes().to_vec());
     store.set(DEVICE_KEY, device.signature_key().to_vec());
-    let e2ee = E2ee::new(api, user_id, device, public, server, store, HashMap::new());
+    let e2ee = E2ee::new(api, user_id, device, identity, server, store, HashMap::new());
     e2ee.upload_key_packages(KEY_PACKAGES, true).await?;
     e2ee.persist();
     tracing::info!("encryption set up for this device ({device_id})");
@@ -245,6 +252,56 @@ async fn ready<S: LocalStore>(e2ee: E2ee<S>) -> Result<Setup<S>, String> {
     e2ee.store.set("last_seen", now().to_string().into_bytes());
     e2ee.top_up().await?;
     Ok(Setup::Ready(Box::new(e2ee)))
+}
+
+/// How a device that lost the others gets the identity key back.
+pub enum Recovery<'a> {
+    Key(&'a str),
+    Passphrase(&'a str),
+}
+
+/// Sets this device up from the identity key's backup (E2EE.md §12).
+pub async fn recover<S: LocalStore>(api: Client, user_id: &str, store: S, info: &AxiondInfo, with: Recovery<'_>) -> Result<Setup<S>, String> {
+    use dm_crypto::recovery::{self, Backup, Kind};
+    let want = match with {
+        Recovery::Key(_) => Kind::Key,
+        Recovery::Passphrase(_) => Kind::Passphrase,
+    };
+    let backup: Backup = api
+        .backups()
+        .await
+        .map_err(s)?
+        .into_iter()
+        .filter_map(|b| serde_json::from_value::<Backup>(b.data).ok())
+        .find(|b| b.kind == want)
+        .ok_or(match want {
+            Kind::Key => "there's no backup under a recovery key",
+            Kind::Passphrase => "there's no backup under a passphrase",
+        })?;
+    let identity = match with {
+        Recovery::Key(code) => recovery::restore_with_key(&backup, user_id, &recovery::RecoveryKey::from_code(code).map_err(s)?).map_err(s)?,
+        Recovery::Passphrase(p) => {
+            let (p, user) = (p.to_string(), user_id.to_string());
+            tokio::task::spawn_blocking(move || recovery::restore_with_passphrase(&backup, &user, &p)).await.map_err(s)?.map_err(s)?
+        }
+    };
+    let on_server = api.identity(user_id).await.map_err(s)?;
+    if on_server.identity_key != B64.encode(identity.public().0) {
+        return Err("that backup is of an older key: your account's key changed since".into());
+    }
+    store.set(IDENTITY, identity.secret().to_vec());
+    setup_with(api, user_id, store, info, Some(identity)).await
+}
+
+/// Starts over with a new identity key, when nothing can bring the old one
+/// back: every other device of yours is taken out, and the people you talk
+/// with are told your key changed. Needs your password.
+pub async fn start_over<S: LocalStore>(api: Client, user_id: &str, store: S, info: &AxiondInfo, password: &str) -> Result<Setup<S>, String> {
+    let identity = UserIdentity::generate();
+    api.reset_identity(password, &B64.encode(identity.public().0)).await.map_err(s)?;
+    store.clear_device().await;
+    store.set(IDENTITY, identity.secret().to_vec());
+    setup_with(api, user_id, store, info, Some(identity)).await
 }
 
 /// A device waiting to be linked to its account's others (E2EE.md §12):
@@ -305,7 +362,7 @@ impl Linking {
         store.clear_device().await;
         store.set(IDENTITY, identity.secret().to_vec());
         store.remember_identity(&l.user_id, &B64.encode(public.0));
-        let e2ee = new_device(l.api.clone(), &l.user_id, device, &cert, public, l.server.clone(), store).await?;
+        let e2ee = new_device(l.api.clone(), &l.user_id, device, &cert, identity, l.server.clone(), store).await?;
         ready(e2ee).await.map(Some)
     }
 }
@@ -321,6 +378,9 @@ pub struct E2ee<S> {
     pub device: Device<MemoryStorage>,
     /// This user's identity key.
     pub identity: IdentityKey,
+    /// Its private half: it signs this user's new devices and goes into
+    /// their backup.
+    own: UserIdentity,
     server: ServerKey,
     store: S,
     /// openmls's state as last given to the store.
@@ -384,8 +444,8 @@ impl<S: LocalStore> E2ee<S> {
         &self.store
     }
 
-    fn new(api: Client, user_id: &str, device: Device<MemoryStorage>, identity: IdentityKey, server: ServerKey, store: S, saved: HashMap<Vec<u8>, Vec<u8>>) -> Self {
-        E2ee { api, user_id: user_id.into(), device, identity, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false, file_keys: Default::default(), caught_up: Default::default(), recent: Default::default(), known: Default::default(), changes: Default::default() }
+    fn new(api: Client, user_id: &str, device: Device<MemoryStorage>, own: UserIdentity, server: ServerKey, store: S, saved: HashMap<Vec<u8>, Vec<u8>>) -> Self {
+        E2ee { api, user_id: user_id.into(), device, identity: own.public(), own, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false, file_keys: Default::default(), caught_up: Default::default(), recent: Default::default(), known: Default::default(), changes: Default::default() }
     }
 
     /// Gives the store whatever openmls changed since the last time.
@@ -411,6 +471,33 @@ impl<S: LocalStore> E2ee<S> {
         Ok(stored)
     }
 
+    /// Backs the identity key up under a new recovery key, replacing any
+    /// before it. The key's code is shown once: it isn't kept anywhere.
+    pub async fn back_up_with_key(&self) -> Result<String, String> {
+        let identity = self.identity_secret().await?;
+        let key = dm_crypto::recovery::RecoveryKey::generate();
+        let backup = dm_crypto::recovery::backup_with_key(&identity, &self.user_id, &key).map_err(s)?;
+        self.api.put_backup("key", &serde_json::to_value(&backup).map_err(s)?).await.map_err(s)?;
+        Ok(key.to_code())
+    }
+
+    /// Backs it up under a passphrase instead (or as well).
+    pub async fn back_up_with_passphrase(&self, passphrase: &str) -> Result<(), String> {
+        let identity = self.identity_secret().await?;
+        let (p, user) = (passphrase.to_string(), self.user_id.clone());
+        let backup = tokio::task::spawn_blocking(move || dm_crypto::recovery::backup_with_passphrase(&identity, &user, &p)).await.map_err(s)?.map_err(s)?;
+        self.api.put_backup("passphrase", &serde_json::to_value(&backup).map_err(s)?).await.map_err(s)
+    }
+
+    /// Which backups there are: `key`, `passphrase`.
+    pub async fn backups(&self) -> Result<Vec<String>, String> {
+        Ok(self.api.backups().await.map_err(s)?.into_iter().map(|b| b.kind).collect())
+    }
+
+    async fn identity_secret(&self) -> Result<UserIdentity, String> {
+        Ok(UserIdentity::from_secret(&self.own.secret()))
+    }
+
     /// The new device of yours whose link code this is, if it's waiting.
     pub async fn find_link(&self, typed: &str) -> Result<Option<mm_api::models::E2eeLink>, String> {
         let Some(code) = dm_crypto::link::normalize(typed) else { return Err("a link code is 20 letters and digits".into()) };
@@ -425,8 +512,7 @@ impl<S: LocalStore> E2ee<S> {
 
     /// Links it: certifies it and gives it the identity key, sealed to it.
     pub async fn approve_link(&self, link: &mm_api::models::E2eeLink) -> Result<(), String> {
-        let secret = self.store.get(IDENTITY).await.and_then(|s| <[u8; 32]>::try_from(s.as_slice()).ok()).ok_or("this device doesn't hold your identity key")?;
-        let identity = UserIdentity::from_secret(&secret);
+        let identity = self.identity_secret().await?;
         let (sig, key) = (B64.decode(&link.signature_key).map_err(s)?, B64.decode(&link.link_key).map_err(s)?);
         let (cert, sealed) = dm_crypto::link::approve(&identity, &self.user_id, &link.device_id, &sig, &key, now()).map_err(s)?;
         self.api.approve_link(&link.device_id, &serde_json::to_value(&cert).map_err(s)?, &serde_json::to_value(&sealed).map_err(s)?).await.map_err(s)
@@ -495,6 +581,12 @@ impl<S: LocalStore> E2ee<S> {
         self.trust(user_id, key, verified);
         self.note_change(user_id, "");
         Ok(())
+    }
+
+    /// Looks at these people's keys now (after the server said one
+    /// changed), so a change is noted before anything is sent.
+    pub async fn check_keys(&self, users: &[String]) -> Result<(), String> {
+        self.keys(users).await.map(|_| ())
     }
 
     /// Where you stand with each of these people, from what this device

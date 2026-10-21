@@ -110,6 +110,22 @@ pub async fn setup(client: &Client, user_id: &str, vault: &Arc<Vault>, info: Opt
     }
 }
 
+/// Encryption on this device from the identity key's backup, or from a new
+/// key (starting over).
+pub async fn recover(client: Client, user_id: String, vault: Arc<Vault>, info: AxiondInfo, how: crate::account::Recover) -> Result<Arc<Crypto>, String> {
+    use crate::account::Recover;
+    let store = VaultStore(vault);
+    let setup = match how {
+        Recover::Key(code) => dm_client::recover(client, &user_id, store, &info, dm_client::Recovery::Key(&code)).await?,
+        Recover::Passphrase(p) => dm_client::recover(client, &user_id, store, &info, dm_client::Recovery::Passphrase(&p)).await?,
+        Recover::StartOver(password) => dm_client::start_over(client, &user_id, store, &info, &password).await?,
+    };
+    match setup {
+        Setup::Ready(e2ee) => Ok(Arc::new(*e2ee)),
+        Setup::NeedsLink => Err("this device still needs linking".into()),
+    }
+}
+
 /// Encryption on this device, once another of yours approved it.
 pub async fn finish_link(linking: dm_client::Linking, vault: Arc<Vault>) -> Result<Option<Arc<Crypto>>, String> {
     match linking.finish(VaultStore(vault)).await? {

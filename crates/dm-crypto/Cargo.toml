@@ -21,6 +21,10 @@ getrandom = "0.3"
 # SHA-256 of the ciphertext.
 chacha20poly1305 = { version = "0.10", features = ["stream"] }
 sha2 = "0.10"
+# The identity key's backup (E2EE.md §12): HKDF from a recovery key, or
+# argon2id from a passphrase.
+hkdf = "0.12"
+argon2 = "0.5"
 zeroize = "1"
 base64 = "0.22"
 serde.workspace = true

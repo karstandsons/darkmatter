@@ -1819,10 +1819,12 @@ dependencies = [
 name = "dm-crypto"
 version = "0.5.0"
 dependencies = [
+ "argon2",
  "base64 0.22.1",
  "chacha20poly1305",
  "ed25519-dalek",
  "getrandom 0.3.4",
+ "hkdf 0.12.4",
  "openmls",
  "openmls_basic_credential",
  "openmls_libcrux_crypto",
