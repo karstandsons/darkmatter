@@ -2245,7 +2245,8 @@ impl Chat {
                 if channel.is_empty() {
                     return Task::none();
                 }
-                self.attach_to(&key, &channel, paths)
+                // Back to typing: the file dialog took the focus away.
+                Task::batch([self.attach_to(&key, &channel, paths), self.focus_composer(thread)])
             }
             Message::Uploaded(local_id, result) => {
                 if let Some(a) = self.attachments.iter_mut().find(|a| a.local_id == local_id) {

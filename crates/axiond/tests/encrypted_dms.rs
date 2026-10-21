@@ -158,6 +158,62 @@ async fn nobody_is_sent_a_message_they_cant_read() {
     assert!(matches!(read(&carol_laptop, &sent).await, Decrypted::Unreadable(why) if why.contains("before this device joined")));
 }
 
+/// A store that hasn't written anything yet: its writes happen later, in
+/// the background, as Darkmatter's do.
+struct Behind(MemoryStore);
+
+impl LocalStore for Behind {
+    async fn get(&self, key: &str) -> Option<Vec<u8>> {
+        self.0.get(key).await
+    }
+    fn set(&self, key: &str, value: Vec<u8>) {
+        self.0.set(key, value)
+    }
+    async fn mls(&self) -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
+        self.0.mls().await
+    }
+    fn save_mls(&self, put: Vec<(Vec<u8>, Vec<u8>)>, delete: Vec<Vec<u8>>) {
+        self.0.save_mls(put, delete)
+    }
+    async fn clear_device(&self) {
+        self.0.clear_device().await
+    }
+    async fn identity(&self, user_id: &str) -> Option<String> {
+        self.0.identity(user_id).await
+    }
+    fn remember_identity(&self, user_id: &str, key: &str) {
+        self.0.remember_identity(user_id, key)
+    }
+    async fn text(&self, _key: &str) -> Option<String> {
+        None
+    }
+    fn save_text(&self, _key: &str, _channel_id: &str, _json: &str) {}
+    fn forget_texts(&self, _post_id: &str, _pending_post_id: &str) {}
+}
+
+#[tokio::test]
+async fn a_message_read_twice_before_its_text_is_written() {
+    let s = server().await;
+    let (alice_api, alice) = device(&s, "alice", MemoryStore::default()).await;
+    let mut bob_api = Client::new(&s.url).unwrap();
+    let me = bob_api.login("bob", PASSWORD, None).await.unwrap();
+    let info = bob_api.axiond().await.unwrap().unwrap();
+    let Setup::Ready(bob) = dm_client::setup(bob_api.clone(), &me.id, Behind(MemoryStore::default()), &info).await.unwrap() else { panic!() };
+    let dm = alice_api.create_direct(&alice.user_id, &bob.user_id).await.unwrap();
+
+    // Shown twice at once (say, arriving while the channel loads): each
+    // message key opens one message once, so the second read uses the text.
+    let first = send(&alice_api, &alice, &dm.id, "with a map").await;
+    let (a, b) = tokio::join!(bob.decrypt_post(&first), bob.decrypt_post(&first));
+    assert_eq!((text(a), text(b)), ("with a map".to_string(), "with a map".to_string()));
+    assert_eq!(text(bob.decrypt_post(&first).await), "with a map");
+
+    // Bob's own message, read back as soon as the server has it.
+    let post = NewPost { channel_id: dm.id.clone(), message: "got it".into(), pending_post_id: "bob:got".into(), ..Default::default() };
+    let sent = bob_api.create_post(&bob.encrypt_post(&post).await.unwrap()).await.unwrap();
+    assert_eq!(text(bob.decrypt_post(&sent).await), "got it");
+}
+
 /// Runs a slash command in a channel.
 async fn run(api: &Client, channel: &str, command: &str) {
     let team = api.my_teams().await.unwrap()[0].id.clone();

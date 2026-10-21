@@ -32,6 +32,8 @@ The release workflow uses each version's section here as its release notes.
   it has decrypted, inside its encrypted database, and shows its finds
   beside the server's.
 - **Fixed:** clicking a link in a message did nothing.
+- **Fixed:** after attaching files with Ctrl+U, what you typed next went
+  nowhere until you clicked the message box.
 
 ## [0.4.3] - 2026-10-20
 

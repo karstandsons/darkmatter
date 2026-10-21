@@ -17,7 +17,7 @@
 pub mod files;
 mod store;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use base64::Engine;
@@ -255,7 +255,21 @@ pub struct E2ee<S> {
     /// Channels whose backlog has been read since connecting; held while
     /// one is read, so nothing newer is decrypted before it.
     caught_up: tokio::sync::Mutex<HashSet<String>>,
+    /// Texts given to the store lately. A store may write them in the
+    /// background, and a message read twice before then would fail the
+    /// second time: each message key is used once.
+    recent: Mutex<Recent>,
 }
+
+/// The last [`RECENT`] texts kept, newest last.
+#[derive(Default)]
+struct Recent {
+    texts: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+/// Far more than a store has waiting at once.
+const RECENT: usize = 2048;
 
 impl<S: LocalStore> E2ee<S> {
     /// Where this device keeps its state (the app's own store).
@@ -264,7 +278,7 @@ impl<S: LocalStore> E2ee<S> {
     }
 
     fn new(api: Client, user_id: &str, device: Device<MemoryStorage>, identity: IdentityKey, server: ServerKey, store: S, saved: HashMap<Vec<u8>, Vec<u8>>) -> Self {
-        E2ee { api, user_id: user_id.into(), device, identity, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false, file_keys: Default::default(), caught_up: Default::default() }
+        E2ee { api, user_id: user_id.into(), device, identity, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false, file_keys: Default::default(), caught_up: Default::default(), recent: Default::default() }
     }
 
     /// Gives the store whatever openmls changed since the last time.
@@ -622,7 +636,7 @@ impl<S: LocalStore> E2ee<S> {
         let aad = Aad::post(&post.channel_id, &post.root_id, &post.pending_post_id);
         let e2ee = self.device.encrypt(&post.channel_id, &content, &aad).map_err(s)?;
         self.persist();
-        self.store.save_text(&format!("pending:{}", post.pending_post_id), &post.channel_id, &serde_json::to_string(&content).map_err(s)?);
+        self.keep(&format!("pending:{}", post.pending_post_id), &post.channel_id, &content);
         let mut out = post.clone();
         out.message = String::new();
         out.props = serde_json::json!({ "dm_e2ee": e2ee });
@@ -642,7 +656,7 @@ impl<S: LocalStore> E2ee<S> {
         let e2ee = self.device.encrypt(channel_id, &content, &Aad::edit(channel_id, post_id)).map_err(s)?;
         self.persist();
         let key = edit_key(post_id, &e2ee.ciphertext().map_err(s)?);
-        self.store.save_text(&key, channel_id, &serde_json::to_string(&content).map_err(s)?);
+        self.keep(&key, channel_id, &content);
         serde_json::to_value(&e2ee).map_err(s)
     }
 
@@ -656,7 +670,7 @@ impl<S: LocalStore> E2ee<S> {
         let content = Content::Reaction { post_id: post_id.into(), emoji: emoji.into(), on };
         let e2ee = self.device.encrypt(channel_id, &content, &Aad::event(channel_id, post_id, &client_id)).map_err(s)?;
         self.persist();
-        self.store.save_text(&event_key(post_id, &self.user_id, &client_id), channel_id, &serde_json::to_string(&content).map_err(s)?);
+        self.keep(&event_key(post_id, &self.user_id, &client_id), channel_id, &content);
         Ok(NewE2eeEvent { post_id: post_id.into(), client_id, dm_e2ee: serde_json::to_value(&e2ee).map_err(s)? })
     }
 
@@ -897,6 +911,11 @@ impl<S: LocalStore> E2ee<S> {
     /// Forgets what this device kept of a deleted post: its text, edits and
     /// reactions.
     pub fn forget_post(&self, post: &Post) {
+        let (edits, events, pending) = (format!("edit:{}:", post.id), format!("event:{}:", post.id), format!("pending:{}", post.pending_post_id));
+        let gone = |k: &str| k == post.id || k.starts_with(&edits) || k.starts_with(&events) || (!post.pending_post_id.is_empty() && k == pending);
+        let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        recent.texts.retain(|k, _| !gone(k));
+        recent.order.retain(|k| !gone(k));
         self.store.forget_texts(&post.id, &post.pending_post_id);
     }
 
@@ -950,13 +969,27 @@ impl<S: LocalStore> E2ee<S> {
     }
 
     async fn text(&self, key: &str) -> Option<Content> {
-        self.store.text(key).await.and_then(|t| serde_json::from_str(&t).ok())
+        let recent = self.recent.lock().unwrap_or_else(|e| e.into_inner()).texts.get(key).cloned();
+        let json = match recent {
+            Some(json) => json,
+            None => self.store.text(key).await?,
+        };
+        serde_json::from_str(&json).ok()
     }
 
     fn keep(&self, key: &str, channel_id: &str, content: &Content) {
-        if let Ok(json) = serde_json::to_string(content) {
-            self.store.save_text(key, channel_id, &json);
+        let Ok(json) = serde_json::to_string(content) else { return };
+        let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        if recent.texts.insert(key.into(), json.clone()).is_none() {
+            recent.order.push_back(key.into());
         }
+        while recent.order.len() > RECENT {
+            if let Some(old) = recent.order.pop_front() {
+                recent.texts.remove(&old);
+            }
+        }
+        drop(recent);
+        self.store.save_text(key, channel_id, &json);
     }
 
     /// Gets this device into an encrypted channel's group if it has one and
