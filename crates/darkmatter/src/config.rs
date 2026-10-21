@@ -33,6 +33,11 @@ pub struct NotificationsConfig {
 pub struct PluginsConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub off: Vec<String>,
+    /// Plugins that may read encrypted conversations: the message they act
+    /// on and your draft. None may unless listed, since a plugin can send
+    /// what it gets anywhere.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub encrypted: Vec<String>,
     #[serde(flatten)]
     pub settings: std::collections::BTreeMap<String, toml::Table>,
 }

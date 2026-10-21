@@ -130,6 +130,8 @@ pub struct Plugin {
     pub built_in: bool,
     /// Its `[plugins.<name>]` settings from config.toml, sent with each request.
     pub config: serde_json::Value,
+    /// You let it read encrypted conversations (`[plugins] encrypted`).
+    pub reads_encrypted: bool,
 }
 
 /// A plugin that loaded but is off.
@@ -246,7 +248,7 @@ fn add_from(plugins: &mut Plugins, root: &Path, built_in: bool) {
         }
         match read_manifest(&dir) {
             Ok(manifest) => {
-                let plugin = Plugin { manifest, dir, built_in, config: serde_json::Value::Object(Default::default()) };
+                let plugin = Plugin { manifest, dir, built_in, config: serde_json::Value::Object(Default::default()), reads_encrypted: false };
                 match plugins.list.iter().position(|p| p.manifest.name == plugin.manifest.name) {
                     Some(i) if plugins.list[i].built_in && !built_in => plugins.list[i] = plugin,
                     Some(_) => plugins.errors.push((plugin.dir, format!("another plugin is already called {}", plugin.manifest.name))),
@@ -271,6 +273,7 @@ fn settle(mut plugins: Plugins, config: &crate::config::PluginsConfig, found: &d
         if let Some(settings) = config.settings.get(&name) {
             p.config = serde_json::to_value(settings).unwrap_or_default();
         }
+        p.reads_encrypted = config.encrypted.contains(&name);
         if config.off.contains(&name) {
             off_commands(&mut plugins);
             plugins.off.push(Off { plugin: p, why: "switched off".into(), by_you: true });
@@ -378,6 +381,11 @@ pub enum Request {
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
 pub struct Context {
+    /// Which of your servers this is for.
+    pub server: Server,
+    /// The conversation is end-to-end encrypted. Unless you let the plugin
+    /// read those, `draft` (and an action's `post.message`) are left empty.
+    pub encrypted: bool,
     pub team: Named,
     pub channel: Named,
     /// The thread being replied to, if it's the reply box.
@@ -386,6 +394,16 @@ pub struct Context {
     pub me: String,
     /// What's in the message box now.
     pub draft: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct Server {
+    /// The account's id in Darkmatter: steady, unlike the URL.
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    /// "mattermost" or "axiond".
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]

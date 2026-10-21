@@ -159,6 +159,8 @@ Each request is one JSON object with a `type`:
 
 ```json
 {
+  "server":  {"id": "…", "name": "Work", "url": "https://chat.example.com", "kind": "mattermost"},
+  "encrypted": false,
   "team":    {"id": "…", "name": "dev", "display_name": "Dev Team"},
   "channel": {"id": "…", "name": "town-square", "display_name": "Town Square"},
   "thread":  null,
@@ -168,6 +170,16 @@ Each request is one JSON object with a `type`:
 ```
 
 `thread` is the root post's id when the answer is for a thread's reply box.
+
+`server` is the server this is for, since Darkmatter can be signed into
+several: `id` is steady (the URL can change), `name` is what the rail calls
+it, and `kind` is `mattermost` or `axiond`.
+
+`encrypted` is true in an end-to-end encrypted conversation (axiond). There
+`draft`, and an action's `post.message`, are empty unless you let the plugin
+read encrypted conversations (its checkbox in the Plugins window, or
+`[plugins] encrypted = ["<name>"]` in config.toml): whatever a plugin gets,
+it could send anywhere.
 
 Every request also has `config`: the plugin's `[plugins.<name>]` settings
 from config.toml plus its secret settings, and for settings you haven't set,

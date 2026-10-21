@@ -165,6 +165,8 @@ pub struct Chat {
     pub shown: bool,
     /// Its name in notifications, once there's more than one server.
     pub server_name: Option<String>,
+    /// Its name, always (plugins are told it).
+    pub server_label: String,
     /// Its notifications are muted.
     pub muted: bool,
     /// Notifications show the text of encrypted messages (`[notifications]`).
@@ -262,7 +264,18 @@ pub struct Chat {
     pub no_editor: text_editor::Content,
     /// A channel to open once the channel list is refreshed (after /join).
     pending_goto: Option<String>,
+    /// The draft that was held back for having encrypted text in it: sent
+    /// if Enter is pressed again with it unchanged.
+    confirm_leak: Option<String>,
 }
+
+/// Text last copied from an encrypted conversation's message box, and where
+/// from (the clipboard itself is never read). Shared by every account, as
+/// the clipboard is.
+static ENCRYPTED_COPY: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// Shorter copies ("ok", "lol") aren't worth asking about.
+const MIN_GUARDED: usize = 8;
 
 pub struct Editing {
     pub post_id: String,
@@ -604,6 +617,7 @@ impl Chat {
             account: b.account,
             shown: true,
             server_name: None,
+            server_label: String::new(),
             muted: false,
             encrypted_previews: false,
             client,
@@ -659,6 +673,7 @@ impl Chat {
             editors: HashMap::new(),
             no_editor: text_editor::Content::new(),
             pending_goto: None,
+            confirm_leak: None,
         };
         let mut chat = chat;
         let statuses = chat.load_statuses();
@@ -1163,7 +1178,15 @@ impl Chat {
     fn plugin_context(&self, target: &PluginTarget) -> plugins::Context {
         let team = self.store.teams.iter().find(|t| t.id == self.team);
         let channel = self.store.channels.get(&target.channel);
+        let encrypted = channel.is_some_and(|c| c.encrypted);
         plugins::Context {
+            server: plugins::Server {
+                id: self.account.clone(),
+                name: self.server_label.clone(),
+                url: self.session.server.clone(),
+                kind: if self.axiond.is_some() { "axiond" } else { "mattermost" }.into(),
+            },
+            encrypted,
             team: team
                 .map(|t| plugins::Named { id: t.id.clone(), name: t.name.clone(), display_name: t.display_name.clone() })
                 .unwrap_or_default(),
@@ -1172,8 +1195,45 @@ impl Chat {
                 .unwrap_or_default(),
             thread: target.key.strip_prefix("thread:").map(str::to_string),
             me: self.store.me.username.clone(),
-            draft: self.drafts.get(&target.key).cloned().unwrap_or_default(),
+            draft: if self.reads(target) { self.drafts.get(&target.key).cloned().unwrap_or_default() } else { String::new() },
         }
+    }
+
+    /// The channel a composer posts to.
+    fn composer_channel(&self, thread: bool) -> Option<String> {
+        if thread {
+            self.pv().thread.as_ref().and_then(|r| self.store.post(r)).map(|p| p.channel_id.clone())
+        } else {
+            Some(self.pv().channel.clone()).filter(|c| !c.is_empty())
+        }
+    }
+
+    /// Text copied from an encrypted conversation, about to go to one that
+    /// isn't: the first Enter stops to say so, the second sends.
+    fn holds_back(&mut self, thread: bool) -> bool {
+        let (Some(key), Some(channel)) = (self.composer_key(thread), self.composer_channel(thread)) else { return false };
+        if self.store.channels.get(&channel).is_none_or(|c| c.encrypted) {
+            return false;
+        }
+        let draft = self.drafts.get(&key).cloned().unwrap_or_default();
+        let from = match &*ENCRYPTED_COPY.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((from, text)) if draft.contains(text.trim()) => from.clone(),
+            _ => return false,
+        };
+        if self.confirm_leak.as_deref() == Some(draft.as_str()) {
+            self.confirm_leak = None;
+            return false;
+        }
+        self.confirm_leak = Some(draft);
+        self.notice = Some(format!("This has text copied from an encrypted conversation ({from}), and this one isn't encrypted. Press Enter again to send it anyway."));
+        true
+    }
+
+    /// Whether the plugin may read what's at `target`: anything, unless it's
+    /// an encrypted conversation you haven't let it read.
+    fn reads(&self, target: &PluginTarget) -> bool {
+        let encrypted = self.store.channels.get(&target.channel).is_some_and(|c| c.encrypted);
+        !encrypted || self.plugins.list.get(target.plugin).is_some_and(|p| p.reads_encrypted)
     }
 
     fn call_plugin(&self, target: PluginTarget, request: plugins::Request) -> Task<Message> {
@@ -1715,6 +1775,20 @@ impl Chat {
             Message::SendReply if let Some(task) = self.complete_on_enter(true) => task,
             Message::Send if let Some(task) = self.slash_send(false) => task,
             Message::SendReply if let Some(task) = self.slash_send(true) => task,
+            Message::Send if self.holds_back(false) => Task::none(),
+            Message::SendReply if self.holds_back(true) => Task::none(),
+            Message::Copied(thread) => {
+                let (key, channel) = (self.composer_key(thread), self.composer_channel(thread));
+                let text = key.and_then(|k| self.editors.get(&k)).and_then(|c| c.selection());
+                let from = channel.as_ref().and_then(|ch| self.store.channels.get(ch)).filter(|c| c.encrypted);
+                let copy = match (from, text) {
+                    (Some(c), Some(text)) if text.trim().chars().count() >= MIN_GUARDED => Some((format!("{} · {}", self.server_label, self.store.channel_label(c)), text)),
+                    // Anything else copied replaces it on the clipboard.
+                    _ => None,
+                };
+                *ENCRYPTED_COPY.lock().unwrap_or_else(|e| e.into_inner()) = copy;
+                Task::none()
+            }
             Message::Send => {
                 self.notice = None;
                 self.last_in_thread = false;
@@ -2241,7 +2315,8 @@ impl Chat {
                 // The answer goes in the message box of the message's channel.
                 let target = PluginTarget { plugin, key: post.channel_id.clone(), channel: post.channel_id.clone(), thread: false, restore: None };
                 let user = self.store.users.get(&post.user_id).map_or(String::new(), |u| u.username.clone());
-                let info = plugins::PostInfo { id: post.id.clone(), message: post.message.clone(), user, create_at: post.create_at };
+                let message = if self.reads(&target) { post.message.clone() } else { String::new() };
+                let info = plugins::PostInfo { id: post.id.clone(), message, user, create_at: post.create_at };
                 let context = self.plugin_context(&target);
                 self.call_plugin(target, plugins::Request::Action { name, post: info, context })
             }
@@ -3038,6 +3113,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn encrypted_text_sent_to_a_plain_conversation_asks_first() {
+        let mut chat = chat();
+        chat.store.channels.get_mut("c1").unwrap().encrypted = true;
+        chat.store.add_channels(vec![Channel { id: "c2".into(), ..Default::default() }], vec![ChannelMember { channel_id: "c2".into(), ..Default::default() }]);
+        // Copied from the encrypted one's message box.
+        let mut content = text_editor::Content::with_text("the door code is 4471");
+        content.perform(text_editor::Action::SelectAll);
+        chat.editors.insert("c1".into(), content);
+        let _ = chat.handle(Message::Copied(false));
+        // Sent in the plain one: held back once, with a note; then sent.
+        chat.pv_mut().channel = "c2".into();
+        let _ = chat.handle(Message::Draft("fyi: the door code is 4471".into()));
+        let _ = chat.handle(Message::Send);
+        assert!(chat.notice.as_deref().is_some_and(|n| n.contains("encrypted conversation")));
+        assert!(chat.drafts.contains_key("c2"), "not sent yet");
+        let _ = chat.handle(Message::Send);
+        assert!(!chat.drafts.contains_key("c2"), "sent on the second Enter");
+        // Into an encrypted conversation it just goes.
+        chat.pv_mut().channel = "c1".into();
+        let _ = chat.handle(Message::Draft("the door code is 4471".into()));
+        let _ = chat.handle(Message::Send);
+        assert!(!chat.drafts.contains_key("c1"));
+        *ENCRYPTED_COPY.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn plugins_learn_the_server_but_not_encrypted_text_unless_allowed() {
+        let mut chat = chat();
+        chat.server_label = "Family".into();
+        chat.store.channels.get_mut("c1").unwrap().encrypted = true;
+        chat.drafts.insert("c1".into(), "a private draft".into());
+        let manifest: plugins::Manifest = toml::from_str("name = \"quote\"\ndescription = \"q\"\nrun = [\"./q\"]\n").unwrap();
+        let plugin = |reads_encrypted| plugins::Plugin { manifest: manifest.clone(), dir: Default::default(), built_in: false, config: Default::default(), reads_encrypted };
+        let target = PluginTarget { plugin: 0, key: "c1".into(), channel: "c1".into(), thread: false, restore: None };
+
+        chat.plugins = std::sync::Arc::new(plugins::Plugins { list: vec![plugin(false)], ..Default::default() });
+        let ctx = chat.plugin_context(&target);
+        assert_eq!((ctx.server.name.as_str(), ctx.server.id.as_str(), ctx.server.kind.as_str()), ("Family", "a1", "mattermost"));
+        assert!(ctx.encrypted && ctx.draft.is_empty(), "withheld");
+
+        chat.plugins = std::sync::Arc::new(plugins::Plugins { list: vec![plugin(true)], ..Default::default() });
+        assert_eq!(chat.plugin_context(&target).draft, "a private draft", "allowed");
+    }
+
+    #[test]
     fn an_account_not_on_screen_keeps_its_messages_unread() {
         use mm_api::ws::{Event, Message as M};
         let mut chat = chat();
@@ -3169,7 +3289,7 @@ pub(crate) mod tests {
             text: None,
             status: Status::Focused { is_hovered: false },
         };
-        let bind = |modifiers, code| crate::chat_view::composer_binding(press(modifiers), false, false, code, &Message::Send);
+        let bind = |modifiers, code| crate::chat_view::composer_binding(press(modifiers), false, false, code, &Message::Send, &Message::Copied(false));
         assert!(matches!(bind(Modifiers::empty(), false), Some(Binding::Custom(Message::Send))));
         assert!(matches!(bind(Modifiers::empty(), true), Some(Binding::Enter)), "in code: a new line");
         assert!(matches!(bind(Modifiers::SHIFT, false), Some(Binding::Enter)));

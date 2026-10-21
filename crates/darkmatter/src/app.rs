@@ -168,6 +168,8 @@ pub enum Message {
     OpenChannelNamed(String),
     /// A click on a notification.
     NotificationClicked(crate::notify::Click),
+    /// Ctrl+C or Ctrl+X in a message box (true: the reply box).
+    Copied(bool),
     /// Where the jump target sits, as a timeline offset from the bottom.
     JumpLocated(Option<f32>),
     /// Posts around a jump target: (channel, root, (before, after, thread)).
@@ -463,6 +465,7 @@ impl App {
             let Screen::Chat(chat) = &mut s.screen else { continue };
             let saved = self.accounts.get(&s.id);
             chat.server_name = saved.filter(|_| many).map(Saved::label);
+            chat.server_label = saved.map(Saved::label).unwrap_or_default();
             chat.muted = saved.is_some_and(|a| a.muted);
             chat.encrypted_previews = previews;
         }

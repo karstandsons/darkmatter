@@ -22,6 +22,8 @@ const LIST: &str = "plugins-list";
 pub enum Msg {
     Open,
     Close,
+    /// Let a plugin read encrypted conversations, or stop it.
+    Encrypted(String),
     Query(String),
     Select(usize),
     /// ↑↓ in the list.
@@ -266,6 +268,24 @@ pub fn update(
                 (true, None) => (false, format!("{name} is on")),
                 (false, _) => (false, format!("{name} is off")),
             });
+            return (Task::none(), true);
+        }
+        Msg::Encrypted(name) => {
+            let list = &mut config.plugins.encrypted;
+            let allowed = match list.iter().position(|n| *n == name) {
+                Some(i) => {
+                    list.remove(i);
+                    false
+                }
+                None => {
+                    list.push(name.clone());
+                    true
+                }
+            };
+            save(config);
+            reload(plugins, config);
+            m.refresh(plugins);
+            m.status = Some((false, if allowed { format!("{name} can read encrypted conversations") } else { format!("{name} can't read encrypted conversations") }));
             return (Task::none(), true);
         }
         Msg::Setting(plugin, key, value) => {
@@ -597,6 +617,16 @@ impl PluginManager {
             }
             col = col.push(help);
         }
+
+        // Encrypted conversations are closed to plugins unless you open them.
+        let name_for = name.clone();
+        col = col.push(
+            iced::widget::checkbox(config.plugins.encrypted.contains(&name))
+                .label("May read encrypted conversations (the message it acts on, and your draft)")
+                .on_toggle(move |_| Message::Plugins(Msg::Encrypted(name_for.clone())))
+                .size(14)
+                .text_size(12),
+        );
 
         let mut actions = row![].spacing(8).align_y(iced::Center);
         actions = match e.state {

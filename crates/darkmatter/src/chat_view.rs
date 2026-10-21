@@ -202,11 +202,12 @@ impl Chat {
         let empty = content.is_empty();
         let code = crate::chat::in_code_block(self.drafts.get(key).map_or("", String::as_str));
         let submit = if thread { Message::SendReply } else { Message::Send };
+        let copied = Message::Copied(thread);
         text_editor(content)
             .id(id)
             .placeholder(placeholder)
             .on_action(move |a| Message::Edit(thread, a))
-            .key_binding(move |kp| composer_binding(kp, menu, empty, code, &submit))
+            .key_binding(move |kp| composer_binding(kp, menu, empty, code, &submit, &copied))
             .padding(padding)
             .max_height(240)
             .style(c.editor())
@@ -1191,7 +1192,7 @@ impl Chat {
 /// Ctrl+Enter (⌘ on macOS) sends anywhere. Keys the app uses (shortcuts,
 /// Tab, ↑↓ in a completion menu, ↑ in an empty box to edit your last
 /// message, PageUp/Down) go to it as if no box had them.
-pub(crate) fn composer_binding(kp: text_editor::KeyPress, menu: bool, empty: bool, code: bool, submit: &Message) -> Option<text_editor::Binding<Message>> {
+pub(crate) fn composer_binding(kp: text_editor::KeyPress, menu: bool, empty: bool, code: bool, submit: &Message, copied: &Message) -> Option<text_editor::Binding<Message>> {
     use iced::keyboard::{Key, key::Named};
     use text_editor::Binding;
     if !matches!(kp.status, text_editor::Status::Focused { .. }) {
@@ -1219,6 +1220,10 @@ pub(crate) fn composer_binding(kp: text_editor::KeyPress, menu: bool, empty: boo
         Key::Named(Named::ArrowUp | Named::ArrowDown) if menu && m.is_empty() => to_app(&kp),
         Key::Named(Named::ArrowUp) if empty && m.is_empty() => to_app(&kp),
         _ if crate::commands::for_key(&kp.key, m).is_some() || crate::commands::server_number(&kp.key, m).is_some() => to_app(&kp),
-        _ => Binding::from_key_press(kp),
+        // Copying tells the app first, while the selection is still there.
+        _ => match Binding::from_key_press(kp) {
+            Some(b @ (Binding::Copy | Binding::Cut)) => Some(Binding::Sequence(vec![Binding::Custom(copied.clone()), b])),
+            other => other,
+        },
     }
 }

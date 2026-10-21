@@ -21,6 +21,12 @@ The release workflow uses each version's section here as its release notes.
 - Notifications from encrypted conversations no longer show the message
   (it would stay in the desktop's notification history unencrypted):
   `[notifications] encrypted_previews = true` brings it back.
+- **Encrypted text stays put:** sending text copied from an encrypted
+  conversation's message box into one that isn't encrypted asks first
+  (Enter again sends it). Plugins aren't given the text of encrypted
+  conversations unless you tick "May read encrypted conversations" for
+  them in the Plugins window, and every plugin request now says which
+  server it's for.
 - **Fixed:** clicking a link in a message did nothing.
 
 ## [0.4.3] - 2026-10-20
