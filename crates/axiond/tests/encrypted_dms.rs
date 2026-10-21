@@ -235,12 +235,15 @@ async fn safety_numbers_and_a_swapped_key() {
     expected.sort();
     assert_eq!(changes, expected, "carol wasn't verified: her change is only noted");
 
-    // Accepting bob's new key lifts the hold.
+    // Accepting the new keys lifts the hold. (Here they're the server's own,
+    // and bob's and carol's real devices were signed by their real keys,
+    // so nothing goes to them: a different refusal.)
     assert!(alice.set_verified(&bob.user_id, &theirs.key, false).await.is_err(), "not the key he has now");
     alice.set_verified(&bob.user_id, &now.key, false).await.unwrap();
     alice.set_verified(&carol.user_id, &alice.safety(&carol.user_id).await.unwrap().key, false).await.unwrap();
     assert!(alice.key_changes(&[bob.user_id.clone(), carol.user_id.clone()]).await.is_empty());
-    alice.encrypt_post(&post).await.unwrap();
+    let after = alice.encrypt_post(&post).await.unwrap_err();
+    assert!(!after.contains("changed since you verified") && after.contains("can't get encrypted messages"), "{after}");
 }
 
 /// A new sign-in for `name`: its own session, so a new device.

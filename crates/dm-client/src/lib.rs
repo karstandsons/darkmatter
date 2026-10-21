@@ -657,11 +657,16 @@ impl<S: LocalStore> E2ee<S> {
                     self.store.remember_identity(user, &id.identity_key);
                 }
             }
-            if let Some(key) = B64.decode(&id.identity_key).ok().and_then(|k| IdentityKey::from_slice(&k).ok()) {
-                keys.identities.insert(user.clone(), key);
-            }
+            let Some(key) = B64.decode(&id.identity_key).ok().and_then(|k| IdentityKey::from_slice(&k).ok()) else { continue };
+            keys.identities.insert(user.clone(), key);
             for cert in id.devices.into_iter().filter_map(|c| serde_json::from_value::<DeviceCertificate>(c).ok()) {
                 if cert.user_id != *user {
+                    continue;
+                }
+                // A device the user's key didn't vouch for (the server's own
+                // making) is left out, so it can't stop the real ones.
+                if cert.verify(&key).is_err() {
+                    tracing::warn!("{user}:{} has a certificate their identity key didn't sign; leaving it out", cert.device_id);
                     continue;
                 }
                 keys.certificates.insert((cert.user_id.clone(), cert.device_id.clone()), cert);

@@ -53,5 +53,6 @@ tokio = { workspace = true, features = ["process"] }
 mm-api = { path = "../mm-api" }
 # The client side of encryption, driven against a real axiond.
 dm-client = { path = "../dm-client" }
+openmls_memory_storage = "0.6"
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart"] }
 tempfile = "3"
