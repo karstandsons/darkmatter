@@ -317,14 +317,15 @@ pub fn file_info(key: &FileKey, post: &mm_api::models::Post) -> mm_api::models::
 }
 
 /// Download an attachment into the cache dir and open it with the system's default app.
-pub async fn open_file(client: Client, crypto: Shared, file_id: String, name: String) -> Result<(), String> {
+pub async fn open_file(client: Client, crypto: Shared, account: String, file_id: String, name: String) -> Result<(), String> {
     // Only the final path component, so a crafted name can't escape the directory.
     let name = std::path::Path::new(&name)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| file_id.clone());
-    let dir = dirs::cache_dir().ok_or("no cache dir")?.join("darkmatter/files").join(&file_id);
+    // Per account: two servers can use the same file id.
+    let dir = dirs::cache_dir().ok_or("no cache dir")?.join("darkmatter/accounts").join(&account).join("files").join(&file_id);
     let path = dir.join(name);
     if !path.exists() {
         let bytes = download(&client, &crypto, &file_id).await?;

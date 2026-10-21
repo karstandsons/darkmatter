@@ -15,7 +15,8 @@ use crate::report::{self, Report};
 use crate::plugin_manager::{self, PluginManager};
 use crate::theme_picker::{self, ModeTab, ThemePicker};
 use omarchy_theme::{Catalog, ThemeChoice};
-use crate::session::Session;
+use crate::accounts::{Accounts, Saved};
+use crate::session::{Keyring, Session};
 use crate::style::Colors;
 use crate::text as fmt;
 
@@ -26,7 +27,21 @@ pub struct App {
     theme: omarchy_theme::Theme,
     colors: Colors,
     iced_theme: Theme,
-    screen: Screen,
+    /// The servers, in the rail's order, each signed in or not.
+    servers: Vec<Server>,
+    /// The one on screen.
+    active: usize,
+    /// The one the message being handled is for: `active`, unless the
+    /// message came tagged with another (`Message::For`).
+    target: Option<usize>,
+    accounts: Accounts,
+    /// Signed in from `MM_URL` and `MM_TOKEN`: nothing is saved.
+    ephemeral: bool,
+    /// Installed plugins, for every account.
+    plugins: std::sync::Arc<crate::plugins::Plugins>,
+    /// A newer release, found by the update check, and installing it.
+    new_release: Option<crate::update::Available>,
+    updating: crate::chat::UpdateState,
     config: Config,
     catalog: Catalog,
     /// Running on Omarchy, and the theme it currently renders.
@@ -50,6 +65,15 @@ enum Screen {
     Chat(Box<Chat>),
 }
 
+/// One account: a server, signed in or not.
+struct Server {
+    /// Routes messages to it (`Message::For`); never reused while running.
+    key: u64,
+    /// Its id in `accounts.toml` (saved once it has signed in).
+    id: String,
+    screen: Screen,
+}
+
 #[derive(Default)]
 struct LoginForm {
     server: String,
@@ -70,6 +94,8 @@ struct LoginForm {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// A message for one account (by its key), whichever is on screen.
+    For(u64, Box<Message>),
     /// Omarchy switched its desktop theme.
     ThemeChanged(omarchy_theme::Theme),
     OsTheme(iced::theme::Mode),
@@ -282,6 +308,8 @@ pub enum LoginField {
 #[derive(Debug, Clone)]
 pub struct Bootstrap {
     pub session: Session,
+    /// The account's id (`accounts.toml`).
+    pub account: String,
     pub me: User,
     pub teams: Vec<Team>,
     pub channels: Vec<Channel>,
@@ -308,17 +336,49 @@ pub(crate) fn err(e: mm_api::Error) -> String {
 impl App {
     pub fn new() -> (Self, Task<Message>) {
         let omarchy = omarchy_theme::omarchy_present();
-        let (screen, task) = match Session::load() {
-            Some(s) => (Screen::Loading, bootstrap(s)),
-            None => (Screen::Login(LoginForm::with_server()), operation::focus(LOGIN_FIRST)),
+        let from_env = Session::from_env();
+        let accounts = match &from_env {
+            Some(s) => Accounts { shown: String::new(), list: vec![Saved::new(&s.server)] },
+            None => Accounts::load(),
         };
+        let mut servers = Vec::new();
+        let mut tasks = Vec::new();
+        for (key, a) in (0u64..).zip(&accounts.list) {
+            let session = from_env.clone().or_else(|| accounts.session(&a.id, &Keyring));
+            let screen = match session {
+                Some(s) => {
+                    tasks.push(bootstrap(s, a.id.clone()).map(move |m| m.to(key)));
+                    Screen::Loading
+                }
+                None => Screen::Login(LoginForm { server: a.server.clone(), ..Default::default() }),
+            };
+            servers.push(Server { key, id: a.id.clone(), screen });
+        }
+        if servers.is_empty() {
+            servers.push(Server { key: 0, id: crate::accounts::new_id(), screen: Screen::Login(LoginForm::with_server()) });
+        }
+        let active = servers.iter().position(|s| s.id == accounts.shown).unwrap_or(0);
+        if matches!(servers[active].screen, Screen::Login(_)) {
+            tasks.push(operation::focus(LOGIN_FIRST));
+        }
+        let config = Config::load();
+        let plugins = std::sync::Arc::new(crate::plugins::load(&config.plugins));
+        tasks.push(Task::done(Message::CheckUpdate));
+        let task = Task::batch(tasks);
         let fallback = omarchy_theme::Theme { name: String::new(), palette: omarchy_theme::Palette::fallback(), font: None };
         let mut app = App {
             colors: Colors::from_palette(&fallback.palette),
             iced_theme: Theme::Dark,
             theme: fallback,
-            screen,
-            config: Config::load(),
+            servers,
+            active,
+            target: None,
+            accounts,
+            ephemeral: from_env.is_some(),
+            plugins,
+            new_release: None,
+            updating: crate::chat::UpdateState::Idle,
+            config,
             catalog: Catalog::load(),
             omarchy,
             omarchy_current: if omarchy { omarchy_theme::Theme::load().ok() } else { None },
@@ -338,6 +398,60 @@ impl App {
         if let Err(e) = self.config.save() {
             tracing::warn!("couldn't save config: {e}");
         }
+    }
+
+    /// The account the message being handled is for.
+    fn cur(&self) -> usize {
+        self.target.unwrap_or(self.active)
+    }
+
+    fn screen(&mut self) -> &mut Screen {
+        let i = self.cur();
+        &mut self.servers[i].screen
+    }
+
+    fn chat(&mut self) -> Option<&mut Chat> {
+        match self.screen() {
+            Screen::Chat(chat) => Some(chat),
+            _ => None,
+        }
+    }
+
+    fn chats(&mut self) -> impl Iterator<Item = &mut Chat> {
+        self.servers.iter_mut().filter_map(|s| match &mut s.screen {
+            Screen::Chat(chat) => Some(&mut **chat),
+            _ => None,
+        })
+    }
+
+    fn save_accounts(&mut self) {
+        if self.ephemeral {
+            return;
+        }
+        self.accounts.shown = self.servers[self.active].id.clone();
+        self.accounts.save();
+    }
+
+    /// Each chat's sidebar shows the update notice.
+    fn sync_updates(&mut self) {
+        let (release, updating) = (self.new_release.clone(), self.updating.clone());
+        for chat in self.chats() {
+            chat.new_release = release.clone();
+            chat.updating = updating.clone();
+        }
+    }
+
+    /// Back to signing in for the account, with its server filled in.
+    fn sign_out(&mut self, error: Option<String>) -> Task<Message> {
+        let i = self.cur();
+        let id = self.servers[i].id.clone();
+        if !self.ephemeral {
+            self.accounts.signed_out(&id, &Keyring);
+            self.save_accounts();
+        }
+        let server = self.accounts.get(&id).map(|a| a.server.clone()).unwrap_or_default();
+        self.servers[i].screen = Screen::Login(LoginForm { server, error, ..Default::default() });
+        if i == self.active { operation::focus(LOGIN_FIRST) } else { Task::none() }
     }
 
     fn choice(&self) -> ThemeChoice {
@@ -396,11 +510,16 @@ impl App {
             Message::Key(_) if open => return ControlFlow::Break(Task::none()),
             other => return ControlFlow::Continue(other),
         };
-        let Screen::Chat(chat) = &mut self.screen else { return ControlFlow::Break(Task::none()) };
-        let (task, reloaded) = plugin_manager::update(&mut self.plugin_manager, &mut self.config, &mut chat.plugins, &chat.server_config, msg);
-        if reloaded {
-            // Its plugin numbers may have moved.
-            chat.plugin_picker = None;
+        let i = self.cur();
+        let Screen::Chat(chat) = &self.servers[i].screen else { return ControlFlow::Break(Task::none()) };
+        let (task, reloaded) = plugin_manager::update(&mut self.plugin_manager, &mut self.config, &mut self.plugins, &chat.server_config, msg);
+        let plugins = self.plugins.clone();
+        for chat in self.chats() {
+            chat.plugins = plugins.clone();
+            if reloaded {
+                // Its plugin numbers may have moved.
+                chat.plugin_picker = None;
+            }
         }
         ControlFlow::Break(task)
     }
@@ -415,17 +534,15 @@ impl App {
             Message::Key(_) if open => return ControlFlow::Break(Task::none()),
             other => return ControlFlow::Continue(other),
         };
-        let Screen::Chat(chat) = &mut self.screen else { return ControlFlow::Break(Task::none()) };
+        let i = self.cur();
+        let Screen::Chat(chat) = &mut self.servers[i].screen else { return ControlFlow::Break(Task::none()) };
         let (task, gone) = account::update(&mut self.account, &chat.client, chat.axiond.is_some(), msg);
         if let Some(blocked) = self.account.as_ref().and_then(Account::blocked_ids) {
             chat.store.blocked = blocked.into_iter().collect();
         }
         if gone {
             // The account is deleted: back to signing in, with nothing saved.
-            let server = chat.session.server.clone();
-            Session::clear();
-            self.screen = Screen::Login(LoginForm { server, error: Some("Your account is deleted.".into()), ..Default::default() });
-            return ControlFlow::Break(operation::focus(LOGIN_FIRST));
+            return ControlFlow::Break(self.sign_out(Some("Your account is deleted.".into())));
         }
         ControlFlow::Break(task)
     }
@@ -439,7 +556,8 @@ impl App {
             Message::Key(_) if open => return ControlFlow::Break(Task::none()),
             other => return ControlFlow::Continue(other),
         };
-        let Screen::Chat(chat) = &mut self.screen else { return ControlFlow::Break(Task::none()) };
+        let i = self.cur();
+        let Screen::Chat(chat) = &mut self.servers[i].screen else { return ControlFlow::Break(Task::none()) };
         let (task, done) = report::update(&mut self.report, &chat.client, msg);
         if let Some((note, blocked)) = done {
             if let Some(user) = blocked {
@@ -634,30 +752,59 @@ impl App {
     }
 
     pub fn title(&self) -> String {
-        match &self.screen {
-            Screen::Chat(chat) => {
-                let unread = chat.store.channels.keys().map(|id| chat.store.unread(id).mentions).sum::<i64>();
-                let name = chat.store.channels.get(&chat.focused().channel).map(|c| chat.store.channel_label(c));
-                match (unread, name) {
-                    (0, Some(n)) => format!("{n} — Darkmatter"),
-                    (m, Some(n)) => format!("({m}) {n} — Darkmatter"),
-                    (_, None) => "Darkmatter".into(),
-                }
-            }
-            _ => "Darkmatter".into(),
+        // Mentions on every server that isn't muted.
+        let unread: i64 = self
+            .servers
+            .iter()
+            .filter(|s| !self.accounts.get(&s.id).is_some_and(|a| a.muted))
+            .filter_map(|s| match &s.screen {
+                Screen::Chat(chat) => Some(chat.store.channels.keys().map(|id| chat.store.unread(id).mentions).sum::<i64>()),
+                _ => None,
+            })
+            .sum();
+        let shown = &self.servers[self.active];
+        let mut parts = Vec::new();
+        if let Screen::Chat(chat) = &shown.screen
+            && let Some(c) = chat.store.channels.get(&chat.focused().channel)
+        {
+            parts.push(chat.store.channel_label(c));
         }
+        // Which server, once there's more than one.
+        if self.servers.len() > 1
+            && let Some(a) = self.accounts.get(&shown.id)
+        {
+            parts.push(a.label());
+        }
+        parts.push("Darkmatter".into());
+        let title = parts.join(" — ");
+        if unread > 0 { format!("({unread}) {title}") } else { title }
     }
 
     pub fn theme(&self) -> Theme {
         self.iced_theme.clone()
     }
 
+    /// Handles a message for the account it's tagged with (the one on screen
+    /// if it isn't), and tags what follows from it the same way.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let (key, message) = match message {
+            Message::For(key, m) => (key, *m),
+            m => (self.servers[self.active].key, m),
+        };
+        // Its account may be gone.
+        let Some(i) = self.servers.iter().position(|s| s.key == key) else { return Task::none() };
+        let before = self.target.replace(i);
+        let task = self.handle(message);
+        self.target = before;
+        task.map(move |m| m.to(key))
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         if tracing::enabled!(tracing::Level::DEBUG) {
             match &message {
                 // Login input carries the password; never log it.
                 Message::Login(..) => {}
-                Message::Ws(_) | Message::Tick | Message::Media(..) | Message::Animation(..) | Message::History(..) | Message::Thread(..) | Message::JumpWindow(..) | Message::Newer(..) => {}
+                Message::For(..) | Message::Ws(_) | Message::Tick | Message::Media(..) | Message::Animation(..) | Message::History(..) | Message::Thread(..) | Message::JumpWindow(..) | Message::Newer(..) => {}
                 Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                     tracing::debug!("key {key:?} {modifiers:?}")
                 }
@@ -672,7 +819,7 @@ impl App {
             m => m,
         };
         // While an image is shown, keys are its: zoom, step, close.
-        if let Screen::Chat(chat) = &mut self.screen
+        if let Some(chat) = self.chat()
             && chat.lightbox.is_some()
         {
             use crate::lightbox::{Lightbox, Msg};
@@ -723,7 +870,7 @@ impl App {
             Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. })
                 if let Some(command) = crate::commands::for_key(&key, modifiers) =>
             {
-                self.update(Message::Run(command, String::new()))
+                self.handle(Message::Run(command, String::new()))
             }
             Message::Run(command, arg) => {
                 use crate::commands::Command as C;
@@ -731,7 +878,7 @@ impl App {
                 // and puts the cursor back in the message box, unless the
                 // command opens a box of its own.
                 let mut refocus = false;
-                if let Screen::Chat(chat) = &mut self.screen
+                if let Some(chat) = self.chat()
                     && chat.menu
                     && command != C::Leave
                 {
@@ -747,10 +894,7 @@ impl App {
                 if let Err(e) = self.config.save() {
                     tracing::warn!("couldn't save config: {e}");
                 }
-                match &mut self.screen {
-                    Screen::Chat(chat) => chat.set_inline_threads(inline),
-                    _ => Task::none(),
-                }
+                Task::batch(self.chats().map(|chat| chat.set_inline_threads(inline)).collect::<Vec<_>>())
             }
             // `mention:` links are @usernames; a profile popover can hook in here later.
             Message::Link(uri) if uri.starts_with("mention:") => Task::none(),
@@ -761,22 +905,82 @@ impl App {
                 Task::none()
             }
             Message::Logout => {
-                if let Screen::Chat(chat) = &self.screen {
-                    let mut client = chat.client.clone();
-                    Session::clear();
-                    self.screen = Screen::Login(LoginForm { server: chat.session.server.clone(), ..Default::default() });
-                    let logout = Task::future(async move { client.logout().await }).discard();
-                    return Task::batch([logout, operation::focus(LOGIN_FIRST)]);
-                }
-                Task::none()
+                let Some(chat) = self.chat() else { return Task::none() };
+                let mut client = chat.client.clone();
+                let logout = Task::future(async move { client.logout().await }).discard();
+                Task::batch([logout, self.sign_out(None)])
             }
             Message::SessionFailed(e) => {
-                let server = Session::load().map(|s| s.server).unwrap_or_default();
-                self.screen = Screen::Login(LoginForm { server, error: Some(e), ..LoginForm::with_server() });
-                operation::focus(LOGIN_FIRST)
+                // Its sign-in is kept: the server may only be unreachable.
+                let i = self.cur();
+                let server = self.accounts.get(&self.servers[i].id).map(|a| a.server.clone()).unwrap_or_default();
+                self.servers[i].screen = Screen::Login(LoginForm { server, error: Some(e), ..LoginForm::with_server() });
+                if i == self.active { operation::focus(LOGIN_FIRST) } else { Task::none() }
             }
-            Message::Bootstrapped(Err(e)) => self.update(Message::SessionFailed(e)),
-            Message::Bootstrapped(Ok(b)) => match &mut self.screen {
+            Message::LoggedIn(Ok((session, _))) => {
+                let i = self.cur();
+                let id = self.servers[i].id.clone();
+                if !self.ephemeral {
+                    let account = self.accounts.get(&id).cloned().unwrap_or_else(|| Saved { id: id.clone(), ..Default::default() });
+                    self.accounts.signed_in(account, &session, &Keyring);
+                    self.save_accounts();
+                }
+                bootstrap(session, id)
+            }
+            Message::CheckUpdate => {
+                let source = std::env::current_exe().ok().and_then(|exe| crate::update::source(&exe));
+                match source.filter(|_| self.config.updates.check != Some(false)) {
+                    Some(url) => Task::perform(crate::update::check(url, env!("CARGO_PKG_VERSION")), Message::UpdateChecked),
+                    None => Task::none(),
+                }
+            }
+            Message::UpdateChecked(Ok(found)) => {
+                if let Some(release) = &found {
+                    tracing::info!("Darkmatter {} is available", release.version);
+                }
+                self.new_release = found;
+                self.sync_updates();
+                Task::none()
+            }
+            Message::UpdateChecked(Err(e)) => {
+                tracing::debug!("update check failed: {e}");
+                Task::none()
+            }
+            Message::UpdateNow => {
+                use crate::chat::UpdateState;
+                let (Some(release), Some(exe)) = (self.new_release.clone(), crate::update::exe_path()) else { return Task::none() };
+                if self.updating == UpdateState::Working {
+                    return Task::none();
+                }
+                self.updating = UpdateState::Working;
+                self.sync_updates();
+                Task::perform(crate::update::install(release, exe), Message::UpdateInstalled)
+            }
+            Message::UpdateInstalled(result) => {
+                use crate::chat::UpdateState;
+                self.updating = match result {
+                    Ok(()) => UpdateState::Ready,
+                    Err(e) => {
+                        tracing::warn!("update failed: {e}");
+                        UpdateState::Failed(e)
+                    }
+                };
+                self.sync_updates();
+                Task::none()
+            }
+            Message::RestartNow => {
+                let restarted = crate::update::exe_path().ok_or_else(|| "couldn't find Darkmatter's binary".to_string()).and_then(|exe| crate::update::relaunch(&exe));
+                match restarted {
+                    Ok(()) => iced::exit(),
+                    Err(e) => {
+                        self.updating = crate::chat::UpdateState::Failed(e);
+                        self.sync_updates();
+                        Task::none()
+                    }
+                }
+            }
+            Message::Bootstrapped(Err(e)) => self.handle(Message::SessionFailed(e)),
+            Message::Bootstrapped(Ok(b)) => match self.screen() {
                 // A resync after lost events: refresh in place, keep the selection.
                 Screen::Chat(chat) => {
                     chat.store.teams = b.teams;
@@ -788,9 +992,9 @@ impl App {
                 _ => self.start_chat(*b),
             },
             Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::Tab), modifiers, .. })
-                if matches!(self.screen, Screen::Login(_)) =>
+                if matches!(self.servers[self.cur()].screen, Screen::Login(_)) =>
             {
-                self.update(Message::LoginTab(if modifiers.shift() { -1 } else { 1 }))
+                self.handle(Message::LoginTab(if modifiers.shift() { -1 } else { 1 }))
             }
             Message::Login(..)
             | Message::LoginNext(_)
@@ -798,12 +1002,12 @@ impl App {
             | Message::LoginSubmit
             | Message::LoginInvite(_)
             | Message::LoggedIn(_) => {
-                let Screen::Login(form) = &mut self.screen else { return Task::none() };
+                let Screen::Login(form) = self.screen() else { return Task::none() };
                 form.update(message)
             }
-            _ => match &mut self.screen {
-                Screen::Chat(chat) => chat.update(message),
-                _ => Task::none(),
+            _ => match self.chat() {
+                Some(chat) => chat.update(message),
+                None => Task::none(),
             },
         }
     }
@@ -826,30 +1030,30 @@ impl App {
                         self.save_choice(&choice);
                         Task::none()
                     }
-                    None => match &mut self.screen {
-                        Screen::Chat(chat) => chat.notify(format!("No theme called {arg}")),
-                        _ => Task::none(),
+                    None => match self.chat() {
+                        Some(chat) => chat.notify(format!("No theme called {arg}")),
+                        None => Task::none(),
                     },
                 }
             }
-            C::Themes => self.update(if self.picker.is_some() { Message::CloseThemes } else { Message::OpenThemes }),
+            C::Themes => self.handle(if self.picker.is_some() { Message::CloseThemes } else { Message::OpenThemes }),
             C::Plugins => {
-                if let Screen::Chat(chat) = &mut self.screen {
+                if let Some(chat) = self.chat() {
                     chat.plus = None;
                 }
                 self.picker = None;
                 self.preview = None;
                 self.apply_theme();
                 let msg = if self.plugin_manager.is_some() { plugin_manager::Msg::Close } else { plugin_manager::Msg::Open };
-                self.update(Message::Plugins(msg))
+                self.handle(Message::Plugins(msg))
             }
             C::Account => {
                 self.plugin_manager = None;
                 self.picker = None;
                 let msg = if self.account.is_some() { account::Msg::Close } else { account::Msg::Open };
-                self.update(Message::Account(msg))
+                self.handle(Message::Account(msg))
             }
-            C::ThreadLayout => self.update(Message::ToggleThreadLayout),
+            C::ThreadLayout => self.handle(Message::ToggleThreadLayout),
             C::ToggleDensity | C::Compact | C::Cozy => {
                 let compact = match command {
                     C::Compact => true,
@@ -858,7 +1062,7 @@ impl App {
                 };
                 self.config.layout.density = Some(if compact { "compact" } else { "comfortable" }.into());
                 self.save_config();
-                if let Screen::Chat(chat) = &mut self.screen {
+                for chat in self.chats() {
                     chat.compact = compact;
                 }
                 Task::none()
@@ -867,16 +1071,16 @@ impl App {
                 let shown = self.config.layout.sidebar == Some(false);
                 self.config.layout.sidebar = (!shown).then_some(false);
                 self.save_config();
-                if let Screen::Chat(chat) = &mut self.screen {
+                for chat in self.chats() {
                     chat.sidebar = shown;
                 }
                 Task::none()
             }
-            C::About => self.update(Message::Link(format!("https://github.com/karstandsons/darkmatter/releases/tag/v{}", env!("CARGO_PKG_VERSION")))),
-            C::Logout => self.update(Message::Logout),
-            _ => match &mut self.screen {
-                Screen::Chat(chat) => chat.run(command, arg),
-                _ => Task::none(),
+            C::About => self.handle(Message::Link(format!("https://github.com/karstandsons/darkmatter/releases/tag/v{}", env!("CARGO_PKG_VERSION")))),
+            C::Logout => self.handle(Message::Logout),
+            _ => match self.chat() {
+                Some(chat) => chat.run(command, arg),
+                None => Task::none(),
             },
         }
     }
@@ -885,12 +1089,13 @@ impl App {
         let Some((mut chat, task)) = Chat::start(b) else { return Task::none() };
         chat.inline_threads = self.config.layout.inline_threads();
         chat.vim_keys = self.config.keys.vim != Some(false);
-        chat.check_updates = self.config.updates.check != Some(false);
         chat.compact = self.config.layout.compact();
         chat.sidebar = self.config.layout.sidebar != Some(false);
-        chat.plugins = std::sync::Arc::new(crate::plugins::load(&self.config.plugins));
-        let task = Task::batch([task, chat.open_panes(), chat.update(Message::CheckUpdate)]);
-        self.screen = Screen::Chat(Box::new(chat));
+        chat.plugins = self.plugins.clone();
+        chat.new_release = self.new_release.clone();
+        chat.updating = self.updating.clone();
+        let task = Task::batch([task, chat.open_panes()]);
+        *self.screen() = Screen::Chat(Box::new(chat));
         task
     }
 
@@ -914,16 +1119,19 @@ impl App {
                 _ => None,
             }),
         ];
-        if let Screen::Chat(chat) = &self.screen {
-            subs.push(Subscription::run_with(chat.session.clone(), ws_events).map(Message::Ws));
-            if chat.check_updates {
-                subs.push(iced::time::every(Duration::from_secs(24 * 60 * 60)).map(|_| Message::CheckUpdate));
-            }
+        if self.config.updates.check != Some(false) {
+            subs.push(iced::time::every(Duration::from_secs(24 * 60 * 60)).map(|_| Message::CheckUpdate));
+        }
+        // Every signed-in account keeps its connection and timers, shown or not.
+        for server in &self.servers {
+            let Screen::Chat(chat) = &server.screen else { continue };
+            subs.push(Subscription::run_with((server.key, chat.session.clone()), ws_events));
+            let every_second = || iced::time::every(Duration::from_secs(1)).with(server.key);
             if chat.layout_dirty {
-                subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::SaveLayout));
+                subs.push(every_second().map(|(key, _)| Message::SaveLayout.to(key)));
             }
             if !chat.typing.is_empty() || chat.panes.iter().any(|(_, p)| p.highlight.is_some()) || !chat.outbox.is_empty() {
-                subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
+                subs.push(every_second().map(|(key, _)| Message::Tick.to(key)));
             }
         }
         Subscription::batch(subs)
@@ -938,11 +1146,14 @@ impl App {
 
     fn view_inner(&self) -> Element<'_, Message> {
         let c = self.colors;
-        let body = match &self.screen {
+        let shown = &self.servers[self.active];
+        let key = shown.key;
+        let body: Element<'_, Message> = match &shown.screen {
             Screen::Loading => center(text("Connecting…").color(c.muted)).into(),
             Screen::Login(form) => form.view(c),
             Screen::Chat(chat) => chat.view(c, &self.iced_theme),
         };
+        let body = body.map(move |m| m.to(key));
         // Always a stack, so opening or closing the picker keeps the state
         // (and focus) of the widgets under it.
         let mut body = iced::widget::stack![body];
@@ -950,10 +1161,10 @@ impl App {
             let choice = self.choice();
             body = body.push(p.view(&self.catalog, &choice, &self.theme.name, self.os_mode == omarchy_theme::Mode::Dark, self.omarchy, c));
         }
-        if let (Some(m), Screen::Chat(chat)) = (&self.plugin_manager, &self.screen) {
-            body = body.push(m.view(&chat.plugins, &self.config, &chat.server_config, c));
+        if let (Some(m), Screen::Chat(chat)) = (&self.plugin_manager, &shown.screen) {
+            body = body.push(m.view(&self.plugins, &self.config, &chat.server_config, c));
         }
-        if let (Some(a), Screen::Chat(chat)) = (&self.account, &self.screen) {
+        if let (Some(a), Screen::Chat(chat)) = (&self.account, &shown.screen) {
             body = body.push(a.view(&chat.crypto_status, c));
         }
         if let Some(r) = &self.report {
@@ -977,13 +1188,14 @@ fn theme_events() -> impl iced::futures::Stream<Item = omarchy_theme::Theme> {
     })
 }
 
-fn ws_events(session: &Session) -> impl iced::futures::Stream<Item = ws::Message> + use<> {
-    let session = session.clone();
+/// One account's websocket, its events tagged with the account's key.
+fn ws_events((key, session): &(u64, Session)) -> impl iced::futures::Stream<Item = Message> + use<> {
+    let (key, session) = (*key, session.clone());
     iced::stream::channel(64, async move |mut out| {
         let Ok(client) = session.client() else { return };
         let Ok(mut stream) = ws::connect(&client) else { return };
         while let Some(msg) = stream.next().await {
-            if out.send(msg).await.is_err() {
+            if out.send(Message::Ws(msg).to(key)).await.is_err() {
                 return;
             }
         }
@@ -991,7 +1203,7 @@ fn ws_events(session: &Session) -> impl iced::futures::Stream<Item = ws::Message
 }
 
 /// Load everything the sidebar needs in one go.
-pub(crate) fn bootstrap(session: Session) -> Task<Message> {
+pub(crate) fn bootstrap(session: Session, account: String) -> Task<Message> {
     Task::perform(
         async move {
             let client = session.client().map_err(err)?;
@@ -1057,7 +1269,7 @@ pub(crate) fn bootstrap(session: Session) -> Task<Message> {
                     (crate::outbox::take_legacy(&session.server), status, None)
                 }
             };
-            Ok(Box::new(Bootstrap { session, me, teams, channels, members, users, server_config, axiond, blocked, vault, outbox, crypto_status, crypto }))
+            Ok(Box::new(Bootstrap { session, account, me, teams, channels, members, users, server_config, axiond, blocked, vault, outbox, crypto_status, crypto }))
         },
         Message::Bootstrapped,
     )
@@ -1153,12 +1365,6 @@ impl LoginForm {
                     Message::LoggedIn,
                 )
             }
-            Message::LoggedIn(Ok((session, _))) => {
-                if let Err(e) = session.save() {
-                    tracing::warn!("could not save session: {e}");
-                }
-                bootstrap(session)
-            }
             Message::LoggedIn(Err((e, mfa))) => {
                 self.busy = false;
                 self.need_mfa |= mfa;
@@ -1243,6 +1449,14 @@ impl LoginForm {
 }
 
 impl Message {
+    /// Tags the message for an account, unless it's tagged already.
+    pub fn to(self, key: u64) -> Message {
+        match self {
+            m @ Message::For(..) => m,
+            m => Message::For(key, Box::new(m)),
+        }
+    }
+
     /// Tag a task's result with the pane that started it, if it only makes
     /// sense there (a jump's scroll position, a page for its older stretch).
     pub fn for_pane(self, pane: iced::widget::pane_grid::Pane) -> Message {
@@ -1250,5 +1464,59 @@ impl Message {
             m @ (Message::JumpLocated(_) | Message::JumpWindow(..) | Message::Newer(..)) => Message::InPane(pane, Box::new(m)),
             m => m,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An app signed into these chats, the first on screen.
+    fn app(chats: Vec<Chat>) -> App {
+        let fallback = omarchy_theme::Theme { name: String::new(), palette: omarchy_theme::Palette::fallback(), font: None };
+        let servers: Vec<Server> = (0u64..).zip(chats).map(|(key, chat)| Server { key, id: chat.account.clone(), screen: Screen::Chat(Box::new(chat)) }).collect();
+        App {
+            colors: Colors::from_palette(&fallback.palette),
+            iced_theme: Theme::Dark,
+            theme: fallback,
+            servers,
+            active: 0,
+            target: None,
+            accounts: Accounts::default(),
+            ephemeral: true,
+            plugins: Default::default(),
+            new_release: None,
+            updating: crate::chat::UpdateState::Idle,
+            config: Config::default(),
+            catalog: Catalog::default(),
+            omarchy: false,
+            omarchy_current: None,
+            os_mode: omarchy_theme::Mode::Dark,
+            picker: None,
+            preview: None,
+            plugin_manager: None,
+            account: None,
+            report: None,
+        }
+    }
+
+    fn draft(app: &App, i: usize) -> Option<&str> {
+        let Screen::Chat(chat) = &app.servers[i].screen else { panic!("signed in") };
+        chat.drafts.get("c1").map(String::as_str)
+    }
+
+    #[test]
+    fn messages_go_to_their_account() {
+        let mut app = app(vec![crate::chat::tests::chat(), crate::chat::tests::chat()]);
+        // Untagged (typing, keys): the account on screen.
+        let _ = app.update(Message::Draft("shown".into()));
+        // Tagged (its websocket, its fetches): that account, wherever you are.
+        let _ = app.update(Message::For(1, Box::new(Message::Draft("background".into()))));
+        assert_eq!((draft(&app, 0), draft(&app, 1)), (Some("shown"), Some("background")));
+        // An account that's gone gets nothing, and nothing else gets it.
+        let _ = app.update(Message::For(7, Box::new(Message::Draft("lost".into()))));
+        assert_eq!((draft(&app, 0), draft(&app, 1)), (Some("shown"), Some("background")));
+        // A message tagged twice keeps its first account.
+        assert!(matches!(Message::Tick.to(1).to(0), Message::For(1, _)));
     }
 }

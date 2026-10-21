@@ -159,6 +159,8 @@ const AROUND: u32 = 30;
 
 pub struct Chat {
     pub session: Session,
+    /// The account's id (`accounts.toml`).
+    pub account: String,
     pub client: Client,
     pub store: Store,
     pub team: String,
@@ -168,8 +170,7 @@ pub struct Chat {
     pub focus: pane_grid::Pane,
     cur: pane_grid::Pane,
     next_pane: usize,
-    /// Look for newer releases; and the one found, if any.
-    pub check_updates: bool,
+    /// The app's update notice, shown in the sidebar.
     pub new_release: Option<crate::update::Available>,
     pub updating: UpdateState,
     /// Vim-style keys when no text box has the cursor.
@@ -549,6 +550,7 @@ impl Chat {
         let outbox = crate::outbox::Outbox::new(b.outbox, b.vault.as_ref().map(|v| v.writer()));
         let chat = Chat {
             session: b.session,
+            account: b.account,
             client,
             store,
             team,
@@ -559,7 +561,6 @@ impl Chat {
             layout_dirty: false,
             last_channel_pane: None,
             vim_keys: true,
-            check_updates: true,
             new_release: None,
             updating: UpdateState::Idle,
             pending_g: false,
@@ -1735,52 +1736,6 @@ impl Chat {
                 }
                 Task::none()
             }
-            Message::CheckUpdate => {
-                let source = std::env::current_exe().ok().and_then(|exe| crate::update::source(&exe));
-                match source.filter(|_| self.check_updates) {
-                    Some(url) => Task::perform(crate::update::check(url, env!("CARGO_PKG_VERSION")), Message::UpdateChecked),
-                    None => Task::none(),
-                }
-            }
-            Message::UpdateChecked(Ok(found)) => {
-                if let Some(release) = &found {
-                    tracing::info!("Darkmatter {} is available", release.version);
-                }
-                self.new_release = found;
-                Task::none()
-            }
-            Message::UpdateChecked(Err(e)) => {
-                tracing::debug!("update check failed: {e}");
-                Task::none()
-            }
-            Message::UpdateNow => {
-                let (Some(release), Some(exe)) = (self.new_release.clone(), crate::update::exe_path()) else { return Task::none() };
-                if self.updating == UpdateState::Working {
-                    return Task::none();
-                }
-                self.updating = UpdateState::Working;
-                Task::perform(crate::update::install(release, exe), Message::UpdateInstalled)
-            }
-            Message::UpdateInstalled(result) => {
-                self.updating = match result {
-                    Ok(()) => UpdateState::Ready,
-                    Err(e) => {
-                        tracing::warn!("update failed: {e}");
-                        UpdateState::Failed(e)
-                    }
-                };
-                Task::none()
-            }
-            Message::RestartNow => {
-                let restarted = crate::update::exe_path().ok_or_else(|| "couldn't find Darkmatter's binary".to_string()).and_then(|exe| crate::update::relaunch(&exe));
-                match restarted {
-                    Ok(()) => iced::exit(),
-                    Err(e) => {
-                        self.updating = UpdateState::Failed(e);
-                        Task::none()
-                    }
-                }
-            }
             Message::FocusComposer => operation::focus(self.pv().composer()),
             Message::SaveLayout => {
                 self.layout_dirty = false;
@@ -1992,7 +1947,7 @@ impl Chat {
                         return self.goto_pending();
                     }
                     self.pending_goto = Some(name);
-                    return bootstrap(self.session.clone());
+                    return bootstrap(self.session.clone(), self.account.clone());
                 }
                 Task::none()
             }
@@ -2070,7 +2025,7 @@ impl Chat {
             }
             Message::Lightbox(m) => self.lightbox_update(m),
             Message::OpenFile(id, name) => {
-                Task::perform(media::open_file(self.client.clone(), self.crypto.clone(), id, name), Message::Opened)
+                Task::perform(media::open_file(self.client.clone(), self.crypto.clone(), self.account.clone(), id, name), Message::Opened)
             }
             Message::Opened(Err(e)) => {
                 self.error = Some(format!("Couldn't open file: {e}"));
@@ -2735,7 +2690,7 @@ impl Chat {
                 channels.sort();
                 channels.dedup();
                 let loads = channels.into_iter().map(|c| self.load_history(c));
-                Task::batch([bootstrap(session)].into_iter().chain(loads))
+                Task::batch([bootstrap(session, self.account.clone())].into_iter().chain(loads))
             }
             // The channel list changed: someone added this account to a
             // channel, opened a DM with it, or a channel changed (encryption
@@ -2983,14 +2938,15 @@ fn to_latest(id: impl Into<Id>) -> Task<Message> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::app::Bootstrap;
     use mm_api::models::{Channel, ChannelMember, User};
 
-    fn chat() -> Chat {
+    pub(crate) fn chat() -> Chat {
         let b = Bootstrap {
             session: Session { server: "http://localhost:1".into(), token: "t".into() },
+            account: "a1".into(),
             me: User { id: "me".into(), ..Default::default() },
             teams: vec![],
             channels: vec![Channel { id: "c1".into(), ..Default::default() }],

@@ -3,7 +3,7 @@
 
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -22,13 +22,9 @@ impl std::fmt::Debug for Session {
 }
 
 
-fn path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("darkmatter/session.toml"))
-}
-
-/// What's written to `session.toml`. The token only appears here when no
-/// system keyring is available (or in files from older versions).
-#[derive(Default, Deserialize, Serialize)]
+/// What older versions wrote to `session.toml`. The token only appears here
+/// when no system keyring was available.
+#[derive(Default, Deserialize)]
 struct SessionFile {
     server: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,56 +91,22 @@ pub fn read_only() -> bool {
 }
 
 impl Session {
-    /// `MM_URL` + `MM_TOKEN` win over the saved login, for scripting and dev.
-    pub fn load() -> Option<Self> {
-        if let (Ok(server), Ok(token)) = (std::env::var("MM_URL"), std::env::var("MM_TOKEN")) {
-            return Some(Session { server, token });
-        }
-        Self::load_from(&path()?, &Keyring)
+    /// `MM_URL` + `MM_TOKEN`: this server only, saved nowhere (scripting, dev).
+    pub fn from_env() -> Option<Self> {
+        let (Ok(server), Ok(token)) = (std::env::var("MM_URL"), std::env::var("MM_TOKEN")) else { return None };
+        Some(Session { server, token })
     }
 
-    pub fn save(&self) -> std::io::Result<()> {
-        self.save_to(&path().ok_or(std::io::ErrorKind::NotFound)?, &Keyring)
-    }
-
-    /// Forget the saved login (file and keyring entry).
-    pub fn clear() {
-        if let Some(path) = path() {
-            Self::clear_at(&path, &Keyring);
-        }
-    }
-
-    fn load_from(path: &Path, store: &dyn SecretStore) -> Option<Self> {
+    /// The one login older versions saved (`session.toml`): its server, and
+    /// its token if it can't go in `store`. A token in the file moves to the
+    /// keyring.
+    pub(crate) fn take_old(path: &Path, store: &dyn SecretStore) -> Option<(String, Option<String>)> {
         let file: SessionFile = toml::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-        match file.token {
-            // A token in the file: an older version, or no keyring. Move it if we can.
-            Some(token) => {
-                let session = Session { server: file.server, token };
-                if store.set(&session.server, &session.token).is_ok() {
-                    let _ = write_file(path, &SessionFile { server: session.server.clone(), token: None });
-                }
-                Some(session)
-            }
-            None => Some(Session { token: store.get(&file.server)?, server: file.server }),
-        }
-    }
-
-    fn save_to(&self, path: &Path, store: &dyn SecretStore) -> std::io::Result<()> {
-        let token = match store.set(&self.server, &self.token) {
-            Ok(()) => None,
-            Err(e) => {
-                tracing::warn!("no system keyring ({e}); keeping the token in {} (mode 0600)", path.display());
-                Some(self.token.clone())
-            }
+        let token = match file.token {
+            Some(token) if store.set(&file.server, &token).is_err() => Some(token),
+            _ => None,
         };
-        write_file(path, &SessionFile { server: self.server.clone(), token })
-    }
-
-    fn clear_at(path: &Path, store: &dyn SecretStore) {
-        if let Some(file) = std::fs::read_to_string(path).ok().and_then(|t| toml::from_str::<SessionFile>(&t).ok()) {
-            store.delete(&file.server);
-        }
-        let _ = std::fs::remove_file(path);
+        Some((file.server, token))
     }
 
     pub fn client(&self) -> Result<mm_api::Client, mm_api::Error> {
@@ -152,11 +114,13 @@ impl Session {
     }
 }
 
-fn write_file(path: &Path, file: &SessionFile) -> std::io::Result<()> {
+/// Writes a file only you can read.
+pub(crate) fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
     std::fs::create_dir_all(path.parent().expect("has parent"))?;
-    let body = toml::to_string(file).map_err(std::io::Error::other)?;
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    f.write_all(body.as_bytes())
+    // An existing file keeps its mode through `open`.
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    f.write_all(body)
 }
 
 /// How Darkmatter names itself to servers, e.g. `Darkmatter/0.4.0 (linux)`.
@@ -206,42 +170,25 @@ mod tests {
         }
     }
 
-    fn session() -> Session {
-        Session { server: "https://chat.x".into(), token: "secret-token".into() }
-    }
-
     #[test]
-    fn token_goes_to_keyring_not_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.toml");
-        let store = Mem::default();
-        session().save_to(&path, &store).unwrap();
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("secret-token"));
-        assert_eq!(Session::load_from(&path, &store), Some(session()));
-        Session::clear_at(&path, &store);
-        assert!(!path.exists() && store.get("https://chat.x").is_none());
-    }
-
-    #[test]
-    fn falls_back_to_private_file_without_keyring() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.toml");
-        let store = Mem(RefCell::default(), true);
-        session().save_to(&path, &store).unwrap();
-        assert!(std::fs::read_to_string(&path).unwrap().contains("secret-token"));
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(Session::load_from(&path, &store), Some(session()));
-    }
-
-    #[test]
-    fn migrates_old_file_token_into_keyring() {
+    fn the_old_file_gives_its_login_up() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.toml");
         std::fs::write(&path, "server = \"https://chat.x\"\ntoken = \"secret-token\"\n").unwrap();
         let store = Mem::default();
-        assert_eq!(Session::load_from(&path, &store), Some(session()));
+        assert_eq!(Session::take_old(&path, &store), Some(("https://chat.x".into(), None)));
         assert_eq!(store.get("https://chat.x").as_deref(), Some("secret-token"));
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("secret-token"));
+        // Without a keyring the token comes back to be kept in a file.
+        let none = Mem(RefCell::default(), true);
+        assert_eq!(Session::take_old(&path, &none), Some(("https://chat.x".into(), Some("secret-token".into()))));
+    }
+
+    #[test]
+    fn private_files_are_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a/f.toml");
+        write_private(&path, b"x").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

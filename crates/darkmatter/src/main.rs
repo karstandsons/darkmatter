@@ -1,4 +1,5 @@
 mod account;
+mod accounts;
 mod animated;
 mod app;
 mod chat;
