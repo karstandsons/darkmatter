@@ -463,6 +463,7 @@ impl Chat {
             .push(item("Keyboard shortcuts".into(), C::Shortcuts, None))
             .push(item(format!("About Darkmatter {}", env!("CARGO_PKG_VERSION")), C::About, None))
             .push(rule::horizontal(1))
+            .push(item("Add a server…".into(), C::AddServer, None))
             .push(item("Log out".into(), C::Logout, None));
         let panel = container(col).padding(6).width(280).style(move |_: &Theme| container::Style {
             background: Some(iced::Background::Color(c.sidebar)),
@@ -1217,7 +1218,7 @@ pub(crate) fn composer_binding(kp: text_editor::KeyPress, menu: bool, empty: boo
         Key::Named(Named::Tab | Named::PageUp | Named::PageDown) => to_app(&kp),
         Key::Named(Named::ArrowUp | Named::ArrowDown) if menu && m.is_empty() => to_app(&kp),
         Key::Named(Named::ArrowUp) if empty && m.is_empty() => to_app(&kp),
-        _ if crate::commands::for_key(&kp.key, m).is_some() => to_app(&kp),
+        _ if crate::commands::for_key(&kp.key, m).is_some() || crate::commands::server_number(&kp.key, m).is_some() => to_app(&kp),
         _ => Binding::from_key_press(kp),
     }
 }

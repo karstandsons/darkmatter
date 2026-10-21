@@ -13,6 +13,7 @@ mod lightbox;
 mod media;
 mod outbox;
 mod pane;
+mod rail;
 mod panels;
 mod plugin_picker;
 mod plugin_manager;

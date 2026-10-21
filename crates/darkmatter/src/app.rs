@@ -37,6 +37,9 @@ pub struct App {
     accounts: Accounts,
     /// Signed in from `MM_URL` and `MM_TOKEN`: nothing is saved.
     ephemeral: bool,
+    next_key: u64,
+    /// The rail's menu for one account.
+    rail_menu: Option<crate::rail::Menu>,
     /// Installed plugins, for every account.
     plugins: std::sync::Arc<crate::plugins::Plugins>,
     /// A newer release, found by the update check, and installing it.
@@ -89,6 +92,8 @@ struct LoginForm {
     focused: LoginField,
     busy: bool,
     error: Option<String>,
+    /// Adding a server: the account to go back to on Cancel.
+    back: Option<u64>,
 }
 
 
@@ -120,6 +125,8 @@ pub enum Message {
     Account(account::Msg),
     /// The report-or-block dialog.
     Report(report::Msg),
+    /// The server rail and its menu.
+    Rail(crate::rail::Msg),
     Login(LoginField, String),
     /// Enter in a login field: next field, or sign in from the last one.
     LoginNext(LoginField),
@@ -370,9 +377,11 @@ impl App {
             colors: Colors::from_palette(&fallback.palette),
             iced_theme: Theme::Dark,
             theme: fallback,
+            next_key: servers.len() as u64,
             servers,
             active,
             target: None,
+            rail_menu: None,
             accounts,
             ephemeral: from_env.is_some(),
             plugins,
@@ -487,6 +496,243 @@ impl App {
                 Err(e) => (true, e),
             });
         }
+    }
+
+    /// Puts an account on screen.
+    fn show(&mut self, i: usize) -> Task<Message> {
+        if i >= self.servers.len() || i == self.active {
+            return Task::none();
+        }
+        if let Screen::Chat(chat) = &mut self.servers[self.active].screen {
+            chat.shown = false;
+        }
+        self.active = i;
+        // The windows act on the account they were opened for.
+        self.account = None;
+        self.report = None;
+        self.plugin_manager = None;
+        self.rail_menu = None;
+        self.save_accounts();
+        let key = self.servers[i].key;
+        match &mut self.servers[i].screen {
+            Screen::Chat(chat) => {
+                let seen = chat.brought_back().map(move |m| m.to(key));
+                Task::batch([seen, Task::done(Message::FocusComposer.to(key))])
+            }
+            Screen::Login(_) => operation::focus(LOGIN_FIRST),
+            Screen::Loading => Task::none(),
+        }
+    }
+
+    /// Steps along the rail (wrapping) to the next account that `wanted`.
+    fn step(&mut self, by: isize, wanted: impl Fn(&Server) -> bool) -> Task<Message> {
+        let n = self.servers.len() as isize;
+        let found = (1..n).map(|d| (self.active as isize + d * by).rem_euclid(n) as usize).find(|&i| wanted(&self.servers[i]));
+        match found {
+            Some(i) => self.show(i),
+            None => Task::none(),
+        }
+    }
+
+    /// Signs in to another server, in place of the one shown.
+    fn add_server(&mut self) -> Task<Message> {
+        // Already adding one: back to it.
+        if let Some(i) = self.servers.iter().position(|s| matches!(&s.screen, Screen::Login(f) if f.back.is_some())) {
+            return self.show(i);
+        }
+        let back = Some(self.servers[self.active].key);
+        let key = self.next_key;
+        self.next_key += 1;
+        let screen = Screen::Login(LoginForm { back, ..Default::default() });
+        self.servers.push(Server { key, id: crate::accounts::new_id(), screen });
+        self.show(self.servers.len() - 1)
+    }
+
+    /// Takes an account off the rail, signing out of it, and with
+    /// `delete_data` what it keeps on this computer too.
+    fn remove_server(&mut self, i: usize, delete_data: bool) -> Task<Message> {
+        let server = self.servers.remove(i);
+        let mut tasks = Vec::new();
+        if let Screen::Chat(chat) = &server.screen {
+            let mut client = chat.client.clone();
+            tasks.push(Task::future(async move { client.logout().await }).discard());
+        }
+        if let Some(a) = self.accounts.get(&server.id).cloned()
+            && !self.ephemeral
+        {
+            self.accounts.signed_out(&a.id, &Keyring);
+            self.accounts.list.retain(|x| x.id != a.id);
+            if delete_data {
+                if !a.user.is_empty() {
+                    crate::vault::delete_account(&a.server, &a.user);
+                }
+                crate::layout::forget(&a.server);
+                if let Some(dir) = dirs::cache_dir().map(|d| d.join("darkmatter/accounts").join(&a.id)) {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        }
+        if self.servers.is_empty() {
+            let key = self.next_key;
+            self.next_key += 1;
+            self.servers.push(Server { key, id: crate::accounts::new_id(), screen: Screen::Login(LoginForm::default()) });
+        }
+        if self.active > i || self.active >= self.servers.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        self.save_accounts();
+        self.rail_menu = None;
+        tasks.push(match &self.servers[self.active].screen {
+            Screen::Chat(_) => Task::done(Message::FocusComposer.to(self.servers[self.active].key)),
+            Screen::Login(_) => operation::focus(LOGIN_FIRST),
+            Screen::Loading => Task::none(),
+        });
+        Task::batch(tasks)
+    }
+
+    /// Rail messages, and keys while its menu is open.
+    fn update_rail(&mut self, message: Message) -> ControlFlow<Task<Message>, Message> {
+        use crate::rail::{Menu, Msg};
+        let msg = match message {
+            Message::Rail(m) => m,
+            Message::Escape if self.rail_menu.is_some() => Msg::Menu(None),
+            Message::Key(_) if self.rail_menu.is_some() => return ControlFlow::Break(Task::none()),
+            Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. })
+                if let Some(n) = crate::commands::server_number(&key, modifiers) =>
+            {
+                return ControlFlow::Break(self.show(n - 1));
+            }
+            other => return ControlFlow::Continue(other),
+        };
+        let at = |app: &App, key: u64| app.servers.iter().position(|s| s.key == key);
+        let menu_at = self.rail_menu.as_ref().and_then(|m| at(self, m.key));
+        let task = match msg {
+            Msg::Show(key) => match at(self, key) {
+                Some(i) => self.show(i),
+                None => Task::none(),
+            },
+            Msg::Add => self.add_server(),
+            Msg::Cancel => {
+                let i = self.cur();
+                let Screen::Login(LoginForm { back: Some(back), .. }) = &self.servers[i].screen else { return ControlFlow::Break(Task::none()) };
+                let back = *back;
+                self.servers.remove(i);
+                self.active = at(self, back).unwrap_or(0);
+                self.save_accounts();
+                match &self.servers[self.active].screen {
+                    Screen::Chat(_) => Task::done(Message::FocusComposer.to(back)),
+                    _ => operation::focus(LOGIN_FIRST),
+                }
+            }
+            Msg::Menu(None) => {
+                self.rail_menu = None;
+                Task::none()
+            }
+            Msg::Menu(Some(key)) => {
+                let name = at(self, key).and_then(|i| self.accounts.get(&self.servers[i].id)).map(|a| a.name.clone()).unwrap_or_default();
+                self.rail_menu = Some(Menu { key, name, removing: false, delete_data: true });
+                Task::none()
+            }
+            Msg::Name(name) => {
+                if let Some(m) = &mut self.rail_menu {
+                    m.name = name;
+                }
+                Task::none()
+            }
+            Msg::Rename | Msg::Mute => {
+                let (Some(i), Some(m)) = (menu_at, &self.rail_menu) else { return ControlFlow::Break(Task::none()) };
+                let name = m.name.trim().to_string();
+                let rename = matches!(msg, Msg::Rename);
+                if let Some(a) = self.accounts.list.iter_mut().find(|a| a.id == self.servers[i].id) {
+                    if rename {
+                        a.name = name;
+                    } else {
+                        a.muted = !a.muted;
+                    }
+                }
+                if rename {
+                    self.rail_menu = None;
+                }
+                self.save_accounts();
+                Task::none()
+            }
+            Msg::Move(by) => {
+                let Some(i) = menu_at else { return ControlFlow::Break(Task::none()) };
+                let j = i as isize + by;
+                if (0..self.servers.len() as isize).contains(&j) {
+                    let j = j as usize;
+                    self.servers.swap(i, j);
+                    if self.active == i {
+                        self.active = j;
+                    } else if self.active == j {
+                        self.active = i;
+                    }
+                    self.save_accounts();
+                }
+                Task::none()
+            }
+            Msg::SignOut => {
+                let Some(m) = self.rail_menu.take() else { return ControlFlow::Break(Task::none()) };
+                Task::done(Message::Logout.to(m.key))
+            }
+            Msg::Remove => {
+                let Some(m) = &mut self.rail_menu else { return ControlFlow::Break(Task::none()) };
+                if !m.removing {
+                    m.removing = true;
+                    return ControlFlow::Break(Task::none());
+                }
+                let delete = m.delete_data;
+                match menu_at {
+                    Some(i) => self.remove_server(i, delete),
+                    None => Task::none(),
+                }
+            }
+            Msg::DeleteData(on) => {
+                if let Some(m) = &mut self.rail_menu {
+                    m.delete_data = on;
+                }
+                Task::none()
+            }
+        };
+        ControlFlow::Break(task)
+    }
+
+    /// The rail's icons.
+    fn rail_entries(&self) -> Vec<crate::rail::Entry> {
+        use crate::rail::{Entry, State};
+        self.servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let saved = self.accounts.get(&s.id);
+                let (state, mentions, unread, encrypted) = match &s.screen {
+                    Screen::Loading => (State::Connecting, 0, false, false),
+                    Screen::Login(form) if form.back.is_some() => (State::New, 0, false, false),
+                    Screen::Login(_) => (State::SignedOut, 0, false, false),
+                    Screen::Chat(chat) => {
+                        let counts: Vec<_> = chat.store.channels.keys().map(|id| chat.store.unread(id)).collect();
+                        (
+                            if chat.online { State::Online } else { State::Offline },
+                            counts.iter().map(|u| u.mentions).sum(),
+                            counts.iter().any(|u| u.has_unread),
+                            chat.axiond.as_ref().is_some_and(|a| a.enabled),
+                        )
+                    }
+                };
+                Entry {
+                    key: s.key,
+                    id: s.id.clone(),
+                    label: saved.map_or_else(|| "New server".into(), Saved::label),
+                    initials: saved.map_or_else(|| "+".into(), Saved::initials),
+                    shown: i == self.active,
+                    state,
+                    mentions,
+                    unread,
+                    encrypted,
+                    muted: saved.is_some_and(|a| a.muted),
+                }
+            })
+            .collect()
     }
 
     /// Plugins-window messages, and keys while it's open.
@@ -835,6 +1081,10 @@ impl App {
                 _ => {}
             }
         }
+        let message = match self.update_rail(message) {
+            ControlFlow::Break(task) => return task,
+            ControlFlow::Continue(message) => message,
+        };
         let message = match self.update_plugin_manager(message) {
             ControlFlow::Break(task) => return task,
             ControlFlow::Continue(message) => message,
@@ -883,7 +1133,7 @@ impl App {
                     && command != C::Leave
                 {
                     chat.menu = false;
-                    refocus = !matches!(command, C::QuickSwitcher | C::Search | C::Shortcuts | C::Themes | C::Plugins | C::Account | C::Logout);
+                    refocus = !matches!(command, C::QuickSwitcher | C::Search | C::Shortcuts | C::Themes | C::Plugins | C::Account | C::Logout | C::AddServer | C::Server | C::NextServer | C::PrevServer | C::MentionServer);
                 }
                 let task = self.run(command, arg);
                 if refocus { Task::batch([task, Task::done(Message::FocusComposer)]) } else { task }
@@ -916,6 +1166,26 @@ impl App {
                 let server = self.accounts.get(&self.servers[i].id).map(|a| a.server.clone()).unwrap_or_default();
                 self.servers[i].screen = Screen::Login(LoginForm { server, error: Some(e), ..LoginForm::with_server() });
                 if i == self.active { operation::focus(LOGIN_FIRST) } else { Task::none() }
+            }
+            Message::LoginSubmit => {
+                // One account per server: signing in again goes to it.
+                let i = self.cur();
+                let Screen::Login(form) = &self.servers[i].screen else { return Task::none() };
+                let url = fmt::server_url(&form.server);
+                let other = self.servers.iter().enumerate().find(|(j, s)| *j != i && self.accounts.get(&s.id).is_some_and(|a| a.server == url)).map(|(j, _)| j);
+                match other {
+                    Some(j) => {
+                        let label = self.accounts.get(&self.servers[j].id).map(Saved::label).unwrap_or_default();
+                        if let Screen::Login(form) = self.screen() {
+                            form.error = Some(format!("You're already signed in to {label}: it's on the rail."));
+                        }
+                        Task::none()
+                    }
+                    None => match self.screen() {
+                        Screen::Login(form) => form.update(Message::LoginSubmit),
+                        _ => Task::none(),
+                    },
+                }
             }
             Message::LoggedIn(Ok((session, _))) => {
                 let i = self.cur();
@@ -980,6 +1250,20 @@ impl App {
                 }
             }
             Message::Bootstrapped(Err(e)) => self.handle(Message::SessionFailed(e)),
+            Message::Bootstrapped(Ok(b)) if !self.ephemeral && self.accounts.get(&b.account).is_some_and(|a| a.user.is_empty()) => {
+                // Signed in for the first time: remember who (it finds the
+                // vault), and the server's own name for the rail.
+                if let Some(a) = self.accounts.list.iter_mut().find(|a| a.id == b.account) {
+                    a.user = b.me.id.clone();
+                    if a.name.is_empty()
+                        && let Some(site) = b.server_config.get("SiteName").filter(|n| !n.trim().is_empty() && *n != "Mattermost")
+                    {
+                        a.name = site.trim().to_string();
+                    }
+                }
+                self.save_accounts();
+                self.handle(Message::Bootstrapped(Ok(b)))
+            }
             Message::Bootstrapped(Ok(b)) => match self.screen() {
                 // A resync after lost events: refresh in place, keep the selection.
                 Screen::Chat(chat) => {
@@ -999,7 +1283,6 @@ impl App {
             Message::Login(..)
             | Message::LoginNext(_)
             | Message::LoginTab(_)
-            | Message::LoginSubmit
             | Message::LoginInvite(_)
             | Message::LoggedIn(_) => {
                 let Screen::Login(form) = self.screen() else { return Task::none() };
@@ -1076,6 +1359,48 @@ impl App {
                 }
                 Task::none()
             }
+            C::NextServer => self.step(1, |_| true),
+            C::PrevServer => self.step(-1, |_| true),
+            C::MentionServer => self.step(1, |s| match &s.screen {
+                Screen::Chat(chat) => chat.store.channels.keys().any(|id| chat.store.unread(id).mentions > 0),
+                _ => false,
+            }),
+            C::AddServer => self.add_server(),
+            C::Server if !arg.is_empty() => {
+                let best = self
+                    .servers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| {
+                        let a = self.accounts.get(&s.id)?;
+                        crate::switcher::score(&arg, &a.label()).or_else(|| crate::switcher::score(&arg, &a.server)).map(|score| (score, i))
+                    })
+                    .max_by_key(|(score, _)| *score);
+                match best {
+                    Some((_, i)) => self.show(i),
+                    None => match self.chat() {
+                        Some(chat) => chat.notify(format!("No server called {arg}")),
+                        None => Task::none(),
+                    },
+                }
+            }
+            C::Server => {
+                let list: Vec<String> = self
+                    .servers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let label = self.accounts.get(&s.id).map_or_else(|| "New server".into(), Saved::label);
+                        let here = if i == self.active { " (here)" } else { "" };
+                        format!("{}. {label}{here}", i + 1)
+                    })
+                    .collect();
+                let note = format!("Servers: {}. /server <name> switches, /server add adds one.", list.join(", "));
+                match self.chat() {
+                    Some(chat) => chat.notify(note),
+                    None => Task::none(),
+                }
+            }
             C::About => self.handle(Message::Link(format!("https://github.com/karstandsons/darkmatter/releases/tag/v{}", env!("CARGO_PKG_VERSION")))),
             C::Logout => self.handle(Message::Logout),
             _ => match self.chat() {
@@ -1094,6 +1419,7 @@ impl App {
         chat.plugins = self.plugins.clone();
         chat.new_release = self.new_release.clone();
         chat.updating = self.updating.clone();
+        chat.shown = self.cur() == self.active;
         let task = Task::batch([task, chat.open_panes()]);
         *self.screen() = Screen::Chat(Box::new(chat));
         task
@@ -1154,6 +1480,16 @@ impl App {
             Screen::Chat(chat) => chat.view(c, &self.iced_theme),
         };
         let body = body.map(move |m| m.to(key));
+        // The rail, once there's more than one server.
+        let entries = (self.servers.len() > 1).then(|| self.rail_entries());
+        let menu_entry = self.rail_menu.as_ref().zip(entries.as_ref()).and_then(|(m, entries)| {
+            let at = entries.iter().position(|e| e.key == m.key)?;
+            Some((m, at, entries[at].clone()))
+        });
+        let body: Element<'_, Message> = match entries {
+            Some(entries) => iced::widget::row![crate::rail::view(entries, self.rail_menu.is_some(), c), body].into(),
+            None => body,
+        };
         // Always a stack, so opening or closing the picker keeps the state
         // (and focus) of the widgets under it.
         let mut body = iced::widget::stack![body];
@@ -1169,6 +1505,9 @@ impl App {
         }
         if let Some(r) = &self.report {
             body = body.push(r.view(c));
+        }
+        if let Some((m, at, entry)) = menu_entry {
+            body = body.push(crate::rail::menu(m, at, entry, c));
         }
         container(body).width(Length::Fill).height(Length::Fill).style(c.panel(c.bg)).into()
     }
@@ -1311,7 +1650,8 @@ impl LoginForm {
                 let fields = self.fields();
                 match fields.iter().position(|f| *f == field) {
                     Some(i) if i + 1 < fields.len() => self.focus(fields[i + 1]),
-                    _ => self.update(Message::LoginSubmit),
+                    // Through the app, which checks for the server first.
+                    _ => Task::done(Message::LoginSubmit),
                 }
             }
             Message::LoginTab(step) => {
@@ -1444,7 +1784,13 @@ impl LoginForm {
             .padding([2, 0])
             .on_press(Message::LoginInvite(!self.signing_up))
             .style(c.link_button());
-        center(form.push(submit).push(switch)).into()
+        let mut form = form.push(submit).push(switch);
+        if self.back.is_some() {
+            form = form.push(
+                button(text("Cancel").size(13).color(c.muted)).padding([2, 0]).on_press(Message::Rail(crate::rail::Msg::Cancel)).style(c.link_button()),
+            );
+        }
+        center(form).into()
     }
 }
 
@@ -1479,9 +1825,11 @@ mod tests {
             colors: Colors::from_palette(&fallback.palette),
             iced_theme: Theme::Dark,
             theme: fallback,
+            next_key: servers.len() as u64,
             servers,
             active: 0,
             target: None,
+            rail_menu: None,
             accounts: Accounts::default(),
             ephemeral: true,
             plugins: Default::default(),
@@ -1518,5 +1866,91 @@ mod tests {
         assert_eq!((draft(&app, 0), draft(&app, 1)), (Some("shown"), Some("background")));
         // A message tagged twice keeps its first account.
         assert!(matches!(Message::Tick.to(1).to(0), Message::For(1, _)));
+    }
+
+    fn three() -> App {
+        app(vec![crate::chat::tests::chat(), crate::chat::tests::chat(), crate::chat::tests::chat()])
+    }
+
+    fn ctrl(digit: &str) -> Message {
+        Message::Key(keyboard::Event::KeyPressed {
+            key: Key::Character(digit.into()),
+            modified_key: Key::Character(digit.into()),
+            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    #[test]
+    fn the_rail_switches_servers() {
+        let mut app = three();
+        let _ = app.update(ctrl("3"));
+        assert_eq!(app.active, 2);
+        let _ = app.update(ctrl("9"));
+        assert_eq!(app.active, 2, "there's no ninth");
+        let _ = app.update(Message::Run(crate::commands::Command::NextServer, String::new()));
+        assert_eq!(app.active, 0, "wraps around");
+        let _ = app.update(Message::Run(crate::commands::Command::PrevServer, String::new()));
+        assert_eq!(app.active, 2);
+        // Typing goes to the one shown now.
+        let _ = app.update(Message::Draft("here".into()));
+        assert_eq!((draft(&app, 0), draft(&app, 2)), (None, Some("here")));
+    }
+
+    #[test]
+    fn adding_a_server_can_be_cancelled() {
+        let mut app = three();
+        let _ = app.update(ctrl("2"));
+        let _ = app.update(Message::Rail(crate::rail::Msg::Add));
+        assert_eq!((app.servers.len(), app.active), (4, 3));
+        assert!(matches!(app.servers[3].screen, Screen::Login(_)));
+        // Adding again while adding goes back to the one being added.
+        let _ = app.update(ctrl("1"));
+        let _ = app.update(Message::Run(crate::commands::Command::AddServer, String::new()));
+        assert_eq!((app.servers.len(), app.active), (4, 3));
+        let _ = app.update(Message::Rail(crate::rail::Msg::Cancel));
+        assert_eq!((app.servers.len(), app.active), (3, 1), "back where it was added from");
+    }
+
+    #[test]
+    fn removing_a_server_keeps_your_place() {
+        let mut app = three();
+        let keys: Vec<u64> = app.servers.iter().map(|s| s.key).collect();
+        let _ = app.update(ctrl("3"));
+        // Remove the first: the one shown stays shown.
+        let _ = app.update(Message::Rail(crate::rail::Msg::Menu(Some(keys[0]))));
+        let _ = app.update(Message::Rail(crate::rail::Msg::Remove));
+        assert_eq!(app.servers.len(), 3, "the first press asks");
+        let _ = app.update(Message::Rail(crate::rail::Msg::Remove));
+        assert_eq!(app.servers.iter().map(|s| s.key).collect::<Vec<_>>(), [keys[1], keys[2]]);
+        assert_eq!(app.servers[app.active].key, keys[2]);
+        // Remove the one shown: the one before it.
+        let _ = app.update(Message::Rail(crate::rail::Msg::Menu(Some(keys[2]))));
+        let _ = app.update(Message::Rail(crate::rail::Msg::Remove));
+        let _ = app.update(Message::Rail(crate::rail::Msg::Remove));
+        assert_eq!(app.servers[app.active].key, keys[1]);
+        // Remove the last: signing in again.
+        let _ = app.update(Message::Rail(crate::rail::Msg::Menu(Some(keys[1]))));
+        let _ = app.update(Message::Rail(crate::rail::Msg::Remove));
+        let _ = app.update(Message::Rail(crate::rail::Msg::Remove));
+        assert_eq!(app.servers.len(), 1);
+        assert!(matches!(app.servers[0].screen, Screen::Login(_)));
+        // A message for a removed account goes nowhere.
+        let _ = app.update(Message::For(keys[0], Box::new(Message::Draft("lost".into()))));
+    }
+
+    #[test]
+    fn moving_on_the_rail_keeps_the_one_shown() {
+        let mut app = three();
+        let keys: Vec<u64> = app.servers.iter().map(|s| s.key).collect();
+        let _ = app.update(Message::Rail(crate::rail::Msg::Menu(Some(keys[0]))));
+        let _ = app.update(Message::Rail(crate::rail::Msg::Move(1)));
+        let _ = app.update(Message::Rail(crate::rail::Msg::Move(1)));
+        let _ = app.update(Message::Rail(crate::rail::Msg::Move(1)));
+        assert_eq!(app.servers.iter().map(|s| s.key).collect::<Vec<_>>(), [keys[1], keys[2], keys[0]]);
+        assert_eq!(app.servers[app.active].key, keys[0]);
     }
 }

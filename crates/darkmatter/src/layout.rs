@@ -108,6 +108,17 @@ pub fn save(server: &str, layout: &Saved) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| e.to_string())
 }
 
+/// Forgets a server's layout (its account was removed).
+pub fn forget(server: &str) {
+    let Some(path) = path() else { return };
+    let mut file = read();
+    if file.servers.remove(server).is_some()
+        && let Ok(text) = toml::to_string(&file)
+    {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

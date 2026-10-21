@@ -13,6 +13,12 @@ pub enum Command {
     Threads,
     PrevChannel,
     NextChannel,
+    /// Servers, on the rail.
+    PrevServer,
+    NextServer,
+    MentionServer,
+    Server,
+    AddServer,
     SplitRight,
     SplitDown,
     ClosePane,
@@ -116,6 +122,11 @@ pub const ALL: &[Spec] = &[
     spec(C::Threads, "Followed threads", Group::Go, &[], &["threads"], ""),
     spec(C::PrevChannel, "Previous channel", Group::Go, &[alt("ArrowUp")], &[], ""),
     spec(C::NextChannel, "Next channel", Group::Go, &[alt("ArrowDown")], &[], ""),
+    spec(C::PrevServer, "Previous server", Group::Go, &[ctrl_shift("Tab")], &[], ""),
+    spec(C::NextServer, "Next server", Group::Go, &[ctrl("Tab")], &[], ""),
+    spec(C::MentionServer, "Next server with mentions", Group::Go, &[ctrl_alt("a")], &[], ""),
+    spec(C::Server, "Go to a server", Group::Go, &[], &["server"], "[name]"),
+    spec(C::AddServer, "Add a server", Group::Go, &[], &["server add"], ""),
     spec(C::SplitRight, "Split right", Group::View, &[ctrl("d")], &["split", "split right"], ""),
     spec(C::SplitDown, "Split down", Group::View, &[ctrl_shift("d")], &["split down"], ""),
     spec(C::ClosePane, "Close pane", Group::View, &[ctrl("w")], &["close"], ""),
@@ -147,6 +158,7 @@ pub const NOTES: &[(Group, &str, &str)] = &[
     (Group::Messages, "Enter / Shift+Enter", "Send / new line"),
     (Group::Messages, "/ at the start", "Slash commands (Tab completes)"),
     (Group::Go, "PageUp / PageDown", "Scroll the messages"),
+    (Group::Go, SERVER_KEYS, "The 1st…9th server on the rail"),
     (Group::Go, "Esc", "Close what's open, then select messages"),
 ];
 
@@ -190,6 +202,7 @@ impl Chord {
             "ArrowDown" => "↓".to_string(),
             "ArrowLeft" => "←".to_string(),
             "ArrowRight" => "→".to_string(),
+            "Tab" => "Tab".to_string(),
             k => k.to_uppercase(),
         };
         if cfg!(target_os = "macos") {
@@ -227,8 +240,28 @@ fn named_str(named: Named) -> Option<&'static str> {
         Named::ArrowDown => "ArrowDown",
         Named::ArrowLeft => "ArrowLeft",
         Named::ArrowRight => "ArrowRight",
+        Named::Tab => "Tab",
         _ => return None,
     })
+}
+
+#[cfg(target_os = "macos")]
+const SERVER_KEYS: &str = "⌘1…9";
+#[cfg(not(target_os = "macos"))]
+const SERVER_KEYS: &str = "Ctrl+1…9";
+
+/// Ctrl+1…9 (⌘ on macOS): the nth server on the rail.
+pub fn server_number(key: &Key, modifiers: keyboard::Modifiers) -> Option<usize> {
+    let Key::Character(k) = key else { return None };
+    if !modifiers.command() || modifiers.shift() || modifiers.alt() {
+        return None;
+    }
+    k.parse::<usize>().ok().filter(|n| (1..=9).contains(n))
+}
+
+/// "Ctrl+3", or "⌘3" on macOS.
+pub fn server_key_label(n: usize) -> String {
+    if cfg!(target_os = "macos") { format!("⌘{n}") } else { format!("Ctrl+{n}") }
 }
 
 /// The command bound to this key press, if any.

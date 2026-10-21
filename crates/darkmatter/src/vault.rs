@@ -145,6 +145,18 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::io::Write::write_all(&mut options.open(path)?, bytes)
 }
 
+/// Deletes an account's vault and its key, for good (the account was
+/// removed). Anything still holding it open writes into an unlinked file.
+pub fn delete_account(server: &str, user_id: &str) {
+    let Some(path) = path_for(server, user_id) else { return };
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &format!("{server}|{user_id}")) {
+        let _ = entry.delete_credential();
+    }
+    for ext in ["db", "db-wal", "db-shm", "key"] {
+        let _ = std::fs::remove_file(path.with_extension(ext));
+    }
+}
+
 impl Vault {
     /// Opens (or makes) the vault for an account on a server.
     pub async fn open_account(server: &str, user_id: &str) -> Result<Vault, String> {

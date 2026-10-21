@@ -16,6 +16,9 @@ pub struct Saved {
     /// account's files, so the server's URL can change.
     pub id: String,
     pub server: String,
+    /// Your user id there, once signed in: its vault is found by it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub user: String,
     /// What the rail calls it; the server's address when empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
@@ -29,6 +32,28 @@ pub struct Saved {
 impl Saved {
     pub fn new(server: &str) -> Self {
         Saved { id: new_id(), server: server.into(), ..Default::default() }
+    }
+
+    /// Two letters for the rail: from its name, or from its address
+    /// ("chat.example.com" is "EX").
+    pub fn initials(&self) -> String {
+        let letters = |w: &str, n| w.chars().filter(|c| c.is_alphanumeric()).take(n).collect::<String>();
+        let two = if self.name.is_empty() {
+            let label = self.label();
+            let host = label.split(':').next().unwrap_or_default();
+            let mut parts: Vec<&str> = host.split('.').collect();
+            if parts.len() > 2 && ["chat", "www", "mm", "mattermost", "app"].contains(&parts[0]) {
+                parts.remove(0);
+            }
+            letters(parts[0], 2)
+        } else {
+            match self.name.split_whitespace().collect::<Vec<_>>().as_slice() {
+                [one] => letters(one, 2),
+                [a, b, ..] => letters(a, 1) + &letters(b, 1),
+                [] => String::new(),
+            }
+        };
+        two.to_uppercase()
     }
 
     /// The name to show: its own, or the server's host.
@@ -214,8 +239,12 @@ mod tests {
     #[test]
     fn labels() {
         let mut a = Saved::new("https://chat.example.com/");
-        assert_eq!(a.label(), "chat.example.com");
+        assert_eq!((a.label().as_str(), a.initials().as_str()), ("chat.example.com", "EX"));
+        assert_eq!(Saved::new("http://127.0.0.1:8068").initials(), "12");
+        assert_eq!(Saved::new("https://localhost:8065").initials(), "LO");
         a.name = "Work".into();
-        assert_eq!(a.label(), "Work");
+        assert_eq!((a.label().as_str(), a.initials().as_str()), ("Work", "WO"));
+        a.name = "the family".into();
+        assert_eq!(a.initials(), "TF");
     }
 }

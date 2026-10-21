@@ -161,6 +161,8 @@ pub struct Chat {
     pub session: Session,
     /// The account's id (`accounts.toml`).
     pub account: String,
+    /// On screen: another account's isn't, so its messages stay unread.
+    pub shown: bool,
     pub client: Client,
     pub store: Store,
     pub team: String,
@@ -313,7 +315,34 @@ impl Chat {
 
     /// Whether any pane shows `channel`.
     pub fn showing(&self, channel: &str) -> bool {
-        self.panes.iter().any(|(_, p)| p.channel == channel)
+        self.shown && self.panes.iter().any(|(_, p)| p.channel == channel)
+    }
+
+    /// Back on screen: what came to its open channels meanwhile is seen now,
+    /// with the "New messages" line above it.
+    pub fn brought_back(&mut self) -> Task<Message> {
+        self.shown = true;
+        let mut open: Vec<String> = self.panes.iter().map(|(_, p)| p.channel.clone()).filter(|c| !c.is_empty()).collect();
+        open.sort();
+        open.dedup();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut views = Vec::new();
+        for id in open {
+            let unread = self.store.unread(&id);
+            if !unread.has_unread && unread.mentions == 0 {
+                continue;
+            }
+            if let Some(m) = self.store.members.get_mut(&id) {
+                self.viewed_before.insert(id.clone(), m.last_viewed_at);
+                m.last_viewed_at = now;
+            }
+            self.store.mark_viewed(&id);
+            if !self.client.is_read_only() && !self.marked_unread.contains(&id) {
+                let client = self.client.clone();
+                views.push(Task::future(async move { client.view_channel(&id, None).await }).discard());
+            }
+        }
+        Task::batch(views)
     }
 
     /// The pane with keyboard focus.
@@ -551,6 +580,7 @@ impl Chat {
         let chat = Chat {
             session: b.session,
             account: b.account,
+            shown: true,
             client,
             store,
             team,
@@ -842,6 +872,8 @@ impl Chat {
             }
             // The app's: they change its config.
             C::Themes | C::Plugins | C::Account | C::ThreadLayout | C::Logout | C::ToggleDensity | C::Compact | C::Cozy | C::ToggleSidebar | C::About => Task::none(),
+            // The app's: they're about servers.
+            C::PrevServer | C::NextServer | C::MentionServer | C::Server | C::AddServer => Task::none(),
         }
     }
 
@@ -1268,16 +1300,22 @@ impl Chat {
         self.pv_mut().hold_top = None;
         let prev = std::mem::replace(&mut self.pv_mut().channel, id.clone());
         self.marked_unread.remove(&id);
-        if let Some(m) = self.store.members.get_mut(&id) {
+        // An account not on screen opens its channels unread; they're read
+        // when it's shown (`brought_back`).
+        if self.shown
+            && let Some(m) = self.store.members.get_mut(&id)
+        {
             // Unread posts are the ones after this; remember it before marking read.
             self.viewed_before.insert(id.clone(), m.last_viewed_at);
             m.last_viewed_at = chrono::Utc::now().timestamp_millis();
         }
-        self.store.mark_viewed(&id);
+        if self.shown {
+            self.store.mark_viewed(&id);
+        }
         let group = self.refresh_group(&id);
         let client = self.client.clone();
         // Marking a channel read is a write; read-only mode skips it quietly.
-        let view = if client.is_read_only() {
+        let view = if client.is_read_only() || !self.shown {
             Task::none()
         } else {
             let id = id.clone();
@@ -2963,6 +3001,18 @@ pub(crate) mod tests {
         let (mut chat, _) = Chat::start(b).unwrap();
         chat.pv_mut().channel = "c1".into();
         chat
+    }
+
+    #[test]
+    fn an_account_not_on_screen_keeps_its_messages_unread() {
+        use mm_api::ws::{Event, Message as M};
+        let mut chat = chat();
+        chat.shown = false;
+        let post = Post { id: "p1".into(), channel_id: "c1".into(), user_id: "bob".into(), message: "hi".into(), create_at: 5, ..Default::default() };
+        let _ = chat.handle(Message::Ws(M::Event(Event::Posted { post: Box::new(post), team_id: String::new(), mentions: vec![] })));
+        assert!(chat.store.unread("c1").has_unread, "its open channel isn't being looked at");
+        let _ = chat.brought_back();
+        assert!(!chat.store.unread("c1").has_unread, "seen once it's shown");
     }
 
     /// Draws the chat offscreen after each keystroke, as the app would
