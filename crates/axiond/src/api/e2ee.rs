@@ -42,8 +42,24 @@ fn refused(e: dm_crypto::Error) -> Error {
 
 /// Which device the signed-in session is: Darkmatter asks rather than
 /// naming one at login, which Mattermost would take for a push address.
-pub async fn my_device(me: Me) -> Json<Value> {
-    Json(json!({ "user_id": me.user_id, "device_id": me.device_id }))
+pub async fn my_device(State(app): State<App>, me: Me) -> Result<Json<Value>> {
+    let set_up: Option<i64> = sqlx::query_scalar("SELECT 1 FROM e2ee_devices WHERE user_id = ? AND device_id = ?")
+        .bind(&me.user_id)
+        .bind(&me.device_id)
+        .fetch_optional(&app.db)
+        .await?;
+    Ok(Json(json!({ "user_id": me.user_id, "device_id": me.device_id, "set_up": set_up.is_some() })))
+}
+
+/// This session's device lost its keys (its data was wiped, or the app
+/// reinstalled while the session stayed signed in): the old device leaves
+/// every group, and the session goes on as a new device.
+pub async fn renew_device(State(app): State<App>, me: Me) -> Result<Json<Value>> {
+    e2ee::device_gone(&app, &me.user_id, &me.device_id).await?;
+    sqlx::query("DELETE FROM e2ee_links WHERE user_id = ? AND device_id = ?").bind(&me.user_id).bind(&me.device_id).execute(&app.db).await?;
+    let device_id = ids::new_id();
+    sqlx::query("UPDATE sessions SET device_id = ? WHERE id = ?").bind(&device_id).bind(&me.session_id).execute(&app.db).await?;
+    Ok(Json(json!({ "device_id": device_id })))
 }
 
 #[derive(Deserialize)]

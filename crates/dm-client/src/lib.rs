@@ -182,7 +182,17 @@ pub async fn setup<S: LocalStore>(api: Client, user_id: &str, store: S, info: &A
 /// backup, or a fresh start).
 async fn setup_with<S: LocalStore>(api: Client, user_id: &str, store: S, info: &AxiondInfo, held: Option<UserIdentity>) -> Result<Setup<S>, String> {
     let server = ServerKey { signature_key: B64.decode(&info.external_sender).map_err(|_| "the server's key isn't valid")? };
-    let device_id = api.my_device().await.map_err(s)?;
+    let mut device_id = api.my_device().await.map_err(s)?;
+    let known = store.get(DEVICE_ID).await.and_then(|d| String::from_utf8(d).ok());
+    let key = store.get(DEVICE_KEY).await;
+    // Set up on the server but not here (this device's data was wiped, or
+    // the app reinstalled, while it stayed signed in): its keys are gone, so
+    // the session goes on as a new device.
+    if (known.as_deref() != Some(device_id.as_str()) || key.is_none()) && api.my_device_set_up().await.map_err(s)? {
+        tracing::info!("this device lost its encryption keys; starting it over as a new one");
+        store.clear_device().await;
+        device_id = api.renew_device().await.map_err(s)?;
+    }
     let on_server = api.identity(user_id).await.map_err(s)?;
     let server_identity = B64.decode(&on_server.identity_key).ok().and_then(|k| IdentityKey::from_slice(&k).ok());
 
@@ -207,8 +217,6 @@ async fn setup_with<S: LocalStore>(api: Client, user_id: &str, store: S, info: &
     // Our own key is the first one we trust for ourselves.
     store.remember_identity(user_id, &B64.encode(public.0));
 
-    let known = store.get(DEVICE_ID).await.and_then(|d| String::from_utf8(d).ok());
-    let key = store.get(DEVICE_KEY).await;
     let e2ee = if let (Some(known), Some(key)) = (known, key)
         && known == device_id
     {

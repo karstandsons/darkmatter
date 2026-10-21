@@ -301,6 +301,31 @@ async fn recovering_from_a_backup_and_starting_over() {
     let _ = after;
 }
 
+#[tokio::test]
+async fn a_device_whose_data_was_wiped_while_signed_in() {
+    use dm_client::Recovery;
+    let s = server().await;
+    let (alice_api, laptop) = device(&s, "alice", MemoryStore::default()).await;
+    let (bob_api, bob) = device(&s, "bob", MemoryStore::default()).await;
+    let dm = alice_api.create_direct(&laptop.user_id, &bob.user_id).await.unwrap();
+    let code = laptop.back_up_with_key().await.unwrap();
+    let (phone_api, me, info) = sign_in(&s, "alice").await;
+    let Setup::Ready(phone) = dm_client::recover(phone_api.clone(), &me, MemoryStore::default(), &info, Recovery::Key(&code)).await.unwrap() else { panic!() };
+    let old = phone_api.my_device().await.unwrap();
+    phone.sync(&dm.id).await.unwrap();
+
+    // The phone's app data is wiped; it's still signed in. It starts as a
+    // new device, linked or recovered, and the old one leaves.
+    let wiped = MemoryStore::default();
+    assert!(matches!(dm_client::setup(phone_api.clone(), &me, wiped.clone(), &info).await.unwrap(), Setup::NeedsLink));
+    assert_ne!(phone_api.my_device().await.unwrap(), old);
+    let Setup::Ready(phone) = dm_client::recover(phone_api.clone(), &me, wiped, &info, Recovery::Key(&code)).await.unwrap() else { panic!() };
+    assert_ne!(phone_api.my_device().await.unwrap(), old);
+    phone.sync(&dm.id).await.unwrap();
+    let next = send(&bob_api, &bob, &dm.id, "back?").await;
+    assert_eq!(text(read(&phone, &next).await), "back?");
+}
+
 /// A store that hasn't written anything yet: its writes happen later, in
 /// the background, as Darkmatter's do.
 struct Behind(MemoryStore);

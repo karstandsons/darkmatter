@@ -52,6 +52,7 @@ pub fn router(app: App) -> Router {
         .route("/e2ee/identity", put(e2ee::put_identity))
         .route("/e2ee/users/{id}/identity", get(e2ee::identity))
         .route("/e2ee/device", get(e2ee::my_device))
+        .route("/e2ee/device/renew", post(e2ee::renew_device))
         .route("/e2ee/devices", post(e2ee::publish_device))
         .route("/e2ee/devices/{id}", delete(e2ee::revoke_device))
         .route("/e2ee/links", post(e2ee::request_link).get(e2ee::links))

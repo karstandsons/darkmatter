@@ -417,6 +417,27 @@ impl Client {
         Ok(self.get::<Device>("e2ee/device").await?.device_id)
     }
 
+    /// Whether this session's device is set up for encryption on the server.
+    pub async fn my_device_set_up(&self) -> Result<bool, Error> {
+        #[derive(serde::Deserialize)]
+        struct Device {
+            #[serde(default)]
+            set_up: bool,
+        }
+        Ok(self.get::<Device>("e2ee/device").await?.set_up)
+    }
+
+    /// Starts this session over as a new device, when the old one lost its
+    /// keys; returns the new device id.
+    pub async fn renew_device(&self) -> Result<String, Error> {
+        #[derive(serde::Deserialize)]
+        struct Device {
+            device_id: String,
+        }
+        let device: Device = self.send(Method::POST, "e2ee/device/renew", None::<&()>).await?;
+        Ok(device.device_id)
+    }
+
     /// Publishes your identity key (base64), the first time.
     pub async fn put_identity(&self, identity_key: &str) -> Result<(), Error> {
         self.send_unit(Method::PUT, "e2ee/identity", Some(&json!({ "identity_key": identity_key }))).await
