@@ -140,7 +140,7 @@ pub async fn direct_channel(app: &App, me: &str, other: &str) -> Result<ChannelR
         return Ok(row);
     }
     let (id, now) = (ids::new_id(), ids::now());
-    let mut tx = app.db.begin().await?;
+    let mut tx = crate::db::write(&app.db).await?;
     // Direct messages are always end-to-end encrypted.
     sqlx::query("INSERT INTO channels (id, team_id, type, name, create_at, update_at, creator_id, encrypted) VALUES (?, '', 'D', ?, ?, ?, ?, 1)")
         .bind(&id)

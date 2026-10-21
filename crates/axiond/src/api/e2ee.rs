@@ -401,7 +401,7 @@ pub async fn upload_key_packages(State(app): State<App>, me: Me, Json(body): Jso
         }
         checked.push((bytes, last_resort));
     }
-    let mut tx = app.db.begin().await?;
+    let mut tx = crate::db::write(&app.db).await?;
     let now = ids::now();
     for (bytes, last_resort) in checked {
         if last_resort {
@@ -440,7 +440,7 @@ pub async fn claim_key_packages(State(app): State<App>, me: Me, Json(body): Json
         return Err(Error::bad_request("Too many people at once."));
     }
     let mut out = Vec::new();
-    let mut tx = app.db.begin().await?;
+    let mut tx = crate::db::write(&app.db).await?;
     for user in &body.user_ids {
         let devices: Vec<String> = sqlx::query_scalar("SELECT device_id FROM e2ee_devices WHERE user_id = ? AND revoked_at = 0").bind(user).fetch_all(&mut *tx).await?;
         for device in devices.into_iter().filter(|d| !(user == &me.user_id && d == &me.device_id)) {
@@ -568,7 +568,7 @@ pub async fn create_group(State(app): State<App>, me: Me, Path(channel_id): Path
     encrypted_channel(&app, &me, &channel_id).await?;
     let info = decode("group info", &body.group_info)?;
     let _held = app.e2ee.lock.lock().await;
-    let mut tx = app.db.begin().await?;
+    let mut tx = crate::db::write(&app.db).await?;
     let exists: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM e2ee_groups WHERE channel_id = ?").bind(&channel_id).fetch_one(&mut *tx).await?;
     if exists {
         return Err(Error::conflict("This channel already has a group: join it instead."));
@@ -610,7 +610,7 @@ pub async fn post_handshake(State(app): State<App>, me: Me, Path(channel_id): Pa
 
     let (entry, applied) = {
         let _held = app.e2ee.lock.lock().await;
-        let mut tx = app.db.begin().await?;
+        let mut tx = crate::db::write(&app.db).await?;
         let keys = Keys::of(&mut tx, &members).await?;
         let (server, own) = e2ee::load(&mut tx, &app, &channel_id).await?;
         if !server.has_group(&channel_id) {
@@ -621,6 +621,13 @@ pub async fn post_handshake(State(app): State<App>, me: Me, Path(channel_id): Pa
             Err(Refusal::Stale { current }) => return Err(Error::conflict(format!("The group is at epoch {current} now: fetch the handshakes you missed and try again."))),
             Err(Refusal::Invalid(e)) => return Err(refused(e)),
         };
+        // A member may take out only devices that should go: their people
+        // left, or they were revoked (if the server's own removal failed),
+        // or its own old place when it rejoins.
+        let keeps = |d: &(String, String)| *d != sender && members.contains(&d.0) && dm_crypto::identity::Directory::certificate(&keys, &d.0, &d.1).is_some();
+        if let Some((user, _)) = applied.removed.iter().find(|d| keeps(d)) {
+            return Err(Error::bad_request(format!("A device of {user}'s that's still in the channel can't be removed.")));
+        }
         if !applied.added.is_empty() && !applied.external && welcome.is_none() {
             return Err(Error::bad_request("A commit that adds devices needs its Welcome."));
         }

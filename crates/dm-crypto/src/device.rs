@@ -191,6 +191,24 @@ impl<S: StorageProvider<CURRENT_VERSION>> Device<S> {
         handshake(epoch, commit, Some(welcome), info)
     }
 
+    /// Takes devices out of the group (ones whose people left the channel,
+    /// or that were revoked, if the server's own removal never came), with
+    /// whatever the server proposed.
+    pub fn remove(&self, channel_id: &str, devices: &[DeviceName]) -> Result<Handshake> {
+        let mut group = self.load(channel_id)?;
+        let leaves: Vec<LeafNodeIndex> = group
+            .members()
+            .filter(|m| identity::parse_credential(&m.credential).is_ok_and(|d| devices.contains(&d)))
+            .map(|m| m.index)
+            .collect();
+        if leaves.len() != devices.len() {
+            return Err(Error::Untrusted("removing a device that isn't in the group".into()));
+        }
+        let epoch = group.epoch().as_u64();
+        let (commit, welcome, info) = group.remove_members(&self.provider, &self.signer, &leaves).map_err(mls)?;
+        handshake(epoch, commit, welcome, info)
+    }
+
     /// Commits the proposals waiting in the group (the server's removals),
     /// if there are any. Must happen before sending.
     pub fn commit_pending(&self, channel_id: &str) -> Result<Option<Handshake>> {

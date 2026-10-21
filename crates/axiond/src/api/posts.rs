@@ -164,7 +164,7 @@ pub async fn insert(app: &App, channel: &ChannelRow, user_id: &str, new: New) ->
     let is_root = new.root_id.is_empty();
     let mentioned = if new.kind.is_empty() { mentions(app, channel, user_id, &new.message, &new.props).await? } else { Vec::new() };
 
-    let mut tx = app.db.begin().await?;
+    let mut tx = crate::db::write(&app.db).await?;
     sqlx::query(
         "INSERT INTO posts (id, channel_id, user_id, root_id, create_at, update_at, message, type, file_ids, pending_post_id, props) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10)",

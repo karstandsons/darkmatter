@@ -508,8 +508,7 @@ impl Account {
             .align_y(iced::Center)
             .into(),
             Mfa::Idle => row![
-                text("Off. Turn on to need a code from your phone when signing in.").size(13).color(c.muted),
-                space::horizontal(),
+                text("Off. Turn on to need a code from your phone when signing in.").size(13).color(c.muted).width(Length::Fill),
                 small(c, "Turn on…", (!busy).then_some(Message::Account(Msg::MfaStart))),
             ]
             .align_y(iced::Center)
@@ -714,7 +713,7 @@ impl Account {
 
     fn frame<'a>(&'a self, body: Column<'a, Message>, c: Colors) -> Element<'a, Message> {
         // What the last action did stays in view below the scrolling part.
-        let mut panel = column![scrollable(body).height(Length::Shrink).spacing(10)].spacing(10);
+        let mut panel = column![scrollable(body).height(Length::Fill).spacing(10)].spacing(10);
         if let Some((is_err, msg)) = &self.status {
             panel = panel.push(text(msg).size(12).color(if *is_err { c.red } else { c.green }));
         }

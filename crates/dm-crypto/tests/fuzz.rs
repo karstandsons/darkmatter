@@ -128,7 +128,7 @@ fn json_and_codes_from_the_server_or_people() {
         "sha256": file::sha256_hex(&file_ct), "name": "a.png", "type": "image/png", "size": 70000
     }))
     .unwrap();
-    let codes = vec![RecoveryKey::generate().to_code().into_bytes(), link::code("u", "d", b"s", b"k").into_bytes()];
+    let codes = [RecoveryKey::generate().to_code().into_bytes(), link::code("u", "d", b"s", b"k").into_bytes()];
     let inputs = vec![cert, ct, aad, sealed, backup, file_key, codes[0].clone(), codes[1].clone()];
 
     fuzz("certificate", 11, &inputs, |b| {

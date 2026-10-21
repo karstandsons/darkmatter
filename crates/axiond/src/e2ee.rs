@@ -51,7 +51,7 @@ pub async fn init(db: &Db) -> anyhow::Result<State> {
         None => {
             let server = Server::create(MemoryStorage::default())?;
             let key = server.key().signature_key;
-            let mut tx = db.begin().await?;
+            let mut tx = crate::db::write(db).await?;
             save(&mut tx, SERVER, server.storage(), &HashSet::new()).await?;
             sqlx::query("INSERT INTO e2ee_mls (group_id, k, v) VALUES (?, ?, ?)").bind(SERVER).bind(SERVER_PUBLIC).bind(&key).execute(&mut *tx).await?;
             tx.commit().await?;
@@ -216,7 +216,7 @@ pub async fn all_devices_gone(app: &App, user_id: &str) -> sqlx::Result<()> {
 async fn propose_remove(app: &App, channel_id: &str, device: &DeviceName) -> sqlx::Result<()> {
     let seq = {
         let _held = app.e2ee.lock.lock().await;
-        let mut tx = app.db.begin().await?;
+        let mut tx = crate::db::write(&app.db).await?;
         let (server, own) = load(&mut tx, app, channel_id).await?;
         // Not (or no longer) in the group: nothing to do.
         let Ok(proposal) = server.propose_remove(channel_id, device) else {

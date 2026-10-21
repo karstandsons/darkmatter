@@ -884,7 +884,33 @@ impl<S: LocalStore> E2ee<S> {
         if !committed {
             return Err("the conversation kept changing; try again".into());
         }
+        self.remove_gone(channel_id, &members).await?;
         self.add_missing(channel_id, &keys).await
+    }
+
+    /// Takes out devices still in the group that shouldn't be: their people
+    /// left the channel, or they were revoked. The server proposes that
+    /// itself, but if it failed to, everyone sent here would still be
+    /// encrypting for them.
+    async fn remove_gone(&self, channel_id: &str, members: &[String]) -> Result<(), String> {
+        for _ in 0..RETRIES {
+            // Fresh keys: a device set up a moment ago isn't one to remove.
+            let keys = self.keys(members).await?;
+            let active: HashSet<&(String, String)> = keys.active().collect();
+            let me = (self.user_id.clone(), self.device.device_id.clone());
+            let gone: Vec<(String, String)> = self.device.members(channel_id).map_err(s)?.into_iter().filter(|d| *d != me && !active.contains(d)).collect();
+            if gone.is_empty() {
+                return Ok(());
+            }
+            tracing::warn!("{} device(s) left in the group of {channel_id} that shouldn't be; taking them out", gone.len());
+            let h = self.device.remove(channel_id, &gone).map_err(s)?;
+            self.persist();
+            if self.send(channel_id, &h).await? {
+                return Ok(());
+            }
+            self.catch_up(channel_id).await?;
+        }
+        Err("couldn't take everyone who left out of the conversation".into())
     }
 
     /// Adds members' devices the group doesn't have yet (set up after it was
@@ -952,11 +978,23 @@ impl<S: LocalStore> E2ee<S> {
 
     /// Joins an existing group by external commit.
     async fn join_external(&self, channel_id: &str) -> Result<(), String> {
-        let keys = self.keys(&self.members(channel_id).await?).await?;
-        for _ in 0..RETRIES {
+        let mut keys = self.keys(&self.members(channel_id).await?).await?;
+        let mut fetched = HashSet::new();
+        let mut tries = 0;
+        while tries < RETRIES {
             let state = self.api.group_state(channel_id).await.map_err(s)?;
             let info = B64.decode(&state.group_info).map_err(s)?;
-            let (_, h) = self.device.join_external(&info, &self.server, &keys).map_err(s)?;
+            // Someone still in the group but gone from the channel (their
+            // removal comes once we're in): fetch their keys to check them.
+            let h = match self.device.join_external(&info, &self.server, &keys) {
+                Ok((_, h)) => h,
+                Err(dm_crypto::Error::UnknownDevice { user, .. }) if fetched.insert(user.clone()) => {
+                    keys.extend(self.keys(std::slice::from_ref(&user)).await?);
+                    continue;
+                }
+                Err(e) => return Err(s(e)),
+            };
+            tries += 1;
             self.persist();
             if self.send(channel_id, &h).await? {
                 self.set_joined(channel_id);

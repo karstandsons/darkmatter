@@ -12,7 +12,7 @@ const PASSWORD: &str = "correct horse battery";
 
 struct Server {
     url: String,
-    _app: App,
+    app: App,
     _dir: tempfile::TempDir,
 }
 
@@ -27,7 +27,7 @@ async fn server() -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(app.clone().serve(listener));
-    Server { url, _app: app, _dir: dir }
+    Server { url, app, _dir: dir }
 }
 
 /// A device: signed in, set up for encryption with `store`.
@@ -220,7 +220,7 @@ async fn safety_numbers_and_a_swapped_key() {
     // The server swaps in keys of its own for bob and carol.
     for user in [&bob.user_id, &carol.user_id] {
         let fake = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, dm_crypto::UserIdentity::generate().public().0);
-        sqlx::query("UPDATE e2ee_identities SET identity_key = ? WHERE user_id = ?").bind(fake).bind(user).execute(&s._app.db).await.unwrap();
+        sqlx::query("UPDATE e2ee_identities SET identity_key = ? WHERE user_id = ?").bind(fake).bind(user).execute(&s.app.db).await.unwrap();
     }
     // Bob was verified: nothing more goes to the channel until alice deals with it.
     let post = NewPost { channel_id: plans.id.clone(), message: "secret".into(), pending_post_id: "alice:secret".into(), ..Default::default() };
@@ -458,6 +458,45 @@ async fn a_private_channel_as_people_come_and_go() {
 }
 
 #[tokio::test]
+async fn someone_the_server_failed_to_take_out_is_taken_out_by_the_next_sender() {
+    let s = server().await;
+    let (alice_api, alice) = device(&s, "alice", MemoryStore::default()).await;
+    let (bob_api, bob) = device(&s, "bob", MemoryStore::default()).await;
+    let (_, carol) = device(&s, "carol", MemoryStore::default()).await;
+    let team = alice_api.my_teams().await.unwrap()[0].id.clone();
+    let trip = alice_api.create_channel(&team, "trip", "Trip", true).await.unwrap();
+    run(&alice_api, &trip.id, "/invite @bob").await;
+    run(&alice_api, &trip.id, "/invite @carol").await;
+    let hello = send(&alice_api, &alice, &trip.id, "hello all").await;
+    assert_eq!(text(read(&carol, &hello).await), "hello all");
+
+    // Carol leaves the channel, but the server's removal from the group
+    // never happens (as when the database was busy).
+    sqlx::query("DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?").bind(&trip.id).bind(&carol.user_id).execute(&s.app.db).await.unwrap();
+    bob.sync(&trip.id).await.unwrap();
+    let after = send(&bob_api, &bob, &trip.id, "carol's gone").await;
+    assert_eq!(text(read(&alice, &after).await), "carol's gone");
+    assert!(matches!(read(&carol, &after).await, Decrypted::Unreadable(_)));
+    let mut seen: Vec<String> = alice.group_members(&trip.id).unwrap().into_iter().map(|(u, _)| u).collect();
+    seen.sort();
+    let mut expected = vec![alice.user_id.clone(), bob.user_id.clone()];
+    expected.sort();
+    assert_eq!(seen, expected);
+
+    // But nobody can take out someone who's still in the channel.
+    let bobs = (bob.user_id.clone(), bob_api.my_device().await.unwrap());
+    let h = alice.device.remove(&trip.id, &[bobs]).unwrap();
+    let body = mm_api::models::NewHandshake {
+        commit: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &h.commit),
+        group_info: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &h.group_info),
+        welcome: String::new(),
+    };
+    let refused = alice_api.post_handshake(&trip.id, &body).await.unwrap_err();
+    assert!(refused.to_string().contains("still in the channel"), "{refused}");
+    alice.device.discard(&trip.id).unwrap();
+}
+
+#[tokio::test]
 async fn files_in_an_encrypted_dm() {
     use dm_client::files::{Outgoing, Thumb};
     let s = server().await;
@@ -596,7 +635,7 @@ async fn edits_reactions_mentions_and_deletes_stay_encrypted() {
     alice_api.delete_post(&lunch.id).await.unwrap();
     let (props, events): (String, i64) = sqlx::query_as("SELECT props, (SELECT count(*) FROM e2ee_events WHERE post_id = ?1) FROM posts WHERE id = ?1")
         .bind(&lunch.id)
-        .fetch_one(&s._app.db)
+        .fetch_one(&s.app.db)
         .await
         .unwrap();
     assert!(!props.contains("dm_e2ee") && !props.contains("dm_edit"), "{props}");

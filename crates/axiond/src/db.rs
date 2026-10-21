@@ -10,6 +10,14 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 
 pub type Db = SqlitePool;
 
+/// A transaction that writes. It takes the write lock as it starts: one
+/// that reads first and writes later fails with "database is locked"
+/// (SQLITE_BUSY_SNAPSHOT) whenever another connection wrote in between, and
+/// waiting doesn't help.
+pub async fn write(db: &Db) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    db.begin_with("BEGIN IMMEDIATE").await
+}
+
 /// Opens (creating if needed) `axiond.db` in `data_dir` and brings its schema
 /// up to date.
 pub async fn open(data_dir: &Path) -> anyhow::Result<Db> {

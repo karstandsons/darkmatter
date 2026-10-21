@@ -189,7 +189,7 @@ pub async fn delete_account(app: &App, actor: &str, user_id: &str, delete_messag
     }
     super::sessions::end_all(app, user_id, None).await?;
     let now = ids::now();
-    let mut tx = app.db.begin().await?;
+    let mut tx = crate::db::write(&app.db).await?;
     sqlx::query(
         "UPDATE users SET username = ?1, email = ?2, first_name = '', last_name = '', nickname = '', password_hash = '', \
            roles = 'system_user', mfa_secret = '', mfa_active = 0, status = '', last_picture_update = 0, delete_at = ?3, update_at = ?3 \
