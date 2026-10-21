@@ -16,9 +16,6 @@ The release workflow uses each version's section here as its release notes.
   passphrase, so losing every device doesn't mean starting over. A new
   device can recover from it, or start over with your password.
 - Encryption is marked **beta** until it's been reviewed more.
-- **Fixed:** with encrypted messages, one read twice at once (a picture
-  arriving while its conversation loads) could show "couldn't be
-  decrypted".
 
 ## [0.5.0] - 2026-10-21
 
