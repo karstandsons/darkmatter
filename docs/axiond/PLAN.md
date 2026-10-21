@@ -216,7 +216,7 @@ We won't pay for an outside audit. Confidence has to come from the libraries we 
 - **Two admins, both accountable:** each has their own admin account with 2FA; no shared logins. The audit log moves into M1, so each admin sees what the other did.
 - **Backups leave the VPS,** encrypted before they go (for example with restic), so the backup host can't read them. Restoring is tested on a schedule, not just documented.
 
-### Threat model (summary; the full version goes in `docs/axiond/THREAT_MODEL.md`)
+### Threat model (summary; the full version is [THREAT_MODEL.md](THREAT_MODEL.md))
 
 | Adversary | Protected? |
 |---|---|
@@ -450,12 +450,12 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
    - safety numbers (`/verify`), a ✓ on verified direct messages;
    - a verified person's changed key holds sending where they are until it's accepted; an unverified change is trusted and said in the conversation.
 10. **Recovery:** *(built 2026-10-21; tested end to end through axiond, the in-app check still to do)* a recovery key (a 28-character code) or a passphrase (argon2id) backs up the identity key, from Account → Recovery; a device waiting to be linked can recover from either, or start over with a new key and the account password.
-11. **Proving it:**
-    - property tests over group operations;
-    - the malicious-server harness;
-    - fuzzing the parsers;
-    - `THREAT_MODEL.md`;
-    - the "beta" label.
+11. **Proving it:** *(2026-10-21, except passkeys)*
+    - property tests over group operations: seeded random runs, out of order within epochs (`crates/dm-crypto/tests/properties.rs`);
+    - the malicious-server harness: eight attacks played by changing axiond's stored state (`crates/axiond/tests/malicious_server.rs`); it found that a forged device certificate stopped senders altogether, now fixed;
+    - fuzzing the parsers, on stable Rust by mutation (`crates/dm-crypto/tests/fuzz.rs`); cargo-fuzz targets need a nightly toolchain, not set up yet;
+    - [THREAT_MODEL.md](THREAT_MODEL.md);
+    - the "beta" label, in Account and the 🔒 tooltip.
 
     Passkeys for login come last.
 

@@ -353,7 +353,7 @@ impl Chat {
                             if *devices > 1 { format!("@{name} ({devices} devices)") } else { format!("@{name}") }
                         })
                         .collect();
-                    format!("End-to-end encrypted for {}", names.join(", "))
+                    format!("End-to-end encrypted (beta) for {}", names.join(", "))
                 }
                 _ if self.crypto.is_none() => "End-to-end encrypted. This device isn't set up to read it (see Account).".into(),
                 _ => "End-to-end encrypted: the first message sets it up for everyone here".into(),

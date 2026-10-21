@@ -5,6 +5,21 @@ The release workflow uses each version's section here as its release notes.
 
 ## [Unreleased]
 
+- **With axiond, more of your devices:** a new device of yours shows a
+  code; type it in Account → Link a new device on one you already use,
+  and the new one reads your encrypted conversations from then on.
+- **Safety numbers:** `/verify` (or `/verify @someone`) shows the number
+  you and they compare, in person or on a call; verified direct messages
+  show ✓. If someone's key changes, their conversations say so, and if
+  you had verified them nothing is sent there until you check.
+- **Recovery:** Account → Recovery makes a recovery key, or uses a
+  passphrase, so losing every device doesn't mean starting over. A new
+  device can recover from it, or start over with your password.
+- Encryption is marked **beta** until it's been reviewed more.
+- **Fixed:** with encrypted messages, one read twice at once (a picture
+  arriving while its conversation loads) could show "couldn't be
+  decrypted".
+
 ## [0.5.0] - 2026-10-21
 
 - **Several servers at once.** Add another Mattermost or axiond server

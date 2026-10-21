@@ -480,7 +480,9 @@ impl Account {
             crate::crypto::Status::Failed(why) => Some(text(format!("Couldn't set it up on this device: {why}")).size(13).color(c.red).into()),
         };
         if let Some(e) = encryption {
-            body = body.push(column![heading(c, "Encryption"), e].spacing(8));
+            let title = row![heading(c, "Encryption"), text("beta").size(11).color(c.yellow)].spacing(8).align_y(iced::Center);
+            let beta = text("End-to-end encryption is new: it's being reviewed in the open, without a paid audit yet.").size(11).color(c.muted);
+            body = body.push(column![title, e, beta].spacing(8));
         }
 
         // Two-factor codes.

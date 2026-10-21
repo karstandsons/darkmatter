@@ -1,0 +1,101 @@
+# Threat model: Darkmatter with axiond
+
+What end-to-end encryption in Darkmatter and axiond protects, from whom,
+and what it doesn't. The design is [E2EE.md](E2EE.md); this is what it
+amounts to, as built in M2. Encryption is **beta** until the review steps
+in [PLAN.md](PLAN.md#review-without-a-paid-audit-decided-2026-10-19) are
+done.
+
+## What's protected
+
+In an encrypted conversation (every direct message and private channel on
+axiond, and public channels an admin turned it on for):
+- the text of messages, edits and reactions;
+- files and pictures, their names, types and sizes, and their thumbnails;
+- who was mentioned is sent beside the message, so the server can count
+  mentions: it learns *who*, not *what*.
+
+Only the devices of the people in the conversation at the time can read
+them. MLS (RFC 9420, through openmls) gives each conversation its own
+keys, changes them whenever someone joins or leaves, and every device
+refreshes its own key weekly and after a day away.
+
+## Who we defend against
+
+| Adversary | Result |
+|---|---|
+| Someone on the network | Sees TLS only. |
+| The server's operator, its host, or someone who took it over, reading | Gets ciphertext. They can't decrypt messages, files, edits or reactions. |
+| The same, *acting*: adding devices, swapping keys, moving or replaying messages | See [A malicious server](#a-malicious-server). |
+| A stolen copy of the server's database or backups | Ciphertext, argon2id password hashes, hashed session tokens, and the identity key backups, which need the recovery key or passphrase. |
+| A stolen copy of a device's files | Darkmatter's local database (decrypted messages, MLS state, search index) is SQLCipher, under a key in the system keychain. A copy of the files alone is unreadable. |
+| Someone removed from a conversation | Reads nothing sent after: they're removed from the group before anything else is sent. |
+| A plugin in Darkmatter | Gets no encrypted text unless you tick "May read encrypted conversations" for it. |
+
+## A malicious server
+
+What a server that turned on its users can and can't do, and how the
+clients catch it. Each row is a test in
+`crates/axiond/tests/malicious_server.rs` or `crates/dm-crypto/tests/`.
+
+| It tries to | Result |
+|---|---|
+| Read anything encrypted | Can't. |
+| Add a device of its own to someone's account | Can't: devices need a certificate signed by the user's identity key, which never leaves their devices (or their encrypted backup). Clients leave out devices whose certificate doesn't verify, and keep talking to the real ones. |
+| Add a device of its own when someone links a new one | Can't: the link code is a hash of the new device's keys, so swapped keys don't match it. A forged approval is refused by the new device. |
+| Swap someone's identity key | Noticed. If you verified them (`/verify`), nothing is sent where they are until you accept the change. If you didn't, the change is accepted and the conversation says so, as Signal does. |
+| Move a message to another conversation, thread or sender, or replay it | Not shown: the authenticated data and the MLS sender don't match, and a message's keys work once. |
+| Swap or weaken a backup | A backup is bound to its user, and clients refuse argon2id settings below OWASP's floor. |
+| Drop, delay or reorder messages | Possible. Within an epoch MLS shows gaps; the server can always refuse service. |
+| Withhold a commit from some members | They fall out of step; a device that can't apply a handshake rejoins the group. |
+| Learn who talks to whom, when, how much | Yes: see [What isn't protected](#what-isnt-protected). |
+
+## What isn't protected
+
+- **Metadata.** The server sees who is in which conversation, when
+  messages are sent and how big they are (padded to 256 bytes), who
+  reacted to which message (not with what), who was mentioned, and file
+  sizes.
+- **Conversations that aren't encrypted.** Public channels on axiond are
+  readable by the server unless an admin turns encryption on; on
+  Mattermost nothing is end-to-end encrypted. Darkmatter shows 🔒 on the
+  ones that are.
+- **First contact.** Until you compare safety numbers, you trust the key
+  the server gave you the first time (trust on first use).
+- **An unlocked device.** Whoever holds it reads what it can. Signing it
+  out from another device takes it out of every conversation for what's
+  sent next; what it already decrypted stays on it.
+- **Old messages on a new device.** A linked or recovered device reads
+  only what's sent from then on. (An encrypted history backup comes
+  later.)
+- **Notifications.** Desktop notifications from encrypted conversations
+  say only "🔒 New message" unless you turn previews on, since the
+  desktop keeps their text.
+- **Copying out.** Text copied from an encrypted conversation and pasted
+  elsewhere is out of our hands; Darkmatter asks before sending it into a
+  conversation that isn't encrypted.
+- **Revocations aren't signed.** Taking a device out is the server's job,
+  so a malicious server could cut one off, but it could refuse it service
+  anyway.
+
+## Assumptions
+
+- The operating system and the Darkmatter binary are trusted: releases are
+  built in CI and signed; a compromised machine is out of scope.
+- The system keychain protects the local database key as well as it
+  protects the user's other secrets.
+- openmls, libcrux and the RustCrypto crates are correct. Our own code adds
+  no cryptographic primitives (see E2EE.md).
+
+## How it's checked
+
+- Unit and end-to-end tests through a real axiond
+  (`crates/axiond/tests/encrypted_dms.rs`).
+- The malicious-server harness (above).
+- Property tests: random runs of adds, removals, key updates and messages,
+  out of order, checking everyone stays in step
+  (`crates/dm-crypto/tests/properties.rs`).
+- Fuzzing every parser that reads what the server sends
+  (`crates/dm-crypto/tests/fuzz.rs`).
+- Community review: the code is open; please report problems privately to
+  the maintainers rather than in a public issue.
