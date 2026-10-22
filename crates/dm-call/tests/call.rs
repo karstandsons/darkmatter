@@ -199,3 +199,40 @@ async fn joining_again_after_leaving() {
     until_heard(&mut b_updates, &alice_id, true).await;
     until_heard(&mut a_updates, &bob_id, true).await;
 }
+
+/// The real microphone, end to end: what it hears reaches the other side.
+/// Needs a sound server and something to hear (music, talking); the other
+/// side is muted, so nothing plays out. `cargo test -p dm-call -- --ignored microphone`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn the_microphone_is_heard() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let keys = vec![(alice_id.clone(), vec![1; 32]), (bob_id.clone(), vec![2; 32])];
+
+    let (b, _) = Call::join(&Media::new(), &bob, &town, Mic::Tone(440.0)).await.unwrap();
+    b.set_muted(true);
+    let (a, _) = Call::join(&Media::new(), &alice, &town, Mic::Device).await.unwrap();
+    a.set_keys(0, &keys);
+    b.set_keys(0, &keys);
+    let mut updates = b.updates().unwrap();
+    let mut loudest = 0f32;
+    let mut heard = 0;
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until {
+        if let Ok(Some(Update::Levels(levels))) = tokio::time::timeout(Duration::from_secs(1), updates.recv()).await
+            && let Some((_, l)) = levels.iter().find(|(u, _)| *u == alice_id)
+        {
+            loudest = loudest.max(*l);
+            heard += (*l > 0.02) as u32;
+        }
+    }
+    println!("microphone: loudest {loudest:.3}, {heard} of ~40 reports above the speaking mark; sent {} packets", a.packets_sent().await);
+    a.leave().await.unwrap();
+    b.leave().await.unwrap();
+    assert!(heard > 0, "nothing from the microphone");
+}
