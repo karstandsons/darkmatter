@@ -161,6 +161,16 @@ impl Drop for Phone {
     }
 }
 
+/// Waits until the socket is up: events sent before are never seen.
+async fn connected(stream: &mut ws::EventStream) {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), stream.next()).await.expect("connecting").expect("stream open") {
+            Message::Event(Event::Hello { .. }) => return,
+            _ => continue,
+        }
+    }
+}
+
 /// The next `call_updated` event.
 async fn next_call(stream: &mut ws::EventStream) -> CallUpdate {
     loop {
@@ -186,6 +196,7 @@ async fn two_people_hear_each_other() {
     let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
     let town = town_square(&alice).await;
     let mut bob_events = ws::connect(&bob).unwrap();
+    connected(&mut bob_events).await;
 
     // Alice starts a call: bob hears it started.
     let (alice_phone, joined) = Phone::dial(&alice, &town, b'a').await.unwrap();
