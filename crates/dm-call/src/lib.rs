@@ -252,6 +252,7 @@ impl Call {
             let user = ev.streams.first().map(|s| s.id()).unwrap_or_default();
             // Each person's frames, with their key.
             let cryptor = FrameCryptor::new_for_rtp_receiver(&factory2, user.clone(), EncryptionAlgorithm::AesGcm, decrypt.clone(), ev.receiver);
+            cryptor.on_state_change(Some(Box::new(|who, state| tracing::debug!("decrypting {who}: {state:?}"))));
             cryptor.set_enabled(true);
             decryptors.lock().unwrap().push(cryptor);
             let heard = heard.clone();
@@ -322,6 +323,7 @@ impl Call {
         // Encrypted from the first frame: without a key yet, nothing goes.
         let me = api.me().await?.id;
         let sending = FrameCryptor::new_for_rtp_sender(factory, me, EncryptionAlgorithm::AesGcm, keys.clone(), sender);
+        sending.on_state_change(Some(Box::new(|_, state| tracing::debug!("encrypting: {state:?}"))));
         sending.set_enabled(true);
 
         // The SFU is ICE-lite: it learns this device's address from its
@@ -362,6 +364,7 @@ impl Call {
     /// moment (at once for the first), so the others have them first.
     pub fn set_keys(&self, epoch: u64, keys: &[(String, Vec<u8>)]) {
         let slot = (epoch % RING) as i32;
+        tracing::debug!("call keys for epoch {epoch} (slot {slot}): {:?}", keys.iter().map(|(u, _)| u).collect::<Vec<_>>());
         for (user, key) in keys {
             self.0.keys.set_key(user.clone(), slot, key.clone());
         }
@@ -382,6 +385,7 @@ impl Call {
             if let Some(call) = call.upgrade()
                 && *call.epoch.lock().unwrap() == Some(epoch)
             {
+                tracing::debug!("sending with epoch {epoch}'s key");
                 call.sending.set_key_index(slot);
             }
         });

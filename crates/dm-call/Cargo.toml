@@ -21,5 +21,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 axiond = { path = "../axiond" }
+# The call's keys come from dm-client, as in Darkmatter.
+dm-client = { path = "../dm-client" }
+dm-crypto = { path = "../dm-crypto" }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

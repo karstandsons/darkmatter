@@ -24,6 +24,7 @@ async fn server() -> Server {
     let user = |name: &str| NewUser { username: name.into(), email: format!("{name}@example.com"), password: PASSWORD.into() };
     admin::setup(&app, user("alice"), "home", "Home").await.unwrap();
     admin::add_user(&app, user("bob"), false).await.unwrap();
+    admin::add_user(&app, user("carol"), false).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(app.clone().serve(listener));
@@ -129,4 +130,69 @@ fn devices_are_listed() {
     let (mics, speakers) = (media.microphones(), media.speakers());
     println!("microphones: {mics:?}\nspeakers: {speakers:?}");
     assert!(!speakers.is_empty());
+}
+
+/// Someone joining a call that's going on hears the others, though they
+/// had sent with an older epoch's key before it came.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_joiner_hears_everyone() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let carol = login(&s, "carol").await;
+    let (alice_id, bob_id, carol_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id, carol.me().await.unwrap().id);
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let media = Media::new();
+    let keys = |epoch: u8| vec![(alice_id.clone(), vec![epoch; 32]), (bob_id.clone(), vec![epoch + 100; 32]), (carol_id.clone(), vec![epoch + 200; 32])];
+
+    let (a, _) = Call::join(&media, &alice, &town, Mic::Tone(440.0)).await.unwrap();
+    let (b, _) = Call::join(&media, &bob, &town, Mic::Tone(660.0)).await.unwrap();
+    let mut a_updates = a.updates().unwrap();
+    a.set_keys(0, &keys(0));
+    b.set_keys(0, &keys(0));
+    until_heard(&mut a_updates, &bob_id, true).await;
+
+    // Carol joins: a new epoch, which only she starts in.
+    let (c, _) = Call::join(&media, &carol, &town, Mic::Tone(550.0)).await.unwrap();
+    let mut c_updates = c.updates().unwrap();
+    c.set_keys(1, &keys(1));
+    a.set_keys(1, &keys(1));
+    b.set_keys(1, &keys(1));
+    until_heard(&mut c_updates, &alice_id, true).await;
+    until_heard(&mut c_updates, &bob_id, true).await;
+    until_heard(&mut a_updates, &carol_id, true).await;
+}
+
+/// Leaving and joining again from the same app, while the other stays on
+/// through several epochs: each still hears the other.
+#[tokio::test(flavor = "multi_thread")]
+async fn joining_again_after_leaving() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let media = Media::new();
+    let keys = |epoch: u8| vec![(alice_id.clone(), vec![epoch; 32]), (bob_id.clone(), vec![epoch + 100; 32])];
+
+    let (a, _) = Call::join(&media, &alice, &town, Mic::Tone(440.0)).await.unwrap();
+    let (b, _) = Call::join(&media, &bob, &town, Mic::Tone(660.0)).await.unwrap();
+    let mut b_updates = b.updates().unwrap();
+    a.set_keys(0, &keys(0));
+    b.set_keys(0, &keys(0));
+    until_heard(&mut b_updates, &alice_id, true).await;
+
+    // Alice leaves (bob alone: epoch 1), then joins again (epoch 2).
+    a.leave().await.unwrap();
+    drop(a);
+    b.set_keys(1, &[(bob_id.clone(), vec![101; 32])]);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (a, _) = Call::join(&media, &alice, &town, Mic::Tone(440.0)).await.unwrap();
+    let mut a_updates = a.updates().unwrap();
+    a.set_keys(2, &keys(2));
+    b.set_keys(2, &keys(2));
+    until_heard(&mut b_updates, &alice_id, true).await;
+    until_heard(&mut a_updates, &bob_id, true).await;
 }

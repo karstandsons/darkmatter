@@ -1952,6 +1952,8 @@ name = "dm-call"
 version = "0.5.0"
 dependencies = [
  "axiond",
+ "dm-client",
+ "dm-crypto",
  "futures-util",
  "libwebrtc",
  "mm-api",
