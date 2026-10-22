@@ -322,6 +322,12 @@ Reliability is the second priority, for the server and the apps alike:
   - Per-sender keys come from the exporter and go into LiveKit's frame encryption. Nothing is sent before there's a key.
   - The call bar shows a code everyone sees the same, and ✓ for verified people. See [E2EE.md §11](E2EE.md#11-calls).
   - Calls stay behind the `calls` feature until video (Phase 3), since voice and video ship together.
+- **Phase 3 (2026-10-22, video):**
+  - Every call has a video track, sending only while the camera is on. It's capped at 640×360, 30 fps and 800 kbps, and encrypted like the sound. With video for up to 5 people, there's no simulcast or layer switching.
+  - The camera comes through nokhwa: V4L2 on Linux, AVFoundation on macOS.
+  - Darkmatter shows a tile per person with their camera on, over the call's channel, and the camera can be picked under Devices.
+  - A late joiner gets a keyframe through the SFU (0.6 s in tests).
+  - Not yet: drawing frames with a shader instead of an image per frame, and screen sharing (Phase 4).
 
 ## Mobile and push
 
