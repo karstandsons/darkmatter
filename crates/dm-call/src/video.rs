@@ -60,6 +60,15 @@ impl Pictures {
     }
 }
 
+/// Whether a picture is all black: what libwebrtc sends (10 a second)
+/// from a camera that hasn't started, to have the encoder going. Not shown,
+/// so someone with their camera off has no tile (a covered lens neither).
+pub(crate) fn is_black(p: &Picture) -> bool {
+    let px = p.rgba.as_chunks::<4>().0;
+    let step = (px.len() / 997).max(1);
+    px.iter().step_by(step).all(|p| p[0] < 24 && p[1] < 24 && p[2] < 24)
+}
+
 /// A frame from the call as RGBA.
 pub(crate) fn rgba_of(frame: &BoxVideoFrame) -> Picture {
     let (w, h) = (frame.buffer.width(), frame.buffer.height());

@@ -286,7 +286,10 @@ impl Call {
                     spawn.spawn(async move {
                         let mut stream = libwebrtc::video_stream::native::NativeVideoStream::new(track);
                         while let Some(frame) = stream.next().await {
-                            shown.put(&user, video::rgba_of(&frame));
+                            let picture = video::rgba_of(&frame);
+                            if !video::is_black(&picture) {
+                                shown.put(&user, picture);
+                            }
                         }
                         shown.remove(&user);
                     });

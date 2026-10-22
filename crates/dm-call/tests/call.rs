@@ -367,3 +367,31 @@ async fn the_camera_and_microphone_are_received() {
     assert!(spread > 5, "the picture is blank");
     assert!(heard > 0, "nothing from the microphone");
 }
+
+/// Someone whose camera is off shows no picture, though their video track
+/// is there from the start.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_camera_thats_off_shows_nothing() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let keys = vec![(alice_id.clone(), vec![1; 32]), (bob_id.clone(), vec![2; 32])];
+    let (a, _) = Call::join(&Media::new(), &alice, &town, Mic::Tone(440.0)).await.unwrap();
+    let (b, _) = Call::join(&Media::new(), &bob, &town, Mic::Tone(660.0)).await.unwrap();
+    a.set_keys(0, &keys);
+    b.set_keys(0, &keys);
+    a.set_camera(Some(dm_call::Cam::Pattern)).unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    while !b.pictures().contains_key(&alice_id) && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(b.pictures().contains_key(&alice_id), "bob sees alice");
+    let of_bob = a.pictures().get(&bob_id).map(|p| (p.width, p.height, p.at.elapsed()));
+    assert!(of_bob.is_none(), "alice has a picture of bob, whose camera is off: {of_bob:?}");
+    a.leave().await.unwrap();
+    b.leave().await.unwrap();
+}
