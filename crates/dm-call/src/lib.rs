@@ -88,16 +88,12 @@ impl Media {
     }
 
     /// Opens the platform's audio devices (PulseAudio/ALSA, CoreAudio) the
-    /// first time they're needed, with sound played out through them.
+    /// first time they're needed: to list them, nothing recorded or played.
     fn devices(&self) -> Result<(), Error> {
         let inner = &self.0;
-        if !inner.devices.swap(true, Ordering::Relaxed) {
-            if !inner.factory.acquire_platform_adm() {
-                inner.devices.store(false, Ordering::Relaxed);
-                return Err(Error::Media("couldn't open the sound devices".into()));
-            }
-            inner.factory.set_adm_recording_enabled(true);
-            inner.factory.set_adm_playout_enabled(true);
+        if !inner.devices.swap(true, Ordering::Relaxed) && !inner.factory.acquire_platform_adm() {
+            inner.devices.store(false, Ordering::Relaxed);
+            return Err(Error::Media("couldn't open the sound devices".into()));
         }
         Ok(())
     }
@@ -278,7 +274,10 @@ impl Call {
 
         let mic_track = match mic {
             Mic::Device => {
+                // Records from the microphone, and plays the others out.
                 media.devices()?;
+                factory.set_adm_recording_enabled(true);
+                factory.set_adm_playout_enabled(true);
                 factory.create_device_audio_track("mic")
             }
             Mic::Tone(pitch) => {

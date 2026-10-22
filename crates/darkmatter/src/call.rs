@@ -355,13 +355,20 @@ pub fn updated(chat: &mut Chat, u: CallUpdate) -> Task<Message> {
 }
 
 /// Someone turned a call down: on another of your devices, it stops here.
-pub fn declined(chat: &mut Chat, channel_id: &str, user_id: &str) {
+/// In a direct message, the caller waiting alone hangs up.
+pub fn declined(chat: &mut Chat, channel_id: &str, user_id: &str) -> Task<Message> {
     if user_id == chat.store.me.id && chat.ringing.as_ref().is_some_and(|r| r.channel_id == channel_id) {
         chat.ringing = None;
     } else if chat.call.as_ref().is_some_and(|a| a.channel_id == channel_id) {
         let name = chat.store.users.get(user_id).map_or_else(|| "Someone".into(), |u| format!("@{}", u.username));
         chat.notice = Some(format!("{name} can't take the call."));
+        let direct = chat.store.channels.get(channel_id).is_some_and(|c| c.kind == mm_api::models::ChannelType::Direct);
+        let alone = chat.calls.get(channel_id).is_none_or(|c| c.participants.iter().all(|p| p.user_id == chat.store.me.id));
+        if direct && alone {
+            return leave(chat);
+        }
     }
+    Task::none()
 }
 
 /// Once a second: a call nobody answers stops ringing.
@@ -420,17 +427,20 @@ pub fn bar<'a>(chat: &'a Chat, c: Colors) -> Option<Element<'a, Message>> {
             let name = chat.store.users.get(&p.user_id).map_or_else(|| p.user_id.clone(), |u| format!("@{}", u.username));
             let level = if me { 0.0 } else { active.levels.get(&p.user_id).copied().unwrap_or(0.0) };
             let speaking = level > 0.02;
-            let dot = text("●").size(10).color(if speaking { c.green } else { c.muted });
+            let dot = text(if speaking { "●" } else { "○" }).size(10).color(if speaking { c.green } else { c.muted });
             let label = if me && active.muted { format!("{name} (muted)") } else { name };
             people = people.push(row![dot, text(label).size(12).color(if speaking { c.fg_bright } else { c.fg })].spacing(6).align_y(iced::Center));
         }
     }
     let mute = button(text(if active.muted { "Unmute" } else { "Mute" }).size(12)).padding([3, 10]).on_press(Message::Call(Msg::Mute)).style(c.chip(active.muted));
-    let gear = button(text("🎚").size(12)).padding([3, 8]).on_press(Message::Call(Msg::Devices)).style(c.chip(active.devices.is_some()));
+    let gear = button(text("Devices").size(12)).padding([3, 10]).on_press(Message::Call(Msg::Devices)).style(c.chip(active.devices.is_some()));
     let leave = button(text("Leave").size(12).color(c.red)).padding([3, 10]).on_press(Message::Call(Msg::Leave)).style(c.chip(false));
     let mut col = column![title, people, row![mute, gear, leave].spacing(8)].spacing(8);
     if let Some((mics, speakers)) = &active.devices {
         let (mic, speaker) = PREFERRED.lock().unwrap().clone();
+        // Nothing picked, or it's unplugged: the system's default ("default: …", listed first).
+        let picked = |p: Option<String>, devices: &[String]| p.filter(|p| devices.contains(p)).or_else(|| devices.first().cloned());
+        let (mic, speaker) = (picked(mic, mics), picked(speaker, speakers));
         let list = |label: &'a str, devices: &'a [String], picked: Option<String>, microphone: bool| {
             let mut l = Column::new().spacing(1).push(text(label).size(11).color(c.muted));
             if devices.is_empty() {
@@ -489,7 +499,7 @@ mod tests {
 
         // Turned down on another device: it stops too.
         let _ = updated(&mut chat, update("d1", Some(call("bob", &["bob"])), true));
-        declined(&mut chat, "d1", "me");
+        let _ = declined(&mut chat, "d1", "me");
         assert!(chat.ringing.is_none());
 
         // Bob gives up: over, and gone from the list.
