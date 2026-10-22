@@ -395,3 +395,39 @@ async fn a_camera_thats_off_shows_nothing() {
     a.leave().await.unwrap();
     b.leave().await.unwrap();
 }
+
+/// A shared screen arrives apart from the camera, at its own size.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_screen_comes_apart_from_the_camera() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let keys = vec![(alice_id.clone(), vec![1; 32]), (bob_id.clone(), vec![2; 32])];
+    let (a, _) = Call::join(&Media::new(), &alice, &town, Mic::Tone(440.0)).await.unwrap();
+    let (b, _) = Call::join(&Media::new(), &bob, &town, Mic::Tone(660.0)).await.unwrap();
+    a.set_keys(0, &keys);
+    b.set_keys(0, &keys);
+    a.set_camera(Some(dm_call::Cam::Pattern)).unwrap();
+    a.share(Some(dm_call::Share::Pattern)).unwrap();
+    assert!(a.sharing());
+
+    let screen = dm_call::screen_key(&alice_id);
+    let until = Instant::now() + Duration::from_secs(15);
+    while !(b.pictures().contains_key(&screen) && b.pictures().contains_key(&alice_id)) && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let pictures = b.pictures();
+    let shared = pictures.get(&screen).expect("bob sees alice's screen");
+    let camera = pictures.get(&alice_id).expect("and her camera");
+    assert_eq!((shared.width, shared.height), (1280, 720));
+    assert_eq!((camera.width, camera.height), (640, 360));
+    assert!(a.pictures().contains_key(&screen), "she sees what she shares");
+
+    a.share(None).unwrap();
+    assert!(!a.sharing() && !a.pictures().contains_key(&screen));
+    a.leave().await.unwrap();
+    b.leave().await.unwrap();
+}

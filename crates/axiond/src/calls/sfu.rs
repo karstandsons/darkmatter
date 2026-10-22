@@ -155,6 +155,9 @@ struct ClientId(u64);
 struct TrackIn {
     origin: ClientId,
     user: String,
+    /// The sender's name for it ("mic", "camera", "screen"), passed on so
+    /// the others can tell a screen from a camera.
+    name: String,
     mid: Mid,
     kind: MediaKind,
 }
@@ -265,7 +268,7 @@ impl Client {
     }
 
     fn handle_media_added(&mut self, mid: Mid, kind: MediaKind) -> Propagated {
-        let entry = TrackInEntry { id: Arc::new(TrackIn { origin: self.id, user: self.user.clone(), mid, kind }), last_keyframe_request: None };
+        let entry = TrackInEntry { id: Arc::new(TrackIn { origin: self.id, user: self.user.clone(), name: self.rtc.media(mid).map(|m| m.track_id().to_string()).unwrap_or_default(), mid, kind }), last_keyframe_request: None };
         let weak = Arc::downgrade(&entry.id);
         self.tracks_in.push(entry);
         Propagated::TrackOpen(self.id, weak)
@@ -312,7 +315,7 @@ impl Client {
             match track.state {
                 TrackOutState::ToOpen => {
                     if let Some(track_in) = track.track_in.upgrade() {
-                        let mid = change.add_media(track_in.kind, Direction::SendOnly, Some(track_in.user.clone()), None, None);
+                        let mid = change.add_media(track_in.kind, Direction::SendOnly, Some(track_in.user.clone()), Some(track_in.name.clone()).filter(|n| !n.is_empty()), None);
                         track.state = TrackOutState::Negotiating(mid);
                     }
                 }

@@ -21,6 +21,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# Screen sharing on Linux goes through the portal, over D-Bus with GLib.
+[target.'cfg(target_os = "linux")'.dependencies]
+libwebrtc = { version = "=0.3.53", features = ["glib-main-loop"] }
+
 [dev-dependencies]
 axiond = { path = "../axiond" }
 # The call's keys come from dm-client, as in Darkmatter.

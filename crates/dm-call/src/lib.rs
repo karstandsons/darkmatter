@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 mod video;
-pub use video::{Cam, Picture};
+pub use video::{Cam, Picture, Share};
 
 pub use mm_api::models::Call as CallInfo;
 
@@ -192,6 +192,9 @@ pub enum Update {
     Levels(Vec<(String, f32)>),
     /// There's a new picture to show ([`Call::pictures`]); at most 30 a second.
     Video,
+    /// This device's screen share ended by itself (stopped in the system,
+    /// or the picker cancelled).
+    ShareEnded,
 }
 
 /// This device in a channel's call. Cheap to clone.
@@ -210,6 +213,11 @@ struct CallInner {
     video_sending: FrameCryptor,
     video: libwebrtc::video_source::native::NativeVideoSource,
     camera: Mutex<Option<video::Feed>>,
+    screen_sending: FrameCryptor,
+    screen: libwebrtc::video_source::native::NativeVideoSource,
+    sharing: Mutex<Option<video::Feed>>,
+    /// For reports that don't come from libwebrtc (a share ending).
+    tx: mpsc::UnboundedSender<Update>,
     pictures: Arc<video::Pictures>,
     me: String,
     _receiving: Arc<Mutex<Vec<FrameCryptor>>>,
@@ -283,6 +291,8 @@ impl Call {
                     cryptor.set_enabled(true);
                     decryptors.lock().unwrap().push(cryptor);
                     let shown = shown.clone();
+                    // A shared screen is kept apart from the camera.
+                    let user = if track.id() == "screen" { screen_key(&user) } else { user };
                     spawn.spawn(async move {
                         let mut stream = libwebrtc::video_stream::native::NativeVideoStream::new(track);
                         while let Some(frame) = stream.next().await {
@@ -407,6 +417,21 @@ impl Call {
         let video_sending = FrameCryptor::new_for_rtp_sender(factory, me.clone(), EncryptionAlgorithm::AesGcm, keys.clone(), vsender);
         video_sending.set_enabled(true);
 
+        // And a shared screen: likewise a track from the start.
+        let screen = libwebrtc::video_source::native::NativeVideoSource::new(VideoResolution { width: 1920, height: 1080 }, true);
+        let strack = factory.create_video_track("screen", screen.clone());
+        let ssender = pc.add_track(strack.into(), &["me"]).map_err(media_err)?;
+        let mut params = ssender.parameters();
+        for e in &mut params.encodings {
+            e.max_bitrate = Some(video::SCREEN_MAX_BITRATE);
+            e.max_framerate = Some(video::SCREEN_FPS as f64);
+        }
+        if let Err(e) = ssender.set_parameters(params) {
+            tracing::warn!("couldn't cap the screen share's bitrate: {e}");
+        }
+        let screen_sending = FrameCryptor::new_for_rtp_sender(factory, me.clone(), EncryptionAlgorithm::AesGcm, keys.clone(), ssender);
+        screen_sending.set_enabled(true);
+
         // The SFU is ICE-lite: it learns this device's address from its
         // checks, so the offer goes without waiting for candidates.
         let offer = pc.create_offer(OfferOptions::default()).await.map_err(media_err)?;
@@ -437,6 +462,10 @@ impl Call {
             video_sending,
             video,
             camera: Mutex::new(None),
+            screen_sending,
+            screen,
+            sharing: Mutex::new(None),
+            tx: tx.clone(),
             pictures,
             me,
             _receiving: receiving,
@@ -481,6 +510,7 @@ impl Call {
         if first {
             self.0.sending.set_key_index(slot);
             self.0.video_sending.set_key_index(slot);
+            self.0.screen_sending.set_key_index(slot);
             return;
         }
         let call = Arc::downgrade(&self.0);
@@ -492,6 +522,7 @@ impl Call {
                 tracing::debug!("sending with epoch {epoch}'s key");
                 call.sending.set_key_index(slot);
                 call.video_sending.set_key_index(slot);
+                call.screen_sending.set_key_index(slot);
             }
         });
     }
@@ -502,9 +533,35 @@ impl Call {
         // The old one stops first: a camera opens once.
         camera.take();
         if let Some(cam) = cam {
-            *camera = Some(video::start(cam, self.0.video.clone(), self.0.pictures.clone(), self.0.me.clone()).map_err(Error::Media)?);
+            let from = match cam {
+                Cam::Device(index) => video::Source::Camera(index),
+                Cam::Pattern => video::Source::Pattern { width: video::WIDTH, height: video::HEIGHT },
+            };
+            *camera = Some(video::start(from, self.0.video.clone(), self.0.pictures.clone(), self.0.me.clone(), Box::new(|| {})).map_err(Error::Media)?);
         }
         Ok(())
+    }
+
+    /// Shares a screen (picked in the system's picker) or a test picture, or
+    /// stops with `None`. If it ends by itself, [`Update::ShareEnded`] says so.
+    pub fn share(&self, what: Option<Share>) -> Result<(), Error> {
+        let mut sharing = self.0.sharing.lock().unwrap();
+        sharing.take();
+        if let Some(what) = what {
+            let from = match what {
+                Share::Screen => video::Source::Screen,
+                Share::Pattern => video::Source::Pattern { width: 1280, height: 720 },
+            };
+            let tx = self.0.tx.clone();
+            *sharing = Some(video::start(from, self.0.screen.clone(), self.0.pictures.clone(), screen_key(&self.0.me), Box::new(move || {
+                let _ = tx.send(Update::ShareEnded);
+            })).map_err(Error::Media)?);
+        }
+        Ok(())
+    }
+
+    pub fn sharing(&self) -> bool {
+        self.0.sharing.lock().unwrap().is_some()
     }
 
     pub fn camera_on(&self) -> bool {
@@ -534,12 +591,18 @@ impl Call {
     /// Hangs up: the connection closes and the server takes this device out.
     pub async fn leave(&self) -> Result<(), Error> {
         self.0.camera.lock().unwrap().take();
+        self.0.sharing.lock().unwrap().take();
         self.0.pc.close();
         for t in self.0.tasks.lock().unwrap().drain(..) {
             t.abort();
         }
         Ok(self.0.api.leave_call(&self.0.channel_id).await?)
     }
+}
+
+/// Where a person's shared screen is kept in [`Call::pictures`].
+pub fn screen_key(user: &str) -> String {
+    format!("{user}#screen")
 }
 
 fn media_err(e: impl std::fmt::Display) -> Error {

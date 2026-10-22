@@ -41,6 +41,8 @@ pub enum Msg {
     Devices,
     /// Turn the camera on or off.
     Camera,
+    /// Share a screen, or stop.
+    Share,
     /// The call's group has a new handshake: catch up.
     Sync(String),
     /// The call's keys, new or changed (`None`: unchanged).
@@ -101,6 +103,8 @@ pub struct Active {
     pub devices: Option<(Vec<String>, Vec<String>, Vec<String>)>,
     /// This device's camera is on.
     pub camera: bool,
+    /// This device is sharing a screen.
+    pub sharing: bool,
     /// Everyone's latest picture as an image, made once per picture (not
     /// on every redraw): when it came, and the image.
     pub pictures: HashMap<String, (Instant, iced::widget::image::Handle)>,
@@ -190,6 +194,7 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
                     call_id: joined.info.id.clone(),
                     code: None,
                     camera: false,
+                    sharing: false,
                     pictures: HashMap::new(),
                 });
                 match updates {
@@ -227,6 +232,10 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
                     return leave(chat);
                 }
                 dm_call::Update::Levels(levels) => active.levels = levels.into_iter().collect(),
+                dm_call::Update::ShareEnded => {
+                    active.sharing = false;
+                    chat.notice = Some("Your screen share ended.".into());
+                }
                 dm_call::Update::Video => {
                     let latest = active.call.pictures();
                     active.pictures.retain(|user, _| latest.contains_key(user));
@@ -301,6 +310,21 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
                 match active.call.set_camera(on.then_some(cam)) {
                     Ok(()) => active.camera = on,
                     Err(e) => chat.error = Some(format!("Camera: {e}")),
+                }
+            }
+            #[cfg(not(feature = "calls"))]
+            let _ = active;
+            Task::none()
+        }
+        Msg::Share => {
+            let Some(active) = &mut chat.call else { return Task::none() };
+            #[cfg(feature = "calls")]
+            {
+                let what = if std::env::var("DM_CALL_TONE").is_ok_and(|v| !v.is_empty()) { dm_call::Share::Pattern } else { dm_call::Share::Screen };
+                let on = !active.sharing;
+                match active.call.share(on.then_some(what)) {
+                    Ok(()) => active.sharing = on,
+                    Err(e) => chat.error = Some(format!("Screen sharing: {e}")),
                 }
             }
             #[cfg(not(feature = "calls"))]
@@ -576,7 +600,8 @@ pub fn bar<'a>(chat: &'a Chat, c: Colors) -> Option<Element<'a, Message>> {
     let camera = button(text(if active.camera { "Camera off" } else { "Camera" }).size(12)).padding([3, 10]).on_press(Message::Call(Msg::Camera)).style(c.chip(active.camera));
     let gear = button(text("Devices").size(12)).padding([3, 10]).on_press(Message::Call(Msg::Devices)).style(c.chip(active.devices.is_some()));
     let leave = button(text("Leave").size(12).color(c.red)).padding([3, 10]).on_press(Message::Call(Msg::Leave)).style(c.chip(false));
-    let mut col = column![title, code, people, row![mute, camera].spacing(8), row![gear, leave].spacing(8)].spacing(8);
+    let share = button(text(if active.sharing { "Stop sharing" } else { "Share screen" }).size(12)).padding([3, 10]).on_press(Message::Call(Msg::Share)).style(c.chip(active.sharing));
+    let mut col = column![title, code, people, row![mute, camera].spacing(8), share, row![gear, leave].spacing(8)].spacing(8);
     if let Some((mics, speakers, cameras)) = &active.devices {
         let (mic, speaker) = PREFERRED.lock().unwrap().clone();
         // Nothing picked, or it's unplugged: the system's default ("default: …", listed first).
@@ -680,30 +705,50 @@ mod tests {
 }
 
 /// Everyone with their camera on, over the call's channel: a tile each,
-/// this device's last.
-pub fn stage<'a>(chat: &'a Chat, channel_id: &str, c: Colors) -> Option<Element<'a, Message>> {
+/// this device's last. Others' shared screens, if any, go above them, side
+/// by side and big (`true`: the stage takes most of the pane's height);
+/// this device's own share is a small tile, since it's on its screen anyway.
+pub fn stage<'a>(chat: &'a Chat, channel_id: &str, c: Colors) -> Option<(Element<'a, Message>, bool)> {
     let active = chat.call.as_ref().filter(|a| a.channel_id == channel_id)?;
     let me = &chat.store.me.id;
-    let mut showing: Vec<(&String, &iced::widget::image::Handle)> = active.pictures.iter().filter(|(_, (at, _))| at.elapsed() < STALE).map(|(u, (_, h))| (u, h)).collect();
-    if showing.is_empty() {
+    let fresh: Vec<(&String, &iced::widget::image::Handle)> = active.pictures.iter().filter(|(_, (at, _))| at.elapsed() < STALE).map(|(u, (_, h))| (u, h)).collect();
+    if fresh.is_empty() {
         return None;
     }
-    showing.sort_by_key(|(u, _)| (*u == me, (*u).clone()));
-    let tiles = showing.into_iter().map(|(user, image)| {
-        let name = if user == me { "You".to_string() } else { chat.store.users.get(user).map_or_else(|| user.clone(), |u| format!("@{}", u.username)) };
-        let speaking = user != me && active.levels.get(user).is_some_and(|l| *l > 0.02);
+    let name = |user: &str| if user == me { "You".to_string() } else { chat.store.users.get(user).map_or_else(|| user.to_string(), |u| format!("@{}", u.username)) };
+    let tile = |image: &iced::widget::image::Handle, label: String, outline: iced::Color, width: Length, height: Length| -> Element<'a, Message> {
         let picture = iced::widget::image(image.clone()).width(Length::Fill).height(Length::Fill).content_fit(iced::ContentFit::Contain);
-        let border = if speaking { c.green } else { iced::Color::TRANSPARENT };
-        container(column![picture, text(name).size(11).color(c.muted)].spacing(2))
-            .width(280)
-            .height(180)
+        container(column![picture, text(label).size(11).color(c.muted)].spacing(2))
+            .width(width)
+            .height(height)
             .padding(4)
             .style(move |_: &iced::Theme| container::Style {
                 background: Some(iced::Background::Color(c.surface)),
-                border: iced::Border { color: border, width: 2.0, radius: 6.0.into() },
+                border: iced::Border { color: outline, width: 2.0, radius: 6.0.into() },
                 ..Default::default()
             })
             .into()
+    };
+    let mine = format!("{me}#screen");
+    let (mut screens, mut small): (Vec<_>, Vec<_>) = fresh.into_iter().partition(|(u, _)| u.ends_with("#screen") && **u != mine);
+    screens.sort_by_key(|(u, _)| (*u).clone());
+    // Cameras, yours last, then your own share.
+    small.sort_by_key(|(u, _)| (**u == mine, *u == me, (*u).clone()));
+    let tiles = small.into_iter().map(|(user, image)| {
+        let speaking = user != me && active.levels.get(user).is_some_and(|l| *l > 0.02);
+        let label = if *user == mine { "Your screen".to_string() } else { name(user) };
+        tile(image, label, if speaking { c.green } else { iced::Color::TRANSPARENT }, Length::Fixed(280.0), Length::Fixed(180.0))
     });
-    Some(container(iced::widget::Row::with_children(tiles).spacing(8).wrap()).padding([8, 20]).width(Length::Fill).into())
+    let row_of_tiles = iced::widget::Row::with_children(tiles).spacing(8).wrap();
+    let big = !screens.is_empty();
+    let col = if big {
+        let wide = screens.into_iter().map(|(key, image)| {
+            let user = key.trim_end_matches("#screen");
+            tile(image, format!("{}'s screen", name(user)), iced::Color::TRANSPARENT, Length::Fill, Length::Fill)
+        });
+        column![iced::widget::Row::with_children(wide).spacing(8).height(Length::Fill), row_of_tiles].spacing(8).height(Length::Fill)
+    } else {
+        column![row_of_tiles]
+    };
+    Some((container(col).padding([8, 20]).width(Length::Fill).into(), big))
 }
