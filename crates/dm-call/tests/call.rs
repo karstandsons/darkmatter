@@ -277,3 +277,32 @@ async fn two_devices_see_each_other() {
     a.leave().await.unwrap();
     b.leave().await.unwrap();
 }
+
+/// Someone joining while a camera's on sees it soon: their device asks the
+/// sender (through the SFU) for a keyframe rather than waiting for one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_joiner_sees_a_camera_that_was_already_on() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let keys = vec![(alice_id.clone(), vec![1; 32]), (bob_id.clone(), vec![2; 32])];
+    let (a, _) = Call::join(&Media::new(), &alice, &town, Mic::Tone(440.0)).await.unwrap();
+    a.set_keys(0, &keys);
+    a.set_camera(Some(dm_call::Cam::Pattern)).unwrap();
+    // Long enough that the first keyframe is well past.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let joined = Instant::now();
+    let (b, _) = Call::join(&Media::new(), &bob, &town, Mic::Tone(660.0)).await.unwrap();
+    b.set_keys(0, &keys);
+    while !b.pictures().contains_key(&alice_id) {
+        assert!(joined.elapsed() < Duration::from_secs(10), "bob never saw alice's camera");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!("bob saw alice {:?} after joining", joined.elapsed());
+    a.leave().await.unwrap();
+    b.leave().await.unwrap();
+}
