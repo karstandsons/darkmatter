@@ -11,6 +11,8 @@ done.
 In an encrypted conversation (every direct message and private channel on
 axiond, and public channels an admin turned it on for):
 - the text of messages, edits and reactions;
+- calls, in any channel: what's said (and, with video, shown), keyed from
+  each call's own group, so only the devices in the call can hear it;
 - files and pictures, their names, types and sizes, and their thumbnails;
 - who was mentioned is sent beside the message, so the server can count
   mentions: it learns *who*, not *what*.
@@ -30,6 +32,7 @@ refreshes its own key weekly and after a day away.
 | A stolen copy of the server's database or backups | Ciphertext, argon2id password hashes, hashed session tokens, and the identity key backups, which need the recovery key or passphrase. |
 | A stolen copy of a device's files | Darkmatter's local database (decrypted messages, MLS state, search index) is SQLCipher, under a key in the system keychain. A copy of the files alone is unreadable. |
 | Someone removed from a conversation | Reads nothing sent after: they're removed from the group before anything else is sent. |
+| Someone who left a call | Hears at most the next second: a new epoch begins as they leave, and senders switch to its keys a second later. |
 | A plugin in Darkmatter | Gets no encrypted text unless you tick "May read encrypted conversations" for it. |
 
 ## A malicious server
@@ -47,6 +50,7 @@ clients catch it. Each row is a test in
 | Move a message to another conversation, thread or sender, or replay it | Not shown: the authenticated data and the MLS sender don't match, and a message's keys work once. |
 | Swap or weaken a backup | A backup is bound to its user, and clients refuse argon2id settings below OWASP's floor. |
 | Drop, delay or reorder messages | Possible. Within an epoch MLS shows gaps; the server can always refuse service. |
+| Add a device to a call, or split it | Can't add one: devices join a call's group by themselves, with certificates the server can't make. A split shows: everyone's call code is the same only if they share one group. |
 | Withhold a commit from some members | They fall out of step; a device that can't apply a handshake rejoins the group. |
 | Learn who talks to whom, when, how much | Yes: see [What isn't protected](#what-isnt-protected). |
 
@@ -68,6 +72,13 @@ clients catch it. Each row is a test in
 - **Old messages on a new device.** A linked or recovered device reads
   only what's sent from then on. (An encrypted history backup comes
   later.)
+- **Calls' metadata.** Who is in a call, from which device and address,
+  when and for how long, and packet sizes and rates. Audio is sent at a
+  constant bitrate without pauses in silences, and without the header that
+  says how loud it is, so packet sizes and gaps don't give away speech.
+- **Within a call, who sent a frame.** Every device in a call can derive
+  every sender's key, so one could forge another's frames (as with SFrame;
+  RFC 9605 §7.2). Calls are beta until they move to SFrame.
 - **Notifications.** Desktop notifications from encrypted conversations
   say only "🔒 New message" unless you turn previews on, since the
   desktop keeps their text.

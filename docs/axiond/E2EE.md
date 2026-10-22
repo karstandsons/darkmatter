@@ -194,15 +194,28 @@ The server's search (FTS5) never sees encrypted content and skips encrypted chan
 
 ## 11. Calls
 
-From the calls research ([research/calls.md](research/calls.md)):
-- **Each call gets its own MLS group**, holding only the devices in the call, with the same device credentials as chat (so chat verification carries over). The caller creates it, claims key packages for the invited devices and sends Welcomes; axiond, as external sender, proposes Removes when someone leaves or drops.
-- **Per-sender frame keys** come from that group's exporter and change with every epoch (every join or leave). Old epochs' decrypt keys are kept about 10 seconds for frames in flight.
-- **Phase A:** LiveKit's frame encryption (AES-GCM-128, HKDF), keyed `MLS-Exporter("darkmatter call v1 lk", sender leaf index, 16)`. **Phase B:** RFC 9605 SFrame in its MLS mode, with the `sframe` crate.
-- **Never reuse a key and nonce:** never encrypt in an epoch the process didn't freshly enter (after a restart, commit an Update first), and every stream has its own key id.
+As built in M3 Phase 2 ("Phase A" of [research/calls.md](research/calls.md) §4.5), beta:
+- **Each call has its own MLS group** (`call:<call id>`), holding only the devices in the call, with the same device credentials as chat, so chat verification carries over and people in the channel but not the call derive nothing.
+  - The first device in the call creates the group. Each later one **joins by itself with an external commit** from the group's latest GroupInfo, so nobody adds anyone.
+  - axiond, as the group's external sender, **proposes the Remove** of a device that leaves the call, is signed out or drops; a member still in the call commits it (each waits a moment of its own first, so most find it done).
+  - An external commit can't carry pending proposals (RFC 9420 §12.4.3.2), so for a call's group axiond lets a join through without them and proposes them again in the new epoch.
+  - The server keeps each group's public state in memory with the call, and checks every commit with the same delivery service as channels. It refuses commits that add anyone, external joins by a device other than the sender or not in the call, and removals of a device still in the call.
+  - Every join and leave is a new epoch.
+- **Per-sender media keys:** `MLS-Exporter("darkmatter call v1", user_id || 0x00 || device_id, 32)` for each device in the group, every epoch. Every member can derive every sender's key, and nobody outside the group can.
+- **Frame encryption (Phase A):** LiveKit's frame encryptor in libwebrtc (AES-GCM-128, the AES key derived from ours with HKDF). Keys sit in a ring of 16 by `epoch mod 16`, and a frame names its key's slot.
+  - Receivers install an epoch's keys as soon as they process its commit. A sender switches to its new key **one second later**, so the others have it first; a device just removed can read for that long.
+  - The sender's encryptor is on from the first frame: **nothing is sent before there's a key**, and a frame without the right key isn't played.
+- **The call code:** eight digits from the epoch authenticator (RFC 9420 §8.7), the same for everyone in the call and new with every join or leave. Read out, it shows nobody's view of the call was split.
+- **Never reuse a key and nonce:** each call is a fresh group and each epoch fresh keys, so no key outlives its epoch. LiveKit derives the IV from the SSRC and RTP timestamp; a collision needs both repeated under one key.
 - Opus at a constant bitrate, no DTX, no audio-level header extension.
-- The SFU and any relay forward ciphertext they can't decode.
+- The SFU forwards ciphertext it can't decode.
 
-The full call design gets its own document before M3.
+**Known limits of Phase A:**
+- No per-sender authentication of frames: any member could forge frames as another (RFC 9605 §7.2 says the same of SFrame; signing frames costs too much).
+- Codec headers stay in the clear (the first byte of each Opus frame; for video, VP8's first 3–10 bytes).
+- LiveKit's key index byte isn't authenticated, and there's no replay protection.
+
+Phase B, before calls lose the beta label, moves to RFC 9605 SFrame in its MLS mode.
 
 ## 12. New devices, verification and recovery
 

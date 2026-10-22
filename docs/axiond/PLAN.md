@@ -317,6 +317,11 @@ Reliability is the second priority, for the server and the apps alike:
     - the call bar, with mute and microphone and speaker choice;
     - one automatic rejoin.
   - **Tests:** end to end through a real axiond, with str0m clients and with libwebrtc ones. Still to check: on screen with real devices, and macOS.
+- **Phase 2 (2026-10-22): calls are end-to-end encrypted (beta).**
+  - Each call has its own MLS group. Devices join it by themselves, the server proposes removals, and every join or leave is a new epoch.
+  - Per-sender keys come from the exporter and go into LiveKit's frame encryption. Nothing is sent before there's a key.
+  - The call bar shows a code everyone sees the same, and ✓ for verified people. See [E2EE.md §11](E2EE.md#11-calls).
+  - Calls stay behind the `calls` feature until video (Phase 3), since voice and video ship together.
 
 ## Mobile and push
 
