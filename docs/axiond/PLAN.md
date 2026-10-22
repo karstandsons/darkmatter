@@ -308,6 +308,15 @@ Reliability is the second priority, for the server and the apps alike:
 - **Reliability:** ICE restart on network changes, a two-level reconnect (resume, then rejoin), a call-quality badge, deterministic SFU tests with str0m's network impairment simulator, and headless libwebrtc clients in CI.
 - **Escape hatch:** if the Phase 0 spike shows str0m can't keep up, LiveKit's server in a second container with the same client and encryption.
 - **Phase 0 result (2026-10-22): go for str0m** ([spikes/calls](../../spikes/calls/README.md)). One SFU thread on a desktop core forwarded a 20-person audio call at 18% of a core, and eight 5-person video calls at once at 37%, with every audio frame delivered. Allowing for a slower VPS core, a 2-vCPU VPS has room to spare; traffic is the limit. libwebrtc adds about 20 MB to Darkmatter.
+- **Phase 1 (2026-10-22, audio; behind Darkmatter's `calls` build feature until Phase 2):**
+  - **axiond:** the SFU (`calls`), with join, leave and decline, and `call_updated` / `call_declined` events.
+  - **`dm-call`:** libwebrtc's audio device module with echo cancellation. Opus is pinned to CBR with no DTX and with FEC, and the audio-level header is dropped. Who's speaking comes from the decoded audio.
+  - **Darkmatter:**
+    - 📞 in title bars, `/call` and `/hangup`;
+    - ringing in direct and group messages, with Accept, Decline and busy;
+    - the call bar, with mute and microphone and speaker choice;
+    - one automatic rejoin.
+  - **Tests:** end to end through a real axiond, with str0m clients and with libwebrtc ones. Still to check: on screen with real devices, and macOS.
 
 ## Mobile and push
 
