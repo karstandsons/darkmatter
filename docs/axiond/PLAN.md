@@ -327,7 +327,13 @@ Reliability is the second priority, for the server and the apps alike:
   - The camera comes through nokhwa: V4L2 on Linux, AVFoundation on macOS.
   - Darkmatter shows a tile per person with their camera on, over the call's channel, and the camera can be picked under Devices.
   - A late joiner gets a keyframe through the SFU (0.6 s in tests).
-  - Not yet: drawing frames with a shader instead of an image per frame, and screen sharing (Phase 4).
+  - Not yet: drawing frames with a shader instead of an image per frame.
+- **Phase 4 (2026-10-23, screen sharing):**
+  - A screen track in every call, encoded as screen content at up to 15 fps and 2 Mbps, encrypted like the rest.
+  - The system's own picker chooses the screen: the portal and PipeWire on Wayland, ScreenCaptureKit on macOS. The SFU passes track names on, so a screen arrives apart from the camera.
+  - Darkmatter shows others' screens big over the channel, with the camera tiles below them.
+  - Still to try: a real share through the Wayland portal, which needs someone to pick a screen.
+  - Next: reliability (Phase 5) and SFrame (Phase 6) before calls lose the beta label, and taking the `calls` feature into releases.
 
 ## Mobile and push
 
