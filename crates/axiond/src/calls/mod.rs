@@ -3,10 +3,11 @@
 //!
 //! A call lives in memory: one per channel, from the first person joining
 //! to the last leaving. Each person is in it from one device; joining from
-//! another moves them there. Media is DTLS-SRTP to the server only, so calls
-//! aren't end-to-end encrypted yet (M3 Phase 2), and Darkmatter keeps them
-//! behind a build feature until they are.
+//! another moves them there. Media is end-to-end encrypted with keys from
+//! the call's own MLS group (`group`), which the server tracks but can't
+//! read.
 
+pub mod group;
 mod sfu;
 
 use std::collections::HashMap;
@@ -35,6 +36,8 @@ pub struct Calls {
     sfu: OnceLock<Sfu>,
     calls: Mutex<HashMap<String, Call>>,
     next_peer: AtomicU64,
+    /// The server's MLS key, for checking call groups.
+    rows: OnceLock<group::ServerRows>,
 }
 
 struct Sfu {
@@ -49,6 +52,8 @@ struct Call {
     start_at: i64,
     owner_id: String,
     members: Vec<Member>,
+    /// Its MLS group, once the first device set it up.
+    group: Option<group::Group>,
 }
 
 struct Member {
@@ -73,7 +78,7 @@ impl Call {
 /// Starts the SFU on the configured UDP address. Devices are told to send
 /// to `calls_public_ip` (or the address it's bound to) and its port. Without
 /// an address to give them, calls stay off.
-pub fn start(app: &App) -> anyhow::Result<()> {
+pub async fn start(app: &App) -> anyhow::Result<()> {
     let bind = app.config.calls_udp.unwrap_or_else(|| SocketAddr::new(app.config.listen.ip(), 0));
     let socket = UdpSocket::bind(bind).map_err(|e| anyhow::anyhow!("binding the calls UDP port {bind}: {e}"))?;
     let bound = socket.local_addr()?;
@@ -86,6 +91,7 @@ pub fn start(app: &App) -> anyhow::Result<()> {
         None => bound.ip(),
     };
     let candidate = SocketAddr::new(ip, bound.port());
+    let _ = app.calls.rows.set(group::server_rows(app).await?);
     str0m::crypto::from_feature_flags().install_process_default();
     let (tx, rx) = mpsc::channel();
     let (gone_tx, mut gone_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -98,10 +104,8 @@ pub fn start(app: &App) -> anyhow::Result<()> {
     let app = app.clone();
     tokio::spawn(async move {
         while let Some(peer) = gone_rx.recv().await {
-            let left = app.calls.remove(|m| m.peer == peer);
-            for (channel_id, call) in left {
-                announce(&app, &channel_id, call, false).await;
-            }
+            let left = app.calls.remove(&app, None, |m| m.peer == peer);
+            announce_all(&app, left).await;
         }
     });
     Ok(())
@@ -118,27 +122,30 @@ impl Calls {
         }
     }
 
-    /// Takes out the members `which` matches, from every call. Returns each
-    /// changed call's channel and what's left of it (`None`: it ended).
-    fn remove(&self, which: impl Fn(&Member) -> bool) -> Vec<(String, Option<CallInfo>)> {
+    /// Takes out the members `which` matches, from `channel`'s call or every
+    /// call, and proposes their devices' removal from its group.
+    fn remove(&self, app: &App, channel: Option<&str>, which: impl Fn(&Member) -> bool) -> Vec<Change> {
         let mut changed = Vec::new();
         let mut gone = Vec::new();
         {
             let mut calls = self.calls.lock().unwrap();
             calls.retain(|channel_id, call| {
-                let before = call.members.len();
-                call.members.retain(|m| {
-                    let out = which(m);
-                    if out {
-                        gone.push(m.peer);
-                    }
-                    !out
-                });
-                if call.members.len() == before {
+                if channel.is_some_and(|c| c != channel_id) {
                     return true;
                 }
+                let (out, kept): (Vec<Member>, Vec<Member>) = std::mem::take(&mut call.members).into_iter().partition(&which);
+                call.members = kept;
+                if out.is_empty() {
+                    return true;
+                }
+                gone.extend(out.iter().map(|m| m.peer));
                 let empty = call.members.is_empty();
-                changed.push((channel_id.clone(), (!empty).then(|| call.info())));
+                let seq = if empty { None } else { out.iter().filter_map(|m| call.propose_removal(app, m)).max() };
+                changed.push(Change {
+                    channel_id: channel_id.clone(),
+                    call: (!empty).then(|| call.info()),
+                    mls: seq.map(|s| (s, call.members.iter().map(|m| m.user_id.clone()).collect())),
+                });
                 !empty
             });
         }
@@ -146,6 +153,23 @@ impl Calls {
             self.send(sfu::Cmd::Remove { peer });
         }
         changed
+    }
+}
+
+/// A call that changed: what's left of it (`None`: it ended), and a
+/// removal proposal in its group to tell those still in it about.
+struct Change {
+    channel_id: String,
+    call: Option<CallInfo>,
+    mls: Option<(i64, Vec<String>)>,
+}
+
+async fn announce_all(app: &App, changes: Vec<Change>) {
+    for c in changes {
+        if let Some((seq, users)) = &c.mls {
+            group::tell(app, &c.channel_id, users, *seq);
+        }
+        announce(app, &c.channel_id, c.call, false).await;
     }
 }
 
@@ -165,7 +189,7 @@ pub async fn join(app: &App, me: &Me, channel_id: &str, offer: &str) -> Result<J
     let answer = rtc.sdp_api().accept_offer(offer).map_err(|e| Error::bad_request(format!("Couldn't accept that offer: {e}")))?;
 
     let peer = app.calls.next_peer.fetch_add(1, Ordering::Relaxed);
-    let (info, room, started, moved) = {
+    let (info, room, started, moved, mls) = {
         let mut calls = app.calls.calls.lock().unwrap();
         let started = !calls.contains_key(channel_id);
         let call = calls.entry(channel_id.to_string()).or_insert_with(|| Call {
@@ -174,28 +198,34 @@ pub async fn join(app: &App, me: &Me, channel_id: &str, offer: &str) -> Result<J
             start_at: ids::now(),
             owner_id: me.user_id.clone(),
             members: Vec::new(),
+            group: None,
         });
-        // From another device: the call moves here.
-        let moved: Vec<u64> = call.members.iter().filter(|m| m.user_id == me.user_id).map(|m| m.peer).collect();
-        call.members.retain(|m| m.user_id != me.user_id);
+        // From another device: the call moves here, and the old one goes
+        // from the group.
+        let (moved, kept): (Vec<Member>, Vec<Member>) = std::mem::take(&mut call.members).into_iter().partition(|m| m.user_id == me.user_id);
+        call.members = kept;
+        let seq = moved.iter().filter_map(|m| call.propose_removal(app, m)).max();
         if call.members.len() >= MAX_PARTICIPANTS {
             return Err(Error::bad_request("This call is full."));
         }
         call.members.push(Member { peer, user_id: me.user_id.clone(), device_id: me.device_id.clone(), joined_at: ids::now() });
-        (call.info(), call.id.clone(), started, moved)
+        let mls = seq.map(|s| (s, call.members.iter().filter(|m| m.user_id != me.user_id).map(|m| m.user_id.clone()).collect::<Vec<_>>()));
+        (call.info(), call.id.clone(), started, moved, mls)
     };
-    for peer in moved {
-        app.calls.send(sfu::Cmd::Remove { peer });
+    for m in moved {
+        app.calls.send(sfu::Cmd::Remove { peer: m.peer });
     }
     app.calls.send(sfu::Cmd::Add { peer, user: me.user_id.clone(), room, rtc: Box::new(rtc) });
+    if let Some((seq, users)) = mls {
+        group::tell(app, channel_id, &users, seq);
+    }
     announce(app, channel_id, Some(info.clone()), started).await;
     Ok(JoinedCall { call: info, answer: answer.to_sdp_string() })
 }
 
 pub async fn leave(app: &App, user_id: &str, channel_id: &str) {
-    for (channel_id, call) in app.calls.remove(|m| m.user_id == user_id).into_iter().filter(|(c, _)| c == channel_id) {
-        announce(app, &channel_id, call, false).await;
-    }
+    let changes = app.calls.remove(app, Some(channel_id), |m| m.user_id == user_id);
+    announce_all(app, changes).await;
 }
 
 /// Turns down a ringing call: the caller and this person's other devices
@@ -227,9 +257,8 @@ pub async fn user_left(app: &App, channel_id: &str, user_id: &str) {
 
 /// A device was signed out or revoked: out of any call it's in.
 pub async fn device_gone(app: &App, user_id: &str, device_id: &str) {
-    for (channel_id, call) in app.calls.remove(|m| m.user_id == user_id && m.device_id == device_id) {
-        announce(app, &channel_id, call, false).await;
-    }
+    let changes = app.calls.remove(app, None, |m| m.user_id == user_id && m.device_id == device_id);
+    announce_all(app, changes).await;
 }
 
 async fn member_channel(app: &App, me: &Me, channel_id: &str) -> Result<db::ChannelRow> {

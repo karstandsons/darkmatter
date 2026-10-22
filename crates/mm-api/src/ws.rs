@@ -61,6 +61,8 @@ pub enum Event {
     /// axiond: someone turned down a call (to stop it ringing on their
     /// other devices, and tell the caller).
     CallDeclined { channel_id: String, user_id: String },
+    /// axiond: the group of the call this device is in has a new handshake.
+    CallMls { channel_id: String, seq: i64 },
     /// Any event without a typed variant yet.
     Other(RawEvent),
 }
@@ -123,6 +125,7 @@ impl RawEvent {
             "e2ee_event" => self.nested("event").map(Event::E2ee),
             "call_updated" => serde_json::from_value(self.data.clone()).ok().map(|u| Event::Call(Box::new(u))),
             "call_declined" => Some(Event::CallDeclined { channel_id: self.str("channel_id"), user_id: self.str("user_id") }),
+            "call_mls" => Some(Event::CallMls { channel_id: self.str("channel_id"), seq: self.int("seq") }),
             "reaction_removed" => self.nested("reaction").map(Event::ReactionRemoved),
             "channel_viewed" => Some(Event::ChannelViewed { channel_id: self.str("channel_id") }),
             "thread_updated" => self.nested("thread").map(Event::ThreadUpdated),

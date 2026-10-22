@@ -3222,6 +3222,7 @@ impl Chat {
             }
             M::Event(Event::Call(update)) => crate::call::updated(self, *update),
             M::Event(Event::CallDeclined { channel_id, user_id }) => crate::call::declined(self, &channel_id, &user_id),
+            M::Event(Event::CallMls { channel_id, .. }) => crate::call::update(self, crate::call::Msg::Sync(channel_id)),
             M::Event(Event::Typing { channel_id, user_id, parent_id }) => {
                 self.typing.insert((channel_id, user_id, parent_id), Instant::now());
                 Task::none()

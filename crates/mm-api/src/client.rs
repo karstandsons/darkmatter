@@ -549,6 +549,27 @@ impl Client {
         self.get("calls").await
     }
 
+    /// The MLS group of the call this device is in, for joining it (404:
+    /// nobody has set it up yet).
+    pub async fn call_group(&self, channel_id: &str) -> Result<GroupState, Error> {
+        self.get(&format!("calls/{channel_id}/group")).await
+    }
+
+    /// Sets up the call's group, this device alone in it (409: another got
+    /// there first).
+    pub async fn create_call_group(&self, channel_id: &str, group_info: &str) -> Result<GroupState, Error> {
+        self.send(Method::POST, &format!("calls/{channel_id}/group"), Some(&json!({ "group_info": group_info }))).await
+    }
+
+    /// A commit to the call's group (409: it moved on; catch up and retry).
+    pub async fn post_call_handshake(&self, channel_id: &str, handshake: &NewHandshake) -> Result<HandshakeEntry, Error> {
+        self.send(Method::POST, &format!("calls/{channel_id}/handshake"), Some(handshake)).await
+    }
+
+    pub async fn call_handshakes(&self, channel_id: &str, after: i64) -> Result<Vec<HandshakeEntry>, Error> {
+        self.get(&format!("calls/{channel_id}/handshakes?after={after}")).await
+    }
+
     pub async fn handshakes(&self, channel_id: &str, after: i64) -> Result<Vec<HandshakeEntry>, Error> {
         self.get(&format!("e2ee/channels/{channel_id}/handshake?after={after}")).await
     }

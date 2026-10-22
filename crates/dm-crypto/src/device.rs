@@ -433,10 +433,18 @@ impl<S: StorageProvider<CURRENT_VERSION>> Device<S> {
     }
 
     /// A secret both ends of a group can derive and no one else can (MLS
-    /// exporter): for call keys later.
+    /// exporter): call keys ([`crate::call`]).
     pub fn export_secret(&self, channel_id: &str, label: &str, context: &[u8], len: usize) -> Result<Vec<u8>> {
         let group = self.load(channel_id)?;
         group.export_secret(self.provider.crypto(), label, context, len).map_err(mls)
+    }
+}
+
+impl<S: StorageProvider<CURRENT_VERSION>> Device<S> {
+    /// The group's epoch authenticator (RFC 9420 §8.7): the same for every
+    /// member in an epoch, so comparing it shows nobody's view was split.
+    pub fn epoch_authenticator(&self, channel_id: &str) -> Result<Vec<u8>> {
+        Ok(self.load(channel_id)?.epoch_authenticator().as_slice().to_vec())
     }
 }
 

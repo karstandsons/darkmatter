@@ -66,7 +66,7 @@ impl App {
         let tls = self.config.tls()?;
         self.schedule_backups();
         housekeeping::start(&self);
-        calls::start(&self)?;
+        calls::start(&self).await?;
         let config = self.config.clone();
         let service = api::router(self).into_make_service_with_connect_info::<std::net::SocketAddr>();
         match tls {

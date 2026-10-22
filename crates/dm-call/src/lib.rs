@@ -7,8 +7,11 @@
 //! over the API, answers the SFU when it adds someone's track (over a data
 //! channel), and reports how the connection is and who's speaking.
 //!
-//! Media is DTLS-SRTP to the server only: end-to-end encryption of calls is
-//! M3 Phase 2.
+//! Media is end-to-end encrypted (M3 Phase 2, "Phase A" in
+//! research/calls.md §4.5): LiveKit's frame encryption (AES-GCM) with a
+//! key per person, which the app sets with [`Call::set_keys`] from the
+//! call's own MLS group. Nothing is sent until the first keys are in, and
+//! a frame without the right key isn't played.
 
 use std::collections::HashMap;
 use std::f32::consts::TAU;
@@ -19,6 +22,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use libwebrtc::audio_source::native::NativeAudioSource;
 use libwebrtc::audio_stream::native::NativeAudioStream;
+use libwebrtc::native::frame_cryptor::{EncryptionAlgorithm, FrameCryptor, KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
 use libwebrtc::peer_connection::TrackEvent;
 use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
 use libwebrtc::prelude::*;
@@ -30,6 +34,12 @@ use tokio::task::JoinHandle;
 pub use mm_api::models::Call as CallInfo;
 
 const RATE: u32 = 48_000;
+/// Epochs' keys kept at once: a frame names its key by `epoch % RING`.
+const RING: u64 = 16;
+/// How long after a new epoch's keys arrive a sender switches to them,
+/// so the others have them first. A device just taken out can still read
+/// this long.
+const SWITCH_AFTER: Duration = Duration::from_secs(1);
 /// How often [`Update::Levels`] comes.
 const LEVELS_EVERY: Duration = Duration::from_millis(250);
 
@@ -174,6 +184,13 @@ struct CallInner {
     api: Client,
     pc: PeerConnection,
     mic: RtcAudioTrack,
+    keys: KeyProvider,
+    /// This device's sender's encryptor, and the receivers' decryptors
+    /// (only held, so they stay on).
+    sending: FrameCryptor,
+    _receiving: Arc<Mutex<Vec<FrameCryptor>>>,
+    /// The newest epoch whose keys are set.
+    epoch: Mutex<Option<u64>>,
     updates: Mutex<Option<mpsc::UnboundedReceiver<Update>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     _media: Media,
@@ -200,6 +217,15 @@ impl Call {
     pub async fn join(media: &Media, api: &Client, channel_id: &str, mic: Mic) -> Result<(Call, CallInfo), Error> {
         let factory = &media.0.factory;
         let (tx, rx) = mpsc::unbounded_channel();
+        let keys = KeyProvider::new(KeyProviderOptions {
+            shared_key: false,
+            ratchet_window_size: 0,
+            ratchet_salt: b"darkmatter call v1".to_vec(),
+            failure_tolerance: -1,
+            key_ring_size: RING as i32,
+            key_derivation_algorithm: KeyDerivationAlgorithm::HKDF,
+        });
+        let receiving: Arc<Mutex<Vec<FrameCryptor>>> = Arc::default();
         let pc = factory.create_peer_connection(RtcConfiguration::default()).map_err(media_err)?;
         let mut tasks = Vec::new();
         let handle = tokio::runtime::Handle::current();
@@ -220,9 +246,14 @@ impl Call {
         let levels: Arc<Mutex<HashMap<String, f32>>> = Arc::default();
         let heard = levels.clone();
         let spawn = handle.clone();
+        let (decrypt, decryptors, factory2) = (keys.clone(), receiving.clone(), factory.clone());
         pc.on_track(Some(Box::new(move |ev: TrackEvent| {
             let MediaStreamTrack::Audio(track) = ev.track else { return };
             let user = ev.streams.first().map(|s| s.id()).unwrap_or_default();
+            // Each person's frames, with their key.
+            let cryptor = FrameCryptor::new_for_rtp_receiver(&factory2, user.clone(), EncryptionAlgorithm::AesGcm, decrypt.clone(), ev.receiver);
+            cryptor.set_enabled(true);
+            decryptors.lock().unwrap().push(cryptor);
             let heard = heard.clone();
             spawn.spawn(async move {
                 let mut stream = NativeAudioStream::new(track, RATE as i32, 1);
@@ -287,7 +318,11 @@ impl Call {
                 track
             }
         };
-        pc.add_track(mic_track.clone().into(), &["me"]).map_err(media_err)?;
+        let sender = pc.add_track(mic_track.clone().into(), &["me"]).map_err(media_err)?;
+        // Encrypted from the first frame: without a key yet, nothing goes.
+        let me = api.me().await?.id;
+        let sending = FrameCryptor::new_for_rtp_sender(factory, me, EncryptionAlgorithm::AesGcm, keys.clone(), sender);
+        sending.set_enabled(true);
 
         // The SFU is ICE-lite: it learns this device's address from its
         // checks, so the offer goes without waiting for candidates.
@@ -302,6 +337,10 @@ impl Call {
             api: api.clone(),
             pc,
             mic: mic_track,
+            keys,
+            sending,
+            _receiving: receiving,
+            epoch: Mutex::new(None),
             updates: Mutex::new(Some(rx)),
             tasks: Mutex::new(tasks),
             _media: media.clone(),
@@ -316,6 +355,42 @@ impl Call {
     /// What the call reports. Only the first caller gets them.
     pub fn updates(&self) -> Option<mpsc::UnboundedReceiver<Update>> {
         self.0.updates.lock().unwrap().take()
+    }
+
+    /// An epoch's keys, from the call's group: each person's (by user id).
+    /// Receivers use them at once; this device sends with its own after a
+    /// moment (at once for the first), so the others have them first.
+    pub fn set_keys(&self, epoch: u64, keys: &[(String, Vec<u8>)]) {
+        let slot = (epoch % RING) as i32;
+        for (user, key) in keys {
+            self.0.keys.set_key(user.clone(), slot, key.clone());
+        }
+        let first = {
+            let mut newest = self.0.epoch.lock().unwrap();
+            if newest.is_some_and(|n| n >= epoch) {
+                return;
+            }
+            newest.replace(epoch).is_none()
+        };
+        if first {
+            self.0.sending.set_key_index(slot);
+            return;
+        }
+        let call = Arc::downgrade(&self.0);
+        tokio::spawn(async move {
+            tokio::time::sleep(SWITCH_AFTER).await;
+            if let Some(call) = call.upgrade()
+                && *call.epoch.lock().unwrap() == Some(epoch)
+            {
+                call.sending.set_key_index(slot);
+            }
+        });
+    }
+
+    /// How many media packets this device has sent: none until it has keys.
+    pub async fn packets_sent(&self) -> u64 {
+        let stats = self.0.pc.get_stats().await.unwrap_or_default();
+        stats.iter().map(|s| if let libwebrtc::stats::RtcStats::OutboundRtp(o) = s { o.sent.packets_sent } else { 0 }).sum()
     }
 
     /// Mutes the microphone (nothing is sent but silence) or unmutes it.

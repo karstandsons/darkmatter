@@ -560,7 +560,7 @@ pub async fn post_event(State(app): State<App>, me: Me, Path(channel_id): Path<S
 
 #[derive(Deserialize)]
 pub struct NewGroup {
-    group_info: String,
+    pub(crate) group_info: String,
 }
 
 /// Starts a channel's group: the creating device alone, at epoch 0.
@@ -672,7 +672,7 @@ pub async fn post_handshake(State(app): State<App>, me: Me, Path(channel_id): Pa
 #[derive(Deserialize)]
 pub struct After {
     #[serde(default)]
-    after: i64,
+    pub(crate) after: i64,
 }
 
 /// The group's handshakes after `after`, in order (at most 500 at a time).

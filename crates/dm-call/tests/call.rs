@@ -55,6 +55,19 @@ async fn until_heard(updates: &mut UnboundedReceiver<Update>, user: &str, loud: 
     panic!("{user} never {}: {:?}", if loud { "heard" } else { "went quiet" }, seen.iter().rev().take(4).collect::<Vec<_>>());
 }
 
+/// Level reports for `wait`, in which `user` is never audible.
+async fn quiet_for(updates: &mut UnboundedReceiver<Update>, user: &str, wait: Duration) -> Vec<Update> {
+    let until = Instant::now() + wait;
+    let mut seen = Vec::new();
+    while let Ok(Some(update)) = tokio::time::timeout(until.saturating_duration_since(Instant::now()), updates.recv()).await {
+        if let Update::Levels(levels) = &update {
+            assert!(levels.iter().all(|(u, l)| u != user || *l < 0.05), "{user} heard without keys: {levels:?}");
+        }
+        seen.push(update);
+    }
+    seen
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn two_devices_hear_each_other_and_mute() {
     let s = server().await;
@@ -73,10 +86,25 @@ async fn two_devices_hear_each_other_and_mute() {
     let mut b_updates = b.updates().unwrap();
     assert!(a.updates().is_none(), "updates go to one place");
 
-    // Each hears the other, through the SFU.
-    let seen = until_heard(&mut a_updates, &bob_id, true).await;
+    // Without keys nothing is sent: connected, but silent.
+    let seen = quiet_for(&mut a_updates, &bob_id, Duration::from_secs(3)).await;
     assert!(seen.contains(&Update::Connected), "{seen:?}");
+    assert_eq!((a.packets_sent().await, b.packets_sent().await), (0, 0), "nothing leaves without a key");
+    // With the same keys, each hears the other, through the SFU.
+    let keys = |epoch: u8| vec![(alice_id.clone(), vec![epoch; 32]), (bob_id.clone(), vec![epoch + 100; 32])];
+    a.set_keys(0, &keys(0));
+    b.set_keys(0, &keys(0));
+    until_heard(&mut a_updates, &bob_id, true).await;
     until_heard(&mut b_updates, &alice_id, true).await;
+    assert!(a.packets_sent().await > 0);
+
+    // Alice moves to the next epoch's keys and bob doesn't have them: once
+    // she switches (a second on), he can't read her; then he gets them.
+    a.set_keys(1, &keys(1));
+    until_heard(&mut b_updates, &alice_id, false).await;
+    b.set_keys(1, &keys(1));
+    until_heard(&mut b_updates, &alice_id, true).await;
+    until_heard(&mut a_updates, &bob_id, true).await;
 
     // Bob mutes: alice hears silence from him; he still hears her.
     b.set_muted(true);

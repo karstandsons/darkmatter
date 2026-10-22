@@ -15,6 +15,7 @@
 //! Shared by Darkmatter (its encrypted vault is the store) and, later, the
 //! phone apps. Everything that changes a group runs one at a time.
 
+mod calls;
 pub mod files;
 mod store;
 
@@ -412,6 +413,8 @@ pub struct E2ee<S> {
     /// Key changes not dealt with yet, by user: the new key ("" once dealt
     /// with), as last given to the store.
     changes: Mutex<HashMap<String, String>>,
+    /// The last handshake applied in each call's group, by call group.
+    call_cursors: Mutex<HashMap<String, i64>>,
 }
 
 /// Where you stand with someone, as this device knows it.
@@ -453,7 +456,7 @@ impl<S: LocalStore> E2ee<S> {
     }
 
     fn new(api: Client, user_id: &str, device: Device<MemoryStorage>, own: UserIdentity, server: ServerKey, store: S, saved: HashMap<Vec<u8>, Vec<u8>>) -> Self {
-        E2ee { api, user_id: user_id.into(), device, identity: own.public(), own, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false, file_keys: Default::default(), caught_up: Default::default(), recent: Default::default(), known: Default::default(), changes: Default::default() }
+        E2ee { api, user_id: user_id.into(), device, identity: own.public(), own, server, store, saved: Mutex::new(saved), lock: Default::default(), away: false, file_keys: Default::default(), caught_up: Default::default(), recent: Default::default(), known: Default::default(), changes: Default::default(), call_cursors: Default::default() }
     }
 
     /// Gives the store whatever openmls changed since the last time.

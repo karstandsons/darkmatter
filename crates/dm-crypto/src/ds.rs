@@ -37,6 +37,9 @@ pub struct Applied {
     pub external: bool,
     pub added: Vec<DeviceName>,
     pub removed: Vec<DeviceName>,
+    /// Removals the server had proposed that this external join couldn't
+    /// carry ([`Server::commit_call`] only): the server proposes them again.
+    pub still_to_remove: Vec<DeviceName>,
 }
 
 pub struct Server<S> {
@@ -133,6 +136,38 @@ impl<S: StorageProvider<CURRENT_VERSION>> Server<S> {
         may_join: impl Fn(&str) -> bool,
         directory: &impl Directory,
     ) -> Result<Applied, Refusal> {
+        self.check(channel_id, sender, commit, group_info, may_join, directory, false)
+    }
+
+    /// [`Server::commit`] for a call's group, where devices come and go
+    /// often and each joins by external commit, which can't carry the
+    /// server's pending removals (RFC 9420 §12.4.3.2). Such a join is let
+    /// through without them; they're in [`Applied::still_to_remove`], for
+    /// the server to propose again in the new epoch. A member's commit must
+    /// still carry them.
+    pub fn commit_call(
+        &self,
+        group_id: &str,
+        sender: &DeviceName,
+        commit: &[u8],
+        group_info: &[u8],
+        may_join: impl Fn(&str) -> bool,
+        directory: &impl Directory,
+    ) -> Result<Applied, Refusal> {
+        self.check(group_id, sender, commit, group_info, may_join, directory, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check(
+        &self,
+        channel_id: &str,
+        sender: &DeviceName,
+        commit: &[u8],
+        group_info: &[u8],
+        may_join: impl Fn(&str) -> bool,
+        directory: &impl Directory,
+        external_may_skip: bool,
+    ) -> Result<Applied, Refusal> {
         let mut group = self.load(channel_id)?;
         let current = group.group_context().epoch().as_u64();
         let message = parse_protocol(commit)?;
@@ -201,8 +236,14 @@ impl<S: StorageProvider<CURRENT_VERSION>> Server<S> {
                 _ => None,
             })
             .collect();
-        if let Some(missing) = pending.iter().find(|leaf| !removed_leaves.contains(leaf)) {
-            return Err(Error::Untrusted(format!("the commit leaves out the server's removal of leaf {}", missing.u32())).into());
+        let mut still_to_remove = Vec::new();
+        for missing in pending.iter().filter(|leaf| !removed_leaves.contains(leaf)) {
+            if !(external_join && external_may_skip) {
+                return Err(Error::Untrusted(format!("the commit leaves out the server's removal of leaf {}", missing.u32())).into());
+            }
+            if let Some(leaf) = group.leaf(*missing) {
+                still_to_remove.push(identity::parse_credential(leaf.credential())?);
+            }
         }
 
         let info = parse_group_info(group_info)?;
@@ -211,7 +252,7 @@ impl<S: StorageProvider<CURRENT_VERSION>> Server<S> {
         }
         group.merge_commit(self.provider.storage(), *staged).map_err(mls)?;
         let epoch = group.group_context().epoch().as_u64();
-        Ok(Applied { epoch, external: external_join, added, removed })
+        Ok(Applied { epoch, external: external_join, added, removed, still_to_remove })
     }
 
     /// Proposes removing a device (it left the channel, or its session was

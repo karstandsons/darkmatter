@@ -13,13 +13,15 @@
 //! - [`recovery`]: the identity key backed up under a recovery key or a
 //!   passphrase;
 //! - [`ds`]: the server's side, which checks handshake messages without
-//!   seeing any secrets and may propose removals.
+//!   seeing any secrets and may propose removals;
+//! - [`call`]: media keys for calls, from each call's own group.
 //!
 //! No primitive here is our own. Anything beyond MLS uses a named, reviewed
 //! construction (Ed25519 for device certificates, HPKE for linking a
 //! device, HKDF, argon2id and XChaCha20-Poly1305 for the backup) and says
 //! so.
 
+pub mod call;
 pub mod device;
 pub mod ds;
 pub mod file;

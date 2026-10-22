@@ -2,8 +2,9 @@
 //! direct or group message, and the bar while you're in one.
 //!
 //! The calls going on come from the server's `call_updated` events whatever
-//! the build; joining needs the `calls` feature (dm-call, libwebrtc), which
-//! stays off in releases until calls are end-to-end encrypted (M3 Phase 2).
+//! the build; joining needs the `calls` feature (dm-call, libwebrtc). Media
+//! is end-to-end encrypted with keys from the call's own MLS group, which
+//! this device joins with the call (dm-client) and follows on `call_mls`.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -38,6 +39,10 @@ pub enum Msg {
     Calls(Vec<CallInfo>),
     /// Show or hide the microphones and speakers to pick from.
     Devices,
+    /// The call's group has a new handshake: catch up.
+    Sync(String),
+    /// The call's keys, new or changed (`None`: unchanged).
+    Keys(Result<Option<dm_crypto::call::Keys>, String>),
 }
 
 /// What [`Msg::Joined`] carries: the live call (with the feature).
@@ -86,6 +91,10 @@ pub struct Active {
     /// Joined again once after the connection failed: the next failure ends it.
     #[cfg_attr(not(feature = "calls"), allow(dead_code))]
     rejoined: bool,
+    #[cfg_attr(not(feature = "calls"), allow(dead_code))]
+    pub call_id: String,
+    /// The code everyone in the call sees the same, once encrypted.
+    pub code: Option<String>,
     /// The microphones' and speakers' names, while the list is open.
     pub devices: Option<(Vec<String>, Vec<String>)>,
 }
@@ -157,6 +166,7 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
             #[cfg(feature = "calls")]
             {
                 let updates = joined.call.updates();
+                let keys = join_keys(chat, &joined.channel_id, &joined.info.id);
                 chat.call = Some(Active {
                     call: joined.call,
                     channel_id: joined.channel_id,
@@ -166,13 +176,22 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
                     levels: HashMap::new(),
                     rejoined: joined.rejoined,
                     devices: None,
+                    call_id: joined.info.id.clone(),
+                    code: None,
                 });
-                if let Some(rx) = updates {
-                    let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|u| (u, rx)) });
-                    return Task::run(stream, |u| Message::Call(Msg::Update(u)));
+                match updates {
+                    Some(rx) => {
+                        let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|u| (u, rx)) });
+                        Task::batch([keys, Task::run(stream, |u| Message::Call(Msg::Update(u)))])
+                    }
+                    None => keys,
                 }
             }
-            Task::none()
+            #[cfg(not(feature = "calls"))]
+            {
+                let _ = joined;
+                Task::none()
+            }
         }
         Msg::Joined(Err(e)) => {
             chat.error = Some(format!("Couldn't join the call: {e}"));
@@ -209,6 +228,41 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
             Task::none()
         }
         Msg::Leave => leave(chat),
+        Msg::Sync(channel_id) => {
+            let (Some(active), Some(crypto)) = (&chat.call, chat.crypto.clone()) else { return Task::none() };
+            if active.channel_id != channel_id {
+                return Task::none();
+            }
+            let call_id = active.call_id.clone();
+            Task::perform(
+                async move {
+                    match crypto.sync_call(&channel_id, &call_id).await {
+                        // Lost track of the group: join it again.
+                        Err(e) => {
+                            tracing::warn!("call encryption: {e}; joining again");
+                            crypto.join_call(&channel_id, &call_id).await.map(Some)
+                        }
+                        ok => ok,
+                    }
+                },
+                |r| Message::Call(Msg::Keys(r)),
+            )
+        }
+        Msg::Keys(Ok(None)) => Task::none(),
+        Msg::Keys(Ok(Some(keys))) => {
+            let Some(active) = &mut chat.call else { return Task::none() };
+            active.code = Some(keys.code.clone());
+            #[cfg(feature = "calls")]
+            {
+                let by_user: Vec<(String, Vec<u8>)> = keys.senders.into_iter().map(|((user, _), key)| (user, key)).collect();
+                active.call.set_keys(keys.epoch, &by_user);
+            }
+            Task::none()
+        }
+        Msg::Keys(Err(e)) => {
+            chat.error = Some(format!("This call can't be encrypted: {e}"));
+            leave(chat)
+        }
         Msg::Devices => {
             let Some(active) = &mut chat.call else { return Task::none() };
             active.devices = match active.devices.take() {
@@ -284,8 +338,21 @@ fn join(chat: &mut Chat, channel_id: String, rejoined: bool) -> Task<Message> {
     }
 }
 
+/// Joins the call's encryption: its keys come back as [`Msg::Keys`].
+#[cfg_attr(not(feature = "calls"), allow(dead_code))]
+fn join_keys(chat: &Chat, channel_id: &str, call_id: &str) -> Task<Message> {
+    let Some(crypto) = chat.crypto.clone() else {
+        return Task::done(Message::Call(Msg::Keys(Err("this device isn't set up for encryption (see Account)".into()))));
+    };
+    let (channel_id, call_id) = (channel_id.to_string(), call_id.to_string());
+    Task::perform(async move { crypto.join_call(&channel_id, &call_id).await.map(Some) }, |r| Message::Call(Msg::Keys(r)))
+}
+
 fn leave(chat: &mut Chat) -> Task<Message> {
     let Some(active) = chat.call.take() else { return Task::none() };
+    if let Some(crypto) = &chat.crypto {
+        crypto.leave_call(&active.call_id);
+    }
     #[cfg(feature = "calls")]
     {
         let call = active.call;
@@ -417,9 +484,20 @@ pub fn bar<'a>(chat: &'a Chat, c: Colors) -> Option<Element<'a, Message>> {
     let (state, color) = match active.link {
         Link::Connecting => ("connecting…".to_string(), c.yellow),
         Link::Reconnecting => ("reconnecting…".to_string(), c.yellow),
+        Link::Connected if active.code.is_none() => ("securing…".to_string(), c.yellow),
         Link::Connected => (format!("{}:{:02}", secs / 60, secs % 60), c.green),
     };
     let title = row![text("🔊").size(13), text(channel).size(13).font(bold()).color(c.fg_bright), text(state).size(12).color(color)].spacing(6).align_y(iced::Center);
+    // Everyone in the call sees the same code: read out, it shows nobody's in between.
+    let code: Element<'a, Message> = match &active.code {
+        Some(code) => {
+            let tip = container(text("End-to-end encrypted (beta). Everyone in the call sees this same code; it changes when someone joins or leaves.").size(11).width(260))
+                .padding([2, 6])
+                .style(c.panel(c.surface));
+            tooltip(text(format!("🔒 {code}")).size(12).color(c.muted), tip, tooltip::Position::Top).into()
+        }
+        None => text("not encrypted yet: nothing is sent").size(11).color(c.yellow).into(),
+    };
     let mut people = Column::new().spacing(2);
     if let Some(call) = chat.calls.get(&active.channel_id) {
         for p in &call.participants {
@@ -429,13 +507,18 @@ pub fn bar<'a>(chat: &'a Chat, c: Colors) -> Option<Element<'a, Message>> {
             let speaking = level > 0.02;
             let dot = text(if speaking { "●" } else { "○" }).size(10).color(if speaking { c.green } else { c.muted });
             let label = if me && active.muted { format!("{name} (muted)") } else { name };
-            people = people.push(row![dot, text(label).size(12).color(if speaking { c.fg_bright } else { c.fg })].spacing(6).align_y(iced::Center));
+            let mut line = row![dot, text(label).size(12).color(if speaking { c.fg_bright } else { c.fg })].spacing(6).align_y(iced::Center);
+            // Someone whose safety number you compared (/verify).
+            if !me && chat.standing.get(&p.user_id).is_some_and(|s| s.verified) {
+                line = line.push(text("✓").size(11).color(c.green));
+            }
+            people = people.push(line);
         }
     }
     let mute = button(text(if active.muted { "Unmute" } else { "Mute" }).size(12)).padding([3, 10]).on_press(Message::Call(Msg::Mute)).style(c.chip(active.muted));
     let gear = button(text("Devices").size(12)).padding([3, 10]).on_press(Message::Call(Msg::Devices)).style(c.chip(active.devices.is_some()));
     let leave = button(text("Leave").size(12).color(c.red)).padding([3, 10]).on_press(Message::Call(Msg::Leave)).style(c.chip(false));
-    let mut col = column![title, people, row![mute, gear, leave].spacing(8)].spacing(8);
+    let mut col = column![title, code, people, row![mute, gear, leave].spacing(8)].spacing(8);
     if let Some((mics, speakers)) = &active.devices {
         let (mic, speaker) = PREFERRED.lock().unwrap().clone();
         // Nothing picked, or it's unplugged: the system's default ("default: …", listed first).
