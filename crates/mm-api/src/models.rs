@@ -585,3 +585,48 @@ pub struct CommandSuggestion {
     #[serde(default, rename = "Description", alias = "description")]
     pub description: String,
 }
+
+/// axiond: a call in a channel, and who's in it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Call {
+    pub id: String,
+    pub channel_id: String,
+    pub start_at: i64,
+    /// Who started it.
+    pub owner_id: String,
+    pub participants: Vec<CallParticipant>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CallParticipant {
+    pub user_id: String,
+    pub joined_at: i64,
+}
+
+/// Body for `POST calls/{channel_id}/join`: this device's WebRTC offer.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct JoinCall {
+    pub offer: String,
+}
+
+/// The reply: the call as it is now, and the server's WebRTC answer.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct JoinedCall {
+    pub call: Call,
+    pub answer: String,
+}
+
+/// The `call_updated` event: someone started, joined or left a call, or it
+/// ended (`call` is then `None`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CallUpdate {
+    pub channel_id: String,
+    pub call: Option<Call>,
+    /// It just started: a direct or group message rings.
+    pub started: bool,
+}

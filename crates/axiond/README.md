@@ -31,6 +31,11 @@ use it for anything secret yet.
 - Teams, public channels and direct messages: joining, leaving, and finding
   channels by name.
 - Messages: posting, threads, editing, deleting and reactions.
+- Calls (in progress, M3): one per channel, through a small SFU built in
+  (str0m) on one UDP port; joining from another device moves you there,
+  and leaving the channel or signing out takes you out. Media is encrypted
+  to the server only so far, so Darkmatter keeps calls behind a build
+  feature until they're end-to-end encrypted.
 - Files and pictures, up to 100 MB each (`max_file_mb`). Pictures get a
   thumbnail and a preview. Files are stored under random names and only ever
   served as downloads.
@@ -91,6 +96,8 @@ Settings live in `axiond.toml` (in the working directory, or pass
 | `tls_cert`, `tls_key` | `AXIOND_TLS_CERT`, `AXIOND_TLS_KEY` | | Serve HTTPS with your own PEM files |
 | `backup_hours` | `AXIOND_BACKUP_HOURS` | `24` | Back up into `data_dir/backups` this often (0 = never) |
 | `backup_keep` | `AXIOND_BACKUP_KEEP` | `7` | How many of those to keep |
+| `calls_udp` | `AXIOND_CALLS_UDP` | a free port on `listen`'s address | The one UDP port call media uses, e.g. `0.0.0.0:443` |
+| `calls_public_ip` | `AXIOND_CALLS_PUBLIC_IP` | | The address devices send call media to. Needed when `calls_udp` is `0.0.0.0` (calls are off without it) |
 
 ### HTTPS
 

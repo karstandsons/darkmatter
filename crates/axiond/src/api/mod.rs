@@ -1,6 +1,7 @@
 //! The HTTP API, under `/api/v4/` as in Mattermost.
 
 pub(crate) mod accounts;
+mod calls;
 pub(crate) mod channels;
 mod commands;
 pub(crate) mod e2ee;
@@ -17,6 +18,7 @@ mod users;
 mod ws;
 
 pub(crate) use channels::add_member;
+pub(crate) use safety::blocked_between;
 
 use axum::extract::State;
 use axum::routing::{delete, get, post, put};
@@ -68,6 +70,10 @@ pub fn router(app: App) -> Router {
         .route("/e2ee/channels/{id}/events", post(e2ee::post_event))
         .route("/e2ee/welcomes", get(e2ee::welcomes))
         .route("/e2ee/welcomes/{id}", delete(e2ee::ack_welcome))
+        .route("/calls", get(calls::list))
+        .route("/calls/{id}/join", post(calls::join))
+        .route("/calls/{id}/leave", post(calls::leave))
+        .route("/calls/{id}/decline", post(calls::decline))
         .route("/users/ids", post(users::by_ids))
         .route("/users/status/ids", post(status::by_ids))
         .route("/users/{id}/status", get(status::get_one).put(status::put))

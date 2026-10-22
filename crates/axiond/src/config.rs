@@ -1,6 +1,6 @@
 //! `axiond.toml`, with `AXIOND_*` environment variables on top.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -40,6 +40,13 @@ pub struct Config {
     pub backup_hours: u64,
     /// How many of those backups to keep.
     pub backup_keep: usize,
+    /// The UDP address call media comes in on: one port for every call.
+    /// Unset, a free port on `listen`'s address (fine on localhost; open a
+    /// fixed one, e.g. `0.0.0.0:443`, on a server).
+    pub calls_udp: Option<SocketAddr>,
+    /// The address devices send call media to, when `calls_udp` is
+    /// `0.0.0.0` or behind NAT: this server's public IP.
+    pub calls_public_ip: Option<IpAddr>,
 }
 
 impl Default for Config {
@@ -59,6 +66,8 @@ impl Default for Config {
             tls_key: None,
             backup_hours: 24,
             backup_keep: 7,
+            calls_udp: None,
+            calls_public_ip: None,
         }
     }
 }
@@ -120,6 +129,12 @@ impl Config {
         }
         if let Some(v) = var("AXIOND_BACKUP_KEEP") {
             self.backup_keep = v.parse().with_context(|| format!("AXIOND_BACKUP_KEEP={v}"))?;
+        }
+        if let Some(v) = var("AXIOND_CALLS_UDP") {
+            self.calls_udp = some(v).map(|v| v.parse().with_context(|| format!("AXIOND_CALLS_UDP={v}"))).transpose()?;
+        }
+        if let Some(v) = var("AXIOND_CALLS_PUBLIC_IP") {
+            self.calls_public_ip = some(v).map(|v| v.parse().with_context(|| format!("AXIOND_CALLS_PUBLIC_IP={v}"))).transpose()?;
         }
         if let Some(v) = var("AXIOND_MAX_FILE_MB") {
             self.max_file_mb = v.parse().with_context(|| format!("AXIOND_MAX_FILE_MB={v}"))?;
@@ -185,6 +200,14 @@ mod tests {
         assert!(c.tls().is_err());
         c.tls_cert = Some("cert.pem".into());
         assert_eq!(c.tls().unwrap(), Tls::Files("cert.pem".into(), "key.pem".into()));
+        c.apply_env(|k| match k {
+            "AXIOND_CALLS_UDP" => Some("0.0.0.0:443".into()),
+            "AXIOND_CALLS_PUBLIC_IP" => Some("203.0.113.7".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!((c.calls_udp.unwrap().port(), c.calls_public_ip.unwrap().to_string()), (443, "203.0.113.7".into()));
+        assert!(c.apply_env(|k| (k == "AXIOND_CALLS_UDP").then(|| "443".into())).is_err());
     }
 
     #[test]

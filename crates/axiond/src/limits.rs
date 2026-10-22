@@ -27,6 +27,9 @@ pub const REQUESTS: Rate = Rate { burst: 300.0, per_second: 30.0 };
 pub const LOGINS: Rate = Rate { burst: 10.0, per_second: 1.0 / 6.0 };
 /// Messages from one person: 30, then 5 a second.
 pub const POSTS: Rate = Rate { burst: 30.0, per_second: 5.0 };
+/// Joining calls, per person: 10, then one every 3 s. Each join is a
+/// connection the SFU sets up.
+pub const CALLS: Rate = Rate { burst: 10.0, per_second: 1.0 / 3.0 };
 
 #[derive(Default)]
 pub struct Limiter {

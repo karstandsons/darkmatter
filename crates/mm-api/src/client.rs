@@ -528,6 +528,27 @@ impl Client {
         self.send(Method::POST, &format!("e2ee/channels/{channel_id}/handshake"), Some(handshake)).await
     }
 
+    /// axiond: joins the channel's call, starting it if there's none, with
+    /// this device's WebRTC offer. The answer comes back with the call.
+    pub async fn join_call(&self, channel_id: &str, offer: &str) -> Result<JoinedCall, Error> {
+        self.send(Method::POST, &format!("calls/{channel_id}/join"), Some(&JoinCall { offer: offer.into() })).await
+    }
+
+    pub async fn leave_call(&self, channel_id: &str) -> Result<(), Error> {
+        self.send::<(), serde_json::Value>(Method::POST, &format!("calls/{channel_id}/leave"), None).await.map(|_| ())
+    }
+
+    /// Turns down a call that's ringing: it stops on this user's other
+    /// devices, and the caller is told.
+    pub async fn decline_call(&self, channel_id: &str) -> Result<(), Error> {
+        self.send::<(), serde_json::Value>(Method::POST, &format!("calls/{channel_id}/decline"), None).await.map(|_| ())
+    }
+
+    /// The calls going on in this user's channels.
+    pub async fn calls(&self) -> Result<Vec<Call>, Error> {
+        self.get("calls").await
+    }
+
     pub async fn handshakes(&self, channel_id: &str, after: i64) -> Result<Vec<HandshakeEntry>, Error> {
         self.get(&format!("e2ee/channels/{channel_id}/handshake?after={after}")).await
     }

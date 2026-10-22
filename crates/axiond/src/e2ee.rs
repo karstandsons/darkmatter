@@ -161,8 +161,9 @@ pub fn announce(app: &App, channel_id: &str, seq: i64, kind: &str, users: &[Stri
 
 /// Someone left an encrypted channel (or was removed): the server proposes
 /// taking each of their devices out of its group. Members commit that before
-/// they next send.
+/// they next send. They're out of its call too.
 pub async fn user_left(app: &App, channel_id: &str, user_id: &str) -> sqlx::Result<()> {
+    crate::calls::user_left(app, channel_id, user_id).await;
     let devices = {
         let _held = app.e2ee.lock.lock().await;
         let mut conn = app.db.acquire().await?;
@@ -180,8 +181,9 @@ pub async fn user_left(app: &App, channel_id: &str, user_id: &str) -> sqlx::Resu
 }
 
 /// A device is gone (its session ended): it's revoked and taken out of
-/// every group it's in.
+/// every group it's in, and any call.
 pub async fn device_gone(app: &App, user_id: &str, device_id: &str) -> sqlx::Result<()> {
+    crate::calls::device_gone(app, user_id, device_id).await;
     let revoked = sqlx::query("UPDATE e2ee_devices SET revoked_at = ? WHERE user_id = ? AND device_id = ? AND revoked_at = 0")
         .bind(ids::now())
         .bind(user_id)

@@ -9,6 +9,7 @@ mod api;
 pub mod audit;
 mod auth;
 pub mod backup;
+mod calls;
 pub mod config;
 mod db;
 pub mod e2ee;
@@ -37,6 +38,7 @@ pub struct State {
     pub db: db::Db,
     hub: hub::Hub,
     e2ee: e2ee::State,
+    calls: calls::Calls,
     guard: auth::Guard,
     limiter: limits::Limiter,
 }
@@ -54,7 +56,7 @@ impl App {
     pub async fn open(config: Config) -> anyhow::Result<Self> {
         let db = db::open(&config.data_dir).await?;
         let e2ee = e2ee::init(&db).await?;
-        Ok(App(Arc::new(State { config, db, hub: Default::default(), e2ee, guard: Default::default(), limiter: Default::default() })))
+        Ok(App(Arc::new(State { config, db, hub: Default::default(), e2ee, calls: Default::default(), guard: Default::default(), limiter: Default::default() })))
     }
 
     /// Serves the API on `listener` until Ctrl+C or SIGTERM: HTTPS if the
@@ -64,6 +66,7 @@ impl App {
         let tls = self.config.tls()?;
         self.schedule_backups();
         housekeeping::start(&self);
+        calls::start(&self)?;
         let config = self.config.clone();
         let service = api::router(self).into_make_service_with_connect_info::<std::net::SocketAddr>();
         match tls {

@@ -8,6 +8,8 @@ license = "AGPL-3.0-or-later"
 publish = false
 
 [dependencies]
+# Calls: the SFU. Pure-Rust crypto, so the static musl build stays simple.
+str0m = { version = "=0.24.1", default-features = false, features = ["rust-crypto"] }
 # End-to-end encryption: the server's checks (MLS delivery service).
 dm-crypto = { path = "../dm-crypto" }
 openmls_memory_storage = "0.6"
