@@ -251,9 +251,25 @@ impl<S: StorageProvider<CURRENT_VERSION>> Device<S> {
         let MlsMessageBodyIn::Welcome(welcome) = message.extract() else {
             return Err(Error::Malformed("welcome"));
         };
+        // Staging the Welcome uses up our key package. If a member's keys
+        // aren't in the directory yet (someone who left the channel since),
+        // put it back so the caller can fetch them and try again.
+        let storage = self.provider.storage();
+        let kept: Vec<(KeyPackageRef, KeyPackageBundle)> = welcome
+            .secrets()
+            .iter()
+            .filter_map(|s| Some((s.new_member(), storage.key_package::<_, KeyPackageBundle>(&s.new_member()).ok()??)))
+            .collect();
         let staged = StagedWelcome::new_from_welcome(&self.provider, &Self::join_config(), welcome, None).map_err(mls)?;
         for member in staged.members() {
-            identity::verify_member(&member.credential, &member.signature_key, directory)?;
+            if let Err(e) = identity::verify_member(&member.credential, &member.signature_key, directory) {
+                if matches!(e, Error::UnknownDevice { .. }) {
+                    for (r, kp) in &kept {
+                        storage.write_key_package(r, kp).map_err(|e| Error::Storage(format!("{e:?}")))?;
+                    }
+                }
+                return Err(e);
+            }
         }
         let mut group = staged.into_group(&self.provider).map_err(mls)?;
         if let Err(e) = check_external_senders(&group, server) {

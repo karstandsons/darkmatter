@@ -256,3 +256,24 @@ fn a_group_must_name_this_server_and_only_it() {
     let info = bob.create_group("c2", &w.server_key()).unwrap();
     assert!(w.server.register("c2", &info, &name(&alice), &w.keys).is_err());
 }
+
+#[test]
+fn a_welcome_refused_for_a_member_not_yet_known_can_be_taken_again() {
+    let mut w = World::new();
+    let alice = w.device("alice", "laptop");
+    let bob = w.device("bob", "desktop");
+    let carol = w.device("carol", "desktop");
+    w.create(&alice, "c");
+    w.add(&alice, "c", &[&bob], &[]);
+    let h = alice.add("c", &[carol.key_package(false).unwrap()], &w.keys).unwrap();
+    w.send(&alice, "c", &h).unwrap();
+    // Carol's directory doesn't have bob yet: he left the channel since.
+    let cert = w.keys.certificates.borrow_mut().remove(&("bob".into(), "desktop".into())).unwrap();
+    let welcome = h.welcome.as_ref().unwrap();
+    assert!(matches!(carol.join(welcome, &w.server_key(), &w.keys), Err(Error::UnknownDevice { .. })));
+    // With his keys fetched, the same Welcome works, and carol reads what's sent in that epoch.
+    w.keys.certificates.borrow_mut().insert(("bob".into(), "desktop".into()), cert);
+    assert_eq!(carol.join(welcome, &w.server_key(), &w.keys).unwrap(), "c");
+    let ct = alice.encrypt("c", &post("welcome, carol"), &Aad::post("c", "", "p")).unwrap();
+    assert_eq!(read(&carol, "c", &ct, &w.keys).unwrap().1, "welcome, carol");
+}

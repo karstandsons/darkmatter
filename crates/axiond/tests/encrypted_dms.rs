@@ -497,6 +497,24 @@ async fn someone_the_server_failed_to_take_out_is_taken_out_by_the_next_sender()
 }
 
 #[tokio::test]
+async fn someone_added_just_before_another_leaves_still_reads_what_was_sent() {
+    let s = server().await;
+    let (alice_api, alice) = device(&s, "alice", MemoryStore::default()).await;
+    let (_, bob) = device(&s, "bob", MemoryStore::default()).await;
+    let (_, carol) = device(&s, "carol", MemoryStore::default()).await;
+    let team = alice_api.my_teams().await.unwrap()[0].id.clone();
+    let trip = alice_api.create_channel(&team, "trip", "Trip", true).await.unwrap();
+    run(&alice_api, &trip.id, "/invite @bob").await;
+    run(&alice_api, &trip.id, "/invite @carol").await;
+    let hello = send(&alice_api, &alice, &trip.id, "hello all").await;
+
+    // Bob is gone before carol opens her Welcome, which still names him.
+    run(&alice_api, &trip.id, "/kick @bob").await;
+    assert_eq!(text(read(&carol, &hello).await), "hello all");
+    let _ = bob;
+}
+
+#[tokio::test]
 async fn files_in_an_encrypted_dm() {
     use dm_client::files::{Outgoing, Thumb};
     let s = server().await;
