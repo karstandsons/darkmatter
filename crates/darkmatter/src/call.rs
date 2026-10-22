@@ -107,7 +107,7 @@ static PREFERRED: std::sync::Mutex<(Option<String>, Option<String>)> = std::sync
 pub fn prefer(config: &crate::config::CallsConfig) {
     *PREFERRED.lock().unwrap() = (config.microphone.clone(), config.speaker.clone());
     #[cfg(feature = "calls")]
-    if let Some(media) = MEDIA.get() {
+    if let Some(media) = CURRENT.lock().unwrap().as_ref() {
         use_preferred(media);
     }
 }
@@ -136,13 +136,10 @@ pub fn available(chat: &Chat) -> bool {
     cfg!(feature = "calls") && chat.axiond.is_some()
 }
 
+/// What the call going on runs on (each call gets its own; see
+/// `dm_call::Media`), for switching its devices.
 #[cfg(feature = "calls")]
-static MEDIA: std::sync::OnceLock<dm_call::Media> = std::sync::OnceLock::new();
-
-#[cfg(feature = "calls")]
-fn media() -> &'static dm_call::Media {
-    MEDIA.get_or_init(dm_call::Media::new)
-}
+static CURRENT: std::sync::Mutex<Option<dm_call::Media>> = std::sync::Mutex::new(None);
 
 pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
     match msg {
@@ -166,6 +163,7 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
             #[cfg(feature = "calls")]
             {
                 let updates = joined.call.updates();
+                *CURRENT.lock().unwrap() = Some(joined.call.media().clone());
                 let keys = join_keys(chat, &joined.channel_id, &joined.info.id);
                 chat.call = Some(Active {
                     call: joined.call,
@@ -283,7 +281,8 @@ fn devices() -> (Vec<String>, Vec<String>) {
     #[cfg(feature = "calls")]
     {
         let names = |l: Vec<dm_call::AudioDevice>| l.into_iter().map(|d| d.name).collect();
-        (names(media().microphones()), names(media().speakers()))
+        let media = CURRENT.lock().unwrap().clone().unwrap_or_default();
+        (names(media.microphones()), names(media.speakers()))
     }
     #[cfg(not(feature = "calls"))]
     (Vec::new(), Vec::new())
@@ -305,7 +304,7 @@ fn join(chat: &mut Chat, channel_id: String, rejoined: bool) -> Task<Message> {
     // drop just replaces the connection (the server moves you to it), so a
     // direct message doesn't end and ring again.
     let leaving = if rejoined {
-        let _ = chat.call.take();
+        let _ = end(chat);
         Task::none()
     } else {
         leave(chat)
@@ -315,16 +314,17 @@ fn join(chat: &mut Chat, channel_id: String, rejoined: bool) -> Task<Message> {
         let client = chat.client.clone();
         // For testing: a tone instead of the microphone, and nothing played
         // out (`DM_CALL_TONE=440`).
+        let media = dm_call::Media::new();
         let mic = match std::env::var("DM_CALL_TONE").ok().and_then(|v| v.parse().ok()) {
             Some(pitch) => dm_call::Mic::Tone(pitch),
             None => {
-                use_preferred(media());
+                use_preferred(&media);
                 dm_call::Mic::Device
             }
         };
         let joining = Task::perform(
             async move {
-                let (call, info) = dm_call::Call::join(media(), &client, &channel_id, mic).await.map_err(|e| e.to_string())?;
+                let (call, info) = dm_call::Call::join(&media, &client, &channel_id, mic).await.map_err(|e| e.to_string())?;
                 Ok(Joined { call, channel_id, info, rejoined })
             },
             |r| Message::Call(Msg::Joined(r)),
@@ -348,11 +348,22 @@ fn join_keys(chat: &Chat, channel_id: &str, call_id: &str) -> Task<Message> {
     Task::perform(async move { crypto.join_call(&channel_id, &call_id).await.map(Some) }, |r| Message::Call(Msg::Keys(r)))
 }
 
-fn leave(chat: &mut Chat) -> Task<Message> {
-    let Some(active) = chat.call.take() else { return Task::none() };
+/// Done with the call on this device, however it ended: its group and its
+/// media go.
+fn end(chat: &mut Chat) -> Option<Active> {
+    let active = chat.call.take()?;
     if let Some(crypto) = &chat.crypto {
         crypto.leave_call(&active.call_id);
     }
+    #[cfg(feature = "calls")]
+    {
+        *CURRENT.lock().unwrap() = None;
+    }
+    Some(active)
+}
+
+fn leave(chat: &mut Chat) -> Task<Message> {
+    let Some(active) = end(chat) else { return Task::none() };
     #[cfg(feature = "calls")]
     {
         let call = active.call;
@@ -390,7 +401,7 @@ pub fn updated(chat: &mut Chat, u: CallUpdate) -> Task<Message> {
     if chat.call.as_ref().is_some_and(|a| a.channel_id == u.channel_id) && !u.call.as_ref().is_some_and(mine) {
         // Answered on another device, or the connection dropped: done here.
         chat.notice = Some("You're out of the call here: it moved to another of your devices, or the connection dropped.".into());
-        let _ = chat.call.take();
+        let _ = end(chat);
         return Task::none();
     }
     let personal = chat.store.channels.get(&u.channel_id).is_some_and(|c| matches!(c.kind, mm_api::models::ChannelType::Direct | mm_api::models::ChannelType::Group));

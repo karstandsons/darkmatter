@@ -73,7 +73,10 @@ pub struct AudioDevice {
     pub name: String,
 }
 
-/// The app's sound and WebRTC. One per app; cheap to clone.
+/// Sound and WebRTC: the devices, and what a call runs on. **One per call**:
+/// libwebrtc doesn't play a new connection's sound in a factory where an
+/// earlier one closed (seen with its synthetic audio device), so each call
+/// gets a fresh one. Cheap to clone.
 #[derive(Clone, Default)]
 pub struct Media(Arc<MediaInner>);
 
@@ -250,6 +253,10 @@ impl Call {
         pc.on_track(Some(Box::new(move |ev: TrackEvent| {
             let MediaStreamTrack::Audio(track) = ev.track else { return };
             let user = ev.streams.first().map(|s| s.id()).unwrap_or_default();
+            tracing::debug!("{user}'s sound arrives (mid {:?})", ev.transceiver.mid());
+            // Playout stops when the last incoming sound ends (someone left)
+            // and libwebrtc doesn't always start it again for the next.
+
             // Each person's frames, with their key.
             let cryptor = FrameCryptor::new_for_rtp_receiver(&factory2, user.clone(), EncryptionAlgorithm::AesGcm, decrypt.clone(), ev.receiver);
             cryptor.on_state_change(Some(Box::new(|who, state| tracing::debug!("decrypting {who}: {state:?}"))));
@@ -258,7 +265,11 @@ impl Call {
             let heard = heard.clone();
             spawn.spawn(async move {
                 let mut stream = NativeAudioStream::new(track, RATE as i32, 1);
+                let mut first = true;
                 while let Some(frame) = stream.next().await {
+                    if std::mem::take(&mut first) {
+                        tracing::debug!("{user}'s sound plays");
+                    }
                     let n = frame.data.len().max(1) as f32;
                     let rms = (frame.data.iter().map(|s| (*s as f32).powi(2)).sum::<f32>() / n).sqrt() / i16::MAX as f32;
                     let mut levels = heard.lock().unwrap();
@@ -352,6 +363,11 @@ impl Call {
 
     pub fn channel_id(&self) -> &str {
         &self.0.channel_id
+    }
+
+    /// What this call runs on: to switch its microphone or speaker.
+    pub fn media(&self) -> &Media {
+        &self.0._media
     }
 
     /// What the call reports. Only the first caller gets them.

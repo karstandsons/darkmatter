@@ -18,7 +18,7 @@ struct Server {
 }
 
 async fn server() -> Server {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_test_writer().try_init();
     let dir = tempfile::tempdir().unwrap();
     let app = App::open(Config { data_dir: dir.path().into(), ..Config::default() }).await.unwrap();
     let user = |name: &str| NewUser { username: name.into(), email: format!("{name}@example.com"), password: PASSWORD.into() };
@@ -174,22 +174,25 @@ async fn joining_again_after_leaving() {
     let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
     let team = alice.my_teams().await.unwrap()[0].id.clone();
     let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
-    let media = Media::new();
+    // Each its own, as two apps would be.
+    let (alice_media, bob_media) = (Media::new(), Media::new());
     let keys = |epoch: u8| vec![(alice_id.clone(), vec![epoch; 32]), (bob_id.clone(), vec![epoch + 100; 32])];
 
-    let (a, _) = Call::join(&media, &alice, &town, Mic::Tone(440.0)).await.unwrap();
-    let (b, _) = Call::join(&media, &bob, &town, Mic::Tone(660.0)).await.unwrap();
+    let (a, _) = Call::join(&alice_media, &alice, &town, Mic::Tone(440.0)).await.unwrap();
+    let (b, _) = Call::join(&bob_media, &bob, &town, Mic::Tone(660.0)).await.unwrap();
     let mut b_updates = b.updates().unwrap();
     a.set_keys(0, &keys(0));
     b.set_keys(0, &keys(0));
     until_heard(&mut b_updates, &alice_id, true).await;
 
-    // Alice leaves (bob alone: epoch 1), then joins again (epoch 2).
+    // Alice leaves (bob alone: epoch 1), then joins again (epoch 2), on a
+    // fresh Media as each call is: in the old one, nothing would play.
     a.leave().await.unwrap();
-    drop(a);
+    drop((a, alice_media));
     b.set_keys(1, &[(bob_id.clone(), vec![101; 32])]);
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let (a, _) = Call::join(&media, &alice, &town, Mic::Tone(440.0)).await.unwrap();
+    let alice_media = Media::new();
+    let (a, _) = Call::join(&alice_media, &alice, &town, Mic::Tone(440.0)).await.unwrap();
     let mut a_updates = a.updates().unwrap();
     a.set_keys(2, &keys(2));
     b.set_keys(2, &keys(2));

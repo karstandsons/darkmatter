@@ -44,8 +44,9 @@ fn by_user(k: dm_crypto::call::Keys) -> (u64, Vec<(String, Vec<u8>)>) {
 }
 
 /// Joins media and the call's encryption, as Darkmatter does.
-async fn join(media: &Media, api: &Client, e2ee: &E2ee<MemoryStore>, channel: &str, pitch: f32) -> (Call, String) {
-    let (call, info) = Call::join(media, api, channel, Mic::Tone(pitch)).await.unwrap();
+async fn join(api: &Client, e2ee: &E2ee<MemoryStore>, channel: &str, pitch: f32) -> (Call, String) {
+    // A fresh Media for each call, as in Darkmatter.
+    let (call, info) = Call::join(&Media::new(), api, channel, Mic::Tone(pitch)).await.unwrap();
     let (epoch, keys) = by_user(e2ee.join_call(channel, &info.id).await.unwrap());
     call.set_keys(epoch, &keys);
     (call, info.id)
@@ -78,11 +79,10 @@ async fn leaving_and_joining_again_with_real_keys() {
     let (bob_api, bob) = device(&s, "bob").await;
     let team = alice_api.my_teams().await.unwrap()[0].id.clone();
     let town = alice_api.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
-    let media = Media::new();
 
-    let (a, call_id) = join(&media, &alice_api, &alice, &town, 440.0).await;
+    let (a, call_id) = join(&alice_api, &alice, &town, 440.0).await;
     let mut a_updates = a.updates().unwrap();
-    let (b, _) = join(&media, &bob_api, &bob, &town, 660.0).await;
+    let (b, _) = join(&bob_api, &bob, &town, 660.0).await;
     let mut b_updates = b.updates().unwrap();
     sync(&a, &alice, &town, &call_id).await;
     assert!(hears(&mut b_updates, &alice.user_id).await, "bob hears alice");
@@ -96,7 +96,7 @@ async fn leaving_and_joining_again_with_real_keys() {
     sync(&a, &alice, &town, &call_id).await;
 
     // He joins again.
-    let (b, _) = join(&media, &bob_api, &bob, &town, 660.0).await;
+    let (b, _) = join(&bob_api, &bob, &town, 660.0).await;
     let mut b_updates = b.updates().unwrap();
     sync(&a, &alice, &town, &call_id).await;
     assert!(hears(&mut a_updates, &bob.user_id).await, "alice hears bob again");
@@ -115,16 +115,15 @@ async fn coming_back_after_the_call_moved_away() {
     old_api.login("bob", PASSWORD, None).await.unwrap();
     let team = alice_api.my_teams().await.unwrap()[0].id.clone();
     let town = alice_api.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
-    let media = Media::new();
 
-    let (a, call_id) = join(&media, &alice_api, &alice, &town, 440.0).await;
+    let (a, call_id) = join(&alice_api, &alice, &town, 440.0).await;
     let mut a_updates = a.updates().unwrap();
-    let (b, _) = join(&media, &bob_api, &bob, &town, 660.0).await;
+    let (b, _) = join(&bob_api, &bob, &town, 660.0).await;
     sync(&a, &alice, &town, &call_id).await;
     assert!(hears(&mut a_updates, &bob.user_id).await);
 
     // The old device takes the call (the phone's out), can't encrypt, leaves.
-    let (old, _) = Call::join(&media, &old_api, &town, Mic::Tone(550.0)).await.unwrap();
+    let (old, _) = Call::join(&Media::new(), &old_api, &town, Mic::Tone(550.0)).await.unwrap();
     drop(b);
     sync(&a, &alice, &town, &call_id).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -133,7 +132,7 @@ async fn coming_back_after_the_call_moved_away() {
     sync(&a, &alice, &town, &call_id).await;
 
     // Back on the phone.
-    let (b, _) = join(&media, &bob_api, &bob, &town, 660.0).await;
+    let (b, _) = join(&bob_api, &bob, &town, 660.0).await;
     let mut b_updates = b.updates().unwrap();
     sync(&a, &alice, &town, &call_id).await;
     assert!(hears(&mut a_updates, &bob.user_id).await, "alice hears bob again");
