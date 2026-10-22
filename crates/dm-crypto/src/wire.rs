@@ -44,12 +44,37 @@ pub enum Content {
         message: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<FileKey>,
+        /// The first link's preview, fetched by the sender's app, so no
+        /// one else fetches anything (and the server never sees it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<Box<LinkPreview>>,
     },
     /// New text for a post; which post is in the [`Aad`].
     Edit { message: String },
     /// A reaction added (`on`) or taken back.
     Reaction { post_id: String, emoji: String, on: bool },
 }
+
+/// A link's preview, as the sender's app made it: what the page says about
+/// itself, and a small picture. In an encrypted conversation it travels
+/// inside the message; elsewhere, in the post's `dm_preview` property.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LinkPreview {
+    pub url: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub site: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// A JPEG of at most [`PREVIEW_IMAGE`] pixels across, base64.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub image: String,
+}
+
+/// The widest a preview's picture is.
+pub const PREVIEW_IMAGE: u32 = 480;
 
 /// How to read one encrypted file (E2EE.md §7). The server has only the
 /// ciphertext, stored under `id`.
@@ -183,7 +208,7 @@ mod tests {
 
     #[test]
     fn the_wire_format_is_stable() {
-        let post = Content::Post { message: "hi".into(), files: vec![] };
+        let post = Content::Post { message: "hi".into(), files: vec![], preview: None };
         assert_eq!(serde_json::to_string(&post).unwrap(), r#"{"t":"post","message":"hi"}"#);
         let r = Content::Reaction { post_id: "p".into(), emoji: "tada".into(), on: true };
         assert_eq!(serde_json::to_string(&r).unwrap(), r#"{"t":"reaction","post_id":"p","emoji":"tada","on":true}"#);

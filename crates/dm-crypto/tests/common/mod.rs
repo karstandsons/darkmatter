@@ -87,7 +87,7 @@ pub fn name(d: &Dev) -> DeviceName {
 }
 
 pub fn post(text: &str) -> Content {
-    Content::Post { message: text.into(), files: vec![] }
+    Content::Post { message: text.into(), files: vec![], preview: None }
 }
 
 pub fn read(d: &Dev, channel: &str, ct: &dm_crypto::wire::DmE2ee, keys: &Keys) -> Result<(DeviceName, String), Error> {

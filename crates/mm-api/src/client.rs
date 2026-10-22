@@ -323,6 +323,13 @@ impl Client {
         self.bytes(&format!("emoji/{emoji_id}/image")).await
     }
 
+    /// A picture from elsewhere on the web, through Mattermost's image proxy
+    /// (which hands back the original's address when it's off).
+    pub async fn image_proxy(&self, url: &str) -> Result<Vec<u8>, Error> {
+        let req = self.request(Method::GET, "image")?.query(&[("url", url)]);
+        Ok(check(req.send().await?).await?.bytes().await?.to_vec())
+    }
+
     pub async fn profile_image(&self, user_id: &str) -> Result<Vec<u8>, Error> {
         self.bytes(&format!("users/{user_id}/image")).await
     }

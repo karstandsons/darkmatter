@@ -24,6 +24,11 @@ pub enum Key {
     /// A GIF, played from the original file (servers make no animated
     /// previews; Mattermost makes none at all for GIFs).
     Gif(String),
+    /// A link preview's picture carried in its post, by post id.
+    LinkInline(String),
+    /// A picture at an address (Mattermost's link previews), fetched
+    /// through the server's image proxy.
+    Remote(String),
 }
 
 pub enum Media {
@@ -106,7 +111,8 @@ impl Cache {
                             Key::Preview(id) => preview(&client, &crypto, id).await,
                             Key::Full(id) => download(&client, &crypto, id).await,
                             Key::Emoji(id) => client.emoji_image(id).await.map_err(|e| e.to_string()),
-                            Key::Gif(_) => unreachable!("fetched above"),
+                            Key::Remote(url) => client.image_proxy(url).await.map_err(|e| e.to_string()),
+                            Key::Gif(_) | Key::LinkInline(_) => unreachable!("not fetched"),
                         };
                         (key, bytes)
                     },
@@ -114,6 +120,23 @@ impl Cache {
                 ));
         }
         Task::batch(tasks)
+    }
+
+    /// A picture already at hand (base64), such as a preview carried in its
+    /// post: decoded here, nothing fetched.
+    pub fn put_inline(&mut self, key: Key, base64: &str) {
+        if self.items.contains_key(&key) {
+            return;
+        }
+        use base64::Engine;
+        let media = match base64::engine::general_purpose::STANDARD.decode(base64) {
+            Ok(bytes) => {
+                let size = ::image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format().ok().and_then(|r| r.into_dimensions().ok());
+                Media::Ready(image::Handle::from_bytes(bytes), size)
+            }
+            Err(_) => Media::Failed,
+        };
+        self.items.insert(key, media);
     }
 
     /// Drop the full-size images (the viewer closed).

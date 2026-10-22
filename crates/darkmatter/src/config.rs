@@ -15,6 +15,18 @@ pub struct Config {
     pub plugins: PluginsConfig,
     pub notifications: NotificationsConfig,
     pub calls: CallsConfig,
+    pub privacy: PrivacyConfig,
+}
+
+/// `[privacy]`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct PrivacyConfig {
+    /// Fetch a preview of the first link in a message as it's sent (axiond),
+    /// so nobody reading it fetches anything; the linked site sees you, as
+    /// if you'd opened it. On unless false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_previews: Option<bool>,
 }
 
 /// `[calls]`: the microphone, speaker and camera calls use, by name (the

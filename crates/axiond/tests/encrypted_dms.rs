@@ -96,7 +96,7 @@ async fn an_encrypted_dm_between_two_people_and_a_new_device() {
             }
             out
         };
-        assert_eq!(got, vec![Decrypted::Text(Content::Post { message: "hello bob".into(), files: vec![] }), Decrypted::Text(Content::Post { message: "hi alice".into(), files: vec![] })], "{who}");
+        assert_eq!(got, vec![Decrypted::Text(Content::Post { message: "hello bob".into(), files: vec![], preview: None }), Decrypted::Text(Content::Post { message: "hi alice".into(), files: vec![], preview: None })], "{who}");
     }
     // Read again: from what was kept (MLS can't decrypt a message twice).
     assert_eq!(text(read(&bob, &first).await), "hello bob");
@@ -564,7 +564,7 @@ async fn files_in_an_encrypted_dm() {
 
     // Bob reads the message, then the files, checked against what was sent.
     let got = posts(&bob_api, &dm.id).await.into_iter().find(|p| p.id == sent.id).unwrap();
-    let Decrypted::Text(Content::Post { message, files }) = read(&bob, &got).await else { panic!() };
+    let Decrypted::Text(Content::Post { message, files, .. }) = read(&bob, &got).await else { panic!() };
     assert_eq!((message.as_str(), files.len()), ("look", 1));
     assert_eq!((files[0].name.as_str(), files[0].width, files[0].height), ("beach.png", 4000, 3000));
     assert_eq!(dm_client::files::download(&bob_api, &files[0]).await.unwrap(), photo);
@@ -711,4 +711,29 @@ async fn rounds(api: &Client, e2ee: &E2ee<MemoryStore>, store: &MemoryStore, cha
         e2ee.sync(channel).await.unwrap();
     }
     sent
+}
+
+/// A link preview the sender's app made goes inside the encrypted message:
+/// the server never has it, and the reader gets it back.
+#[tokio::test]
+async fn a_link_preview_travels_inside_the_message() {
+    let s = server().await;
+    let (alice_api, alice) = device(&s, "alice", MemoryStore::default()).await;
+    let (_, bob) = device(&s, "bob", MemoryStore::default()).await;
+    let dm = alice_api.create_direct(&alice.user_id, &bob.user_id).await.unwrap();
+    let preview = dm_crypto::wire::LinkPreview { url: "https://example.com/secret-plans".into(), title: "Secret plans".into(), site: "Example".into(), ..Default::default() };
+    let post = NewPost {
+        channel_id: dm.id.clone(),
+        message: "look https://example.com/secret-plans".into(),
+        pending_post_id: "alice:preview".into(),
+        props: serde_json::json!({ dm_client::PREVIEW_PROP: preview }),
+        ..Default::default()
+    };
+    let sealed = alice.encrypt_post(&post).await.unwrap();
+    assert!(sealed.props.get(dm_client::PREVIEW_PROP).is_none(), "not beside the ciphertext");
+    let sent = alice_api.create_post(&sealed).await.unwrap();
+    let stored = serde_json::to_string(&posts(&alice_api, &dm.id).await.into_iter().find(|p| p.id == sent.id).unwrap()).unwrap();
+    assert!(!stored.contains("Secret plans") && !stored.contains("secret-plans"), "the server has neither link nor preview");
+    let Decrypted::Text(Content::Post { preview: Some(got), .. }) = read(&bob, &sent).await else { panic!("no preview") };
+    assert_eq!(*got, preview);
 }

@@ -157,6 +157,10 @@ pub enum Message {
     Users(Result<Vec<User>, String>),
     Statuses(Result<Vec<mm_api::models::Status>, String>),
     Draft(String),
+    /// A draft's link preview, fetched (`None`: there's none).
+    LinkPreview(String, Option<dm_crypto::wire::LinkPreview>),
+    /// A message whose link's preview was fetched as it was sent: it goes now.
+    Previewed(Box<mm_api::models::NewPost>, Option<dm_crypto::wire::LinkPreview>),
     Send,
     /// The server's answer to a message from the outbox: (its pending id,
     /// the post, or the problem and whether to try again).
@@ -486,6 +490,7 @@ impl App {
     fn sync_servers(&mut self) {
         let many = self.servers.len() > 1;
         let previews = self.config.notifications.encrypted_previews == Some(true);
+        let link_previews = self.config.privacy.link_previews != Some(false);
         for s in &mut self.servers {
             let Screen::Chat(chat) = &mut s.screen else { continue };
             let saved = self.accounts.get(&s.id);
@@ -493,6 +498,7 @@ impl App {
             chat.server_label = saved.map(Saved::label).unwrap_or_default();
             chat.muted = saved.is_some_and(|a| a.muted);
             chat.encrypted_previews = previews;
+            chat.link_previews = link_previews;
         }
     }
 

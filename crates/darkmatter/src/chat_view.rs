@@ -903,6 +903,34 @@ impl Chat {
             .into()
     }
 
+    /// A message's link preview: site, title, a few lines, the picture.
+    /// Clicking it opens the link.
+    fn link_card<'a>(&'a self, post: &'a mm_api::models::Post, c: Colors) -> Option<Element<'a, Message>> {
+        let (p, picture) = crate::link_preview::of(post)?;
+        let mut col = column![].spacing(3);
+        if !p.site.is_empty() {
+            col = col.push(text(p.site.clone()).size(11).color(c.muted));
+        }
+        if !p.title.is_empty() {
+            col = col.push(text(p.title.clone()).size(13).font(bold()).color(c.accent));
+        }
+        if !p.description.is_empty() {
+            let short: String = p.description.chars().take(220).collect();
+            let short = if short.len() < p.description.len() { format!("{short}…") } else { short };
+            col = col.push(text(short).size(12).color(c.fg));
+        }
+        if let Some(handle) = picture.and_then(|pic| self.media.get(&crate::link_preview::key(&post.id, &pic)).cloned()) {
+            col = col.push(iced::widget::image(handle).width(Length::Shrink).height(Length::Shrink).content_fit(iced::ContentFit::ScaleDown));
+        }
+        let card = container(col).padding(iced::Padding { top: 6.0, right: 10.0, bottom: 6.0, left: 10.0 }).max_width(420).style(move |_: &Theme| container::Style {
+            background: Some(iced::Background::Color(c.surface)),
+            border: iced::Border { color: c.accent, width: 0.0, radius: 6.0.into() },
+            ..Default::default()
+        });
+        let card = row![container(space()).width(3).height(Length::Fill).style(move |_: &Theme| container::Style { background: Some(iced::Background::Color(c.accent)), ..Default::default() }), card];
+        Some(button(card.height(Length::Shrink)).padding(0).on_press(Message::Link(p.url.clone())).style(c.link_button()).into())
+    }
+
     fn post_view<'a>(
         &'a self,
         pv: &'a PaneView,
@@ -933,6 +961,9 @@ impl Chat {
         }
         for f in &post.metadata.files {
             body = body.push(self.attachment(f, &post.id, c));
+        }
+        if let Some(card) = self.link_card(post, c) {
+            body = body.push(card);
         }
         if let Some(reactions) = self.reactions(post, c) {
             body = body.push(reactions);

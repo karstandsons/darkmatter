@@ -148,7 +148,7 @@ impl Status for mm_api::Error {
 }
 
 fn post(text: &str) -> Content {
-    Content::Post { message: text.into(), files: vec![] }
+    Content::Post { message: text.into(), files: vec![], preview: None }
 }
 
 async fn channel_id(api: &Client, name: &str) -> String {

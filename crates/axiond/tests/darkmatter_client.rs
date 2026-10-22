@@ -1023,3 +1023,25 @@ async fn a_retried_message_is_written_once() {
     let bobs = bob.create_post(&new).await.unwrap();
     assert_ne!(bobs.id, first.id);
 }
+
+/// In a plain channel the sender's link preview is kept, checked: its link
+/// must be in the message, and its picture a JPEG. Nothing else is kept.
+#[tokio::test]
+async fn plain_link_previews_are_checked() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let post = |message: &str, preview: serde_json::Value| NewPost { channel_id: town.clone(), message: message.into(), props: serde_json::json!({ "dm_preview": preview, "other": 1 }), ..Default::default() };
+    let jpeg = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0xff, 0xd8, 0xff, 0xe0, 0, 0]);
+    let sent = alice
+        .create_post(&post("see https://example.com/a", serde_json::json!({ "url": "https://example.com/a", "title": "A", "image": jpeg, "extra": "x" })))
+        .await
+        .unwrap();
+    assert_eq!(sent.props["dm_preview"]["title"], "A");
+    assert!(sent.props.get("other").is_none() && sent.props["dm_preview"].get("extra").is_none());
+    // Not for a link in the message, or not a JPEG: refused.
+    assert!(alice.create_post(&post("no link here", serde_json::json!({ "url": "https://example.com/a", "title": "A" }))).await.is_err());
+    let png = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x89PNG....");
+    assert!(alice.create_post(&post("see https://example.com/b", serde_json::json!({ "url": "https://example.com/b", "image": png }))).await.is_err());
+}

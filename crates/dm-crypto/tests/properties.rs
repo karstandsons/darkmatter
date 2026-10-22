@@ -116,7 +116,7 @@ impl Run {
         let from = members[rng.below(members.len())];
         self.sent += 1;
         let text = format!("m{} from {from}", self.sent);
-        let ct = self.devices[from].encrypt("c", &Content::Post { message: text.clone(), files: vec![] }, &Aad::post("c", "", &format!("p{}", self.sent))).unwrap();
+        let ct = self.devices[from].encrypt("c", &Content::Post { message: text.clone(), files: vec![], preview: None }, &Aad::post("c", "", &format!("p{}", self.sent))).unwrap();
         for &d in &self.members {
             if d != from {
                 self.inbox[d].push(Pending { ct: ct.clone(), from, text: text.clone() });

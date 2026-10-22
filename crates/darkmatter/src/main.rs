@@ -11,6 +11,7 @@ mod crypto;
 mod emoji_picker;
 mod layout;
 mod lightbox;
+mod link_preview;
 mod media;
 mod outbox;
 mod notify;

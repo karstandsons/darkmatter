@@ -162,10 +162,13 @@ pub async fn open(crypto: &Shared, posts: &mut [&mut Post]) {
         };
         post.message = match shown {
             Decrypted::Plain => continue,
-            Decrypted::Text(Content::Post { message, files }) => {
+            Decrypted::Text(Content::Post { message, files, preview }) => {
                 // The files as the sender described them; the server knows
                 // them only as blobs (thumbnails included).
                 post.metadata.files = files.iter().map(|k| crate::media::file_info(k, post)).collect();
+                if let Some(p) = preview {
+                    post.props[dm_client::PREVIEW_PROP] = serde_json::to_value(p).unwrap_or_default();
+                }
                 // Searchable here, since the server can't search it.
                 if let Some(c) = crypto.as_ref().filter(|_| !post.id.is_empty()) {
                     c.store().0.writer().index(crate::vault::Found {

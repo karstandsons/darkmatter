@@ -150,6 +150,10 @@ pub fn mention_names(message: &str) -> Vec<String> {
 /// The prop the app puts a post's file keys in before it's encrypted. It
 /// never reaches the server: [`E2ee::encrypt_post`] moves them inside.
 pub const FILES_PROP: &str = "dm_files";
+/// A message's link preview ([`dm_crypto::wire::LinkPreview`]): in a
+/// plain channel the post carries it; in an encrypted one it goes inside
+/// the message, and comes back out here once read.
+pub const PREVIEW_PROP: &str = "dm_preview";
 
 /// The keys of a post's files, each of which must be attached to it.
 fn files_of(post: &NewPost) -> Result<Vec<FileKey>, String> {
@@ -1017,7 +1021,8 @@ impl<S: LocalStore> E2ee<S> {
         self.backlog_first(&post.channel_id).await;
         let _held = self.lock.lock().await;
         self.ready(&post.channel_id).await?;
-        let content = Content::Post { message: post.message.clone(), files: files_of(post)? };
+        let preview = post.props.get(PREVIEW_PROP).and_then(|p| serde_json::from_value(p.clone()).ok()).map(Box::new);
+        let content = Content::Post { message: post.message.clone(), files: files_of(post)?, preview };
         let aad = Aad::post(&post.channel_id, &post.root_id, &post.pending_post_id);
         let e2ee = self.device.encrypt(&post.channel_id, &content, &aad).map_err(s)?;
         self.persist();
@@ -1203,9 +1208,9 @@ impl<S: LocalStore> E2ee<S> {
             let mut keys = self.file_keys.lock().unwrap_or_else(|e| e.into_inner());
             keys.extend(files.iter().map(|f| (f.id.clone(), f.clone())));
         }
-        let (Decrypted::Text(Content::Post { files, .. }), Some(edit)) = (&original, post.props.get("dm_edit")) else { return original };
+        let (Decrypted::Text(Content::Post { files, preview, .. }), Some(edit)) = (&original, post.props.get("dm_edit")) else { return original };
         match self.decrypt_edit(post, edit).await {
-            Ok(message) => Decrypted::Text(Content::Post { message, files: files.clone() }),
+            Ok(message) => Decrypted::Text(Content::Post { message, files: files.clone(), preview: preview.clone() }),
             Err(why) => {
                 tracing::warn!("couldn't read the edit of post {}: {why}", post.id);
                 original

@@ -274,12 +274,26 @@ pub struct Chat {
     /// The draft that was held back for having encrypted text in it: sent
     /// if Enter is pressed again with it unchanged.
     confirm_leak: Option<String>,
+    /// Make link previews of what this account sends (axiond;
+    /// `[privacy] link_previews`).
+    pub link_previews: bool,
+    /// Previews fetched for links in drafts, by link (`None`: none to be had).
+    previews: HashMap<String, Option<dm_crypto::wire::LinkPreview>>,
     /// The calls going on in this account's channels, by channel (axiond).
     pub calls: HashMap<String, mm_api::models::Call>,
     /// The call this device is in.
     pub call: Option<crate::call::Active>,
     /// A call ringing here.
     pub ringing: Option<crate::call::Ringing>,
+}
+
+/// Puts a link's preview on a post, for the server (plain) or for
+/// dm-client to move inside the encrypted message.
+fn attach_preview(post: &mut NewPost, preview: dm_crypto::wire::LinkPreview) {
+    if !post.props.is_object() {
+        post.props = serde_json::json!({});
+    }
+    post.props[dm_client::PREVIEW_PROP] = serde_json::to_value(preview).unwrap_or_default();
 }
 
 /// Text last copied from an encrypted conversation's message box, and where
@@ -783,6 +797,8 @@ impl Chat {
             no_editor: text_editor::Content::new(),
             pending_goto: None,
             confirm_leak: None,
+            link_previews: true,
+            previews: HashMap::new(),
             calls: HashMap::new(),
             call: None,
             ringing: None,
@@ -1252,6 +1268,54 @@ impl Chat {
             props[dm_client::MENTIONS_PROP] = serde_json::json!(mentions);
         }
         props
+    }
+
+    /// Whether this account makes previews of the links it sends (axiond:
+    /// Mattermost makes its own).
+    fn makes_previews(&self) -> bool {
+        self.link_previews && self.axiond.is_some() && !self.client.is_read_only()
+    }
+
+    /// Starts fetching the preview of a draft's link once it looks typed
+    /// out (something follows it), so it's ready when the message goes.
+    fn prefetch_preview(&mut self, draft: &str) -> Task<Message> {
+        if !self.makes_previews() {
+            return Task::none();
+        }
+        let Some(url) = crate::link_preview::first_link(draft) else { return Task::none() };
+        let typed_out = draft.split(&url).nth(1).is_some_and(|after| after.starts_with(char::is_whitespace));
+        if !typed_out || self.previews.contains_key(&url) {
+            return Task::none();
+        }
+        // Fetching: nobody asks again meanwhile.
+        self.previews.insert(url.clone(), None);
+        let target = url.clone();
+        Task::perform(async move { crate::link_preview::fetch(&target).await.ok() }, move |p| Message::LinkPreview(url.clone(), p))
+    }
+
+    /// `post` with its link's preview, if one's ready; if not, fetches it
+    /// first (as long as [`crate::link_preview::TIMEOUT`]) and sends after,
+    /// as `Err` of the task doing so.
+    fn with_preview(&mut self, mut post: NewPost) -> Result<NewPost, Task<Message>> {
+        if !self.makes_previews() {
+            return Ok(post);
+        }
+        let Some(url) = crate::link_preview::first_link(&post.message) else { return Ok(post) };
+        match self.previews.get(&url) {
+            Some(Some(p)) => {
+                attach_preview(&mut post, p.clone());
+                Ok(post)
+            }
+            // Fetched (or fetching) and nothing to show: don't wait.
+            Some(None) => Ok(post),
+            None => Err(Task::perform(
+                async move {
+                    let p = tokio::time::timeout(crate::link_preview::TIMEOUT, crate::link_preview::fetch(&url)).await.ok().and_then(Result::ok);
+                    (Box::new(post), p)
+                },
+                |(post, p)| Message::Previewed(post, p),
+            )),
+        }
     }
 
     /// The finished uploads for the composer with draft key `key`: the ids
@@ -1797,6 +1861,7 @@ impl Chat {
             .flat_map(|(_, p)| p.thread.iter().chain(&p.expanded))
             .filter_map(|root| self.store.threads.get(root));
         let mut keys = Vec::new();
+        let mut inline = Vec::new();
         let mut learned = Vec::new();
         for timeline in timelines.chain(threads).collect::<Vec<_>>() {
             for post in timeline.entries.iter().map(|e| &e.post) {
@@ -1820,7 +1885,16 @@ impl Chat {
                         keys.push(media::Key::Preview(f.id.clone()));
                     }
                 }
+                if let Some((_, Some(picture))) = crate::link_preview::of(post) {
+                    match &picture {
+                        crate::link_preview::Picture::Inline(b64) => inline.push((crate::link_preview::key(&post.id, &picture), b64.clone())),
+                        crate::link_preview::Picture::Remote(_) => keys.push(crate::link_preview::key(&post.id, &picture)),
+                    }
+                }
             }
+        }
+        for (key, b64) in inline {
+            self.media.put_inline(key, &b64);
         }
         self.store.custom_emoji.extend(learned);
         self.media.fetch(&self.client, &self.crypto, keys)
@@ -1929,8 +2003,22 @@ impl Chat {
             }
             Message::Draft(d) => {
                 let slash = self.update_slash(false, &d);
+                let prefetch = self.prefetch_preview(&d);
                 self.drafts.insert(self.pv().channel.clone(), d);
-                slash
+                Task::batch([slash, prefetch])
+            }
+            Message::LinkPreview(url, preview) => {
+                self.previews.insert(url, preview);
+                Task::none()
+            }
+            Message::Previewed(post, preview) => {
+                let mut post = *post;
+                if let Some(p) = preview {
+                    attach_preview(&mut post, p);
+                }
+                let thread = !post.root_id.is_empty();
+                self.outbox.push(post);
+                Task::batch([self.flush(), if thread { to_latest(THREAD) } else { to_latest(self.pv().timeline()) }])
             }
             Message::Send if self.editing.as_ref().is_some_and(|e| e.key == self.pv().channel) => self.save_edit(),
             Message::SendReply if self.editing.as_ref().is_some_and(|e| Some(&e.key) == self.pv().thread.as_ref().map(|r| thread_key(r)).as_ref()) => {
@@ -1979,8 +2067,13 @@ impl Chat {
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
                     ..Default::default()
                 };
-                self.outbox.push(post);
-                Task::batch([self.flush(), to_latest(self.pv().timeline())])
+                match self.with_preview(post) {
+                    Ok(post) => {
+                        self.outbox.push(post);
+                        Task::batch([self.flush(), to_latest(self.pv().timeline())])
+                    }
+                    Err(waiting) => waiting,
+                }
             }
             Message::Delivered(id, Ok(post)) => {
                 self.outbox.remove(&id);
@@ -2350,8 +2443,13 @@ impl Chat {
                     root_id: root,
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
                 };
-                self.outbox.push(post);
-                Task::batch([self.flush(), to_latest(THREAD)])
+                match self.with_preview(post) {
+                    Ok(post) => {
+                        self.outbox.push(post);
+                        Task::batch([self.flush(), to_latest(THREAD)])
+                    }
+                    Err(waiting) => waiting,
+                }
             }
             Message::Media(key, result) => {
                 self.media.loaded(key, result);

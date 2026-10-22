@@ -102,6 +102,39 @@ pub async fn ciphertext(app: &App, channel_id: &str, e2ee: &Value, max: usize) -
     Ok(json!({ "v": 1, "epoch": epoch, "ct": ct }))
 }
 
+/// A link preview the sender's app made (`dm_preview`), checked: a link
+/// that's in the message, short text, and a small JPEG. Anything else in it
+/// is dropped.
+fn preview(p: &Value, message: &str) -> Result<Value> {
+    let field = |k: &str, max: usize| -> Result<String> {
+        let v = p.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
+        if v.chars().count() > max {
+            return Err(Error::bad_request(format!("A link preview's {k} is too long.")));
+        }
+        Ok(v)
+    };
+    let url = field("url", 2048)?;
+    if !(url.starts_with("https://") || url.starts_with("http://")) || !message.contains(&url) {
+        return Err(Error::bad_request("A link preview must be for a link in the message."));
+    }
+    let image = field("image", MAX_PREVIEW_IMAGE)?;
+    if !image.is_empty() {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&image).map_err(|_| Error::bad_request("A link preview's picture isn't valid base64."))?;
+        if !bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            return Err(Error::bad_request("A link preview's picture must be a JPEG."));
+        }
+    }
+    let mut out = json!({ "url": url, "site": field("site", 200)?, "title": field("title", 300)?, "description": field("description", 1000)? });
+    if !image.is_empty() {
+        out["image"] = image.into();
+    }
+    Ok(out)
+}
+
+/// The largest picture (base64) a plain link preview may carry.
+const MAX_PREVIEW_IMAGE: usize = 96 * 1024;
+
 /// The largest ciphertext (base64) a post may carry.
 const MAX_CIPHERTEXT: usize = 128 * 1024;
 /// How long the server's removal proposals may wait for a commit before
@@ -116,7 +149,12 @@ pub async fn create(State(app): State<App>, me: Me, Json(body): Json<Create>) ->
     let (message, props) = if channel.encrypted {
         (ENCRYPTED_PLACEHOLDER.to_string(), encrypted_props(&app, &channel.id, &body.message, &body.props).await?)
     } else {
-        (body.message.trim_end().to_string(), json!({}))
+        let message = body.message.trim_end().to_string();
+        let props = match body.props.get("dm_preview") {
+            Some(p) => json!({ "dm_preview": preview(p, &message)? }),
+            None => json!({}),
+        };
+        (message, props)
     };
     if message.trim().is_empty() && body.file_ids.is_empty() {
         return Err(Error::bad_request("A message can't be empty."));
