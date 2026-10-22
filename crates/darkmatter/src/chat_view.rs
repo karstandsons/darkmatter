@@ -179,6 +179,7 @@ impl Chat {
         if let Some(release) = &self.new_release {
             col = col.push(self.update_notice(release, c));
         }
+        col = col.push(crate::call::ringing_view(self, c)).push(crate::call::bar(self, c));
         container(col.push(footer))
         .width(250)
         .height(Length::Fill)
@@ -399,8 +400,15 @@ impl Chat {
 
     /// The ✕ at the right of a pane's title bar, when there are other panes.
     /// (Leave, density and the rest are in the ☰ menu.)
-    fn pane_controls<'a>(&'a self, _pv: &'a PaneView, many: bool, c: Colors) -> Option<Element<'a, Message>> {
-        many.then(|| button(text("✕").size(13).color(c.muted)).padding([2, 8]).on_press(Message::ClosePane).style(c.row_button(false)).into())
+    /// A pane's title bar controls: the call button, and ✕ when there are
+    /// several panes.
+    fn pane_controls<'a>(&'a self, pv: &'a PaneView, many: bool, c: Colors) -> Option<Element<'a, Message>> {
+        let call = (!pv.inbox && !pv.channel.is_empty()).then(|| crate::call::header_button(self, &pv.channel, c)).flatten();
+        let close: Option<Element<'a, Message>> = many.then(|| button(text("✕").size(13).color(c.muted)).padding([2, 8]).on_press(Message::ClosePane).style(c.row_button(false)).into());
+        match (call, close) {
+            (None, None) => None,
+            (call, close) => Some(row![].push(call).push(close).spacing(4).align_y(iced::Center).into()),
+        }
     }
 
     /// Sidebar rows, by density.

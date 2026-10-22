@@ -39,6 +39,8 @@ pub enum Command {
     Leave,
     CreateChannel,
     Verify,
+    Call,
+    Hangup,
     Themes,
     Plugins,
     Account,
@@ -149,6 +151,8 @@ pub const ALL: &[Spec] = &[
     spec(C::Leave, "Leave this channel", Group::Messages, &[], &[], ""),
     spec(C::CreateChannel, "New channel (private ones are encrypted on axiond)", Group::Messages, &[], &["create"], "[private] <name>"),
     spec(C::Verify, "Safety number with someone (encrypted conversations)", Group::Messages, &[], &["verify"], "[@someone]"),
+    spec(C::Call, "Start or join the call here (axiond)", Group::Messages, &[], &["call"], ""),
+    spec(C::Hangup, "Leave the call", Group::Messages, &[], &["hangup"], ""),
     spec(C::Themes, "Themes", Group::Darkmatter, &[ctrl("t")], &["theme"], "[name]"),
     spec(C::Plugins, "Plugins", Group::Darkmatter, &[ctrl_shift("p")], &["plugins"], ""),
     spec(C::Account, "Account and security", Group::Darkmatter, &[], &["account"], ""),
@@ -282,11 +286,16 @@ pub fn key_label(command: Command) -> Option<String> {
 /// `/split down` → (SplitDown, ""), `/search rust tips` → (Search, "rust tips").
 /// The longest matching slash name wins. None for anything else, which goes
 /// to the server.
+/// The commands this build offers: calls only with the `calls` feature.
+pub fn listed() -> impl Iterator<Item = &'static Spec> {
+    ALL.iter().filter(|s| cfg!(feature = "calls") || !matches!(s.command, C::Call | C::Hangup))
+}
+
 pub fn parse_slash(input: &str) -> Option<(Command, String)> {
     let rest = input.strip_prefix('/')?;
     let words: Vec<&str> = rest.split_whitespace().collect();
     let mut best: Option<(usize, Command)> = None;
-    for s in ALL {
+    for s in listed() {
         for name in s.slash {
             let n: Vec<&str> = name.split(' ').collect();
             let fits = words.len() >= n.len() && words.iter().zip(&n).all(|(w, n)| w.eq_ignore_ascii_case(n));
@@ -309,7 +318,7 @@ pub fn complete_slash(input: &str) -> Vec<(String, &'static str, &'static str)> 
     let Some(typed) = input.strip_prefix('/') else { return Vec::new() };
     let typed = typed.to_lowercase();
     // Each command once, by its first name that fits.
-    ALL.iter()
+    listed()
         .filter_map(|s| s.slash.iter().find(|name| name.starts_with(&typed)).map(|name| (name.to_string(), s.args, s.title)))
         .collect()
 }

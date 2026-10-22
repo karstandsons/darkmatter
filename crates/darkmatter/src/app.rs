@@ -245,6 +245,7 @@ pub enum Message {
     /// Load the open channels' history again (now that it can be decrypted).
     ReloadOpen,
     Verify(crate::verify::Msg),
+    Call(crate::call::Msg),
     /// A device waiting to be linked recovers instead, or starts over.
     Recover(crate::account::Recover),
     Recovered(Result<std::sync::Arc<crate::crypto::Crypto>, String>),

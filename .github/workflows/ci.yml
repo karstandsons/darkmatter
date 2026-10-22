@@ -34,6 +34,9 @@ jobs:
       - run: dev/fetch-webrtc.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # Calls stay behind a feature until they're end-to-end encrypted.
+      - run: cargo clippy -p darkmatter --features calls --all-targets --locked -- -D warnings
+      - run: cargo test -p darkmatter --features calls --locked
       - run: cargo build --release --locked -p darkmatter
       - uses: actions/upload-artifact@v4
         with:

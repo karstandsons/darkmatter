@@ -2,6 +2,7 @@ mod account;
 mod accounts;
 mod animated;
 mod app;
+mod call;
 mod chat;
 mod chat_view;
 mod commands;

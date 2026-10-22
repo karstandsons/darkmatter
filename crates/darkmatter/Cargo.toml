@@ -49,10 +49,18 @@ qrcode = { version = "0.14", default-features = false }
 # libcrypto on Linux and CommonCrypto on macOS.
 dm-crypto = { path = "../dm-crypto" }
 dm-client = { path = "../dm-client" }
+# Calls (axiond), with the `calls` feature: libwebrtc through dm-call.
+dm-call = { path = "../dm-call", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 libsqlite3-sys = { version = "0.30", features = ["bundled-sqlcipher"] }
 base64 = "0.22"
 getrandom = "0.3"
+
+[features]
+# Calls. Off until they're end-to-end encrypted (M3 Phase 2); needs the
+# prebuilt libwebrtc from dev/fetch-webrtc.sh.
+calls = ["dep:dm-call", "dep:futures-util"]
 
 [dev-dependencies]
 wiremock = "0.6"

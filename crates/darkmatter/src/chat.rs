@@ -274,6 +274,12 @@ pub struct Chat {
     /// The draft that was held back for having encrypted text in it: sent
     /// if Enter is pressed again with it unchanged.
     confirm_leak: Option<String>,
+    /// The calls going on in this account's channels, by channel (axiond).
+    pub calls: HashMap<String, mm_api::models::Call>,
+    /// The call this device is in.
+    pub call: Option<crate::call::Active>,
+    /// A call ringing here.
+    pub ringing: Option<crate::call::Ringing>,
 }
 
 /// Text last copied from an encrypted conversation's message box, and where
@@ -777,14 +783,27 @@ impl Chat {
             no_editor: text_editor::Content::new(),
             pending_goto: None,
             confirm_leak: None,
+            calls: HashMap::new(),
+            call: None,
+            ringing: None,
         };
         let mut chat = chat;
         let statuses = chat.load_statuses();
         let threads = chat.load_user_threads();
         let emoji = chat.load_custom_emoji();
+        let calls = chat.load_calls();
         // Messages left from last time go now.
         let resend = chat.flush();
-        Some((chat, Task::batch([statuses, threads, emoji, resend])))
+        Some((chat, Task::batch([statuses, threads, emoji, calls, resend])))
+    }
+
+    /// The calls going on (axiond): for the title bars' Join buttons.
+    fn load_calls(&self) -> Task<Message> {
+        if self.axiond.is_none() {
+            return Task::none();
+        }
+        let client = self.client.clone();
+        Task::future(async move { client.calls().await.ok() }).and_then(|calls| Task::done(Message::Call(crate::call::Msg::Calls(calls))))
     }
 
     /// Every custom emoji on the server, a page of 200 at a time.
@@ -1000,6 +1019,11 @@ impl Chat {
             },
             C::CreateChannel => self.create_channel(&arg),
             C::Verify => self.open_verify(&arg),
+            C::Call => {
+                let channel = self.focused().channel.clone();
+                crate::call::update(self, crate::call::Msg::Join(channel))
+            }
+            C::Hangup => crate::call::update(self, crate::call::Msg::Leave),
             C::Attach => self.update(Message::PickFiles),
             C::ReactLatest => match self.latest_post().map(|p| p.id.clone()) {
                 Some(id) => self.update(Message::OpenEmoji(id)),
@@ -2266,6 +2290,7 @@ impl Chat {
                 operation::focus(self.pv().composer())
             }
             Message::Escape if self.verify.is_some() => self.verify_update(crate::verify::Msg::Close),
+            Message::Call(m) => crate::call::update(self, m),
             Message::Verify(m) => {
                 if let crate::verify::Msg::Open(user) = &m
                     && self.verify.is_none()
@@ -2989,6 +3014,7 @@ impl Chat {
             }
             Message::Ws(msg) => self.on_ws(msg),
             Message::Tick => {
+                crate::call::tick(self);
                 let resend = if self.outbox.is_empty() { Task::none() } else { self.flush() };
                 self.typing.retain(|_, at| at.elapsed() < TYPING_TTL);
                 for (_, p) in self.panes.iter_mut() {
@@ -3047,7 +3073,7 @@ impl Chat {
                 channels.sort();
                 channels.dedup();
                 let loads = channels.into_iter().map(|c| self.load_history(c));
-                Task::batch([bootstrap(session, self.account.clone())].into_iter().chain(loads))
+                Task::batch([bootstrap(session, self.account.clone()), self.load_calls()].into_iter().chain(loads))
             }
             // The channel list changed: someone added this account to a
             // channel, opened a DM with it, or a channel changed (encryption
@@ -3192,6 +3218,11 @@ impl Chat {
             }
             M::Event(Event::ReactionRemoved(r)) => {
                 self.store.reaction(r, false);
+                Task::none()
+            }
+            M::Event(Event::Call(update)) => crate::call::updated(self, *update),
+            M::Event(Event::CallDeclined { channel_id, user_id }) => {
+                crate::call::declined(self, &channel_id, &user_id);
                 Task::none()
             }
             M::Event(Event::Typing { channel_id, user_id, parent_id }) => {

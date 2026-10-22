@@ -72,8 +72,7 @@ pub fn score(query: &str, candidate: &str) -> Option<i64> {
 impl Switcher {
     pub fn refresh(&mut self, store: &Store) {
         if let Some(q) = self.query.strip_prefix('>') {
-            let mut scored: Vec<(i64, &crate::commands::Spec)> = crate::commands::ALL
-                .iter()
+            let mut scored: Vec<(i64, &crate::commands::Spec)> = crate::commands::listed()
                 .filter_map(|s| {
                     let by_slash = s.slash.iter().filter_map(|n| score(q, n)).max();
                     Some((score(q, s.title).max(by_slash)?, s))

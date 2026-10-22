@@ -37,7 +37,7 @@ pub fn view<'a>(query: &'a str, vim: bool, plugins: &'a crate::plugins::Plugins,
     let mut list = Column::new().spacing(2);
     for group in Group::ALL {
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
-        for s in commands::ALL.iter().filter(|s| s.group == group) {
+        for s in commands::listed().filter(|s| s.group == group) {
             let keys: Vec<String> = s.keys.iter().map(|k| k.label()).collect();
             let slash = s.slash.first().map(|n| if s.args.is_empty() { format!("/{n}") } else { format!("/{n} {}", s.args) }).unwrap_or_default();
             if hit(&[s.title, &slash, &keys.join(" ")]) {
