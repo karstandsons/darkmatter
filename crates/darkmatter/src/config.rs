@@ -14,6 +14,18 @@ pub struct Config {
     pub updates: UpdatesConfig,
     pub plugins: PluginsConfig,
     pub notifications: NotificationsConfig,
+    pub calls: CallsConfig,
+}
+
+/// `[calls]`: the microphone and speaker calls use, by name (the system's
+/// default when unset, or not plugged in).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct CallsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub microphone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

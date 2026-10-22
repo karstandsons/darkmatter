@@ -91,3 +91,14 @@ async fn two_devices_hear_each_other_and_mute() {
     a.leave().await.unwrap();
     assert!(alice.calls().await.unwrap().is_empty());
 }
+
+/// The platform's microphones and speakers (needs a sound server; nothing is
+/// recorded): `cargo test -p dm-call -- --ignored devices`.
+#[test]
+#[ignore]
+fn devices_are_listed() {
+    let media = Media::new();
+    let (mics, speakers) = (media.microphones(), media.speakers());
+    println!("microphones: {mics:?}\nspeakers: {speakers:?}");
+    assert!(!speakers.is_empty());
+}

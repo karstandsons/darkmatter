@@ -246,6 +246,8 @@ pub enum Message {
     ReloadOpen,
     Verify(crate::verify::Msg),
     Call(crate::call::Msg),
+    /// A microphone (true) or speaker picked for calls, by name: saved.
+    CallDevice(bool, String),
     /// A device waiting to be linked recovers instead, or starts over.
     Recover(crate::account::Recover),
     Recovered(Result<std::sync::Arc<crate::crypto::Crypto>, String>),
@@ -397,6 +399,7 @@ impl App {
             tasks.push(operation::focus(LOGIN_FIRST));
         }
         let config = Config::load();
+        crate::call::prefer(&config.calls);
         let plugins = std::sync::Arc::new(crate::plugins::load(&config.plugins));
         tasks.push(Task::done(Message::CheckUpdate));
         let task = Task::batch(tasks);
@@ -1275,6 +1278,16 @@ impl App {
                 }
                 let task = self.run(command, arg);
                 if refocus { Task::batch([task, Task::done(Message::FocusComposer)]) } else { task }
+            }
+            Message::CallDevice(microphone, name) => {
+                if microphone {
+                    self.config.calls.microphone = Some(name);
+                } else {
+                    self.config.calls.speaker = Some(name);
+                }
+                crate::call::prefer(&self.config.calls);
+                self.save_config();
+                Task::none()
             }
             Message::ToggleThreadLayout => {
                 let inline = !self.config.layout.inline_threads();

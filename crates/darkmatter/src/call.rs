@@ -36,6 +36,8 @@ pub enum Msg {
     Decline,
     /// The calls going on in this account's channels (fetched on connecting).
     Calls(Vec<CallInfo>),
+    /// Show or hide the microphones and speakers to pick from.
+    Devices,
 }
 
 /// What [`Msg::Joined`] carries: the live call (with the feature).
@@ -45,6 +47,9 @@ pub struct Joined {
     call: dm_call::Call,
     channel_id: String,
     info: CallInfo,
+    /// Joined again after the connection failed.
+    #[cfg_attr(not(feature = "calls"), allow(dead_code))]
+    rejoined: bool,
 }
 
 impl std::fmt::Debug for Joined {
@@ -78,6 +83,36 @@ pub struct Active {
     pub since: Instant,
     /// How loud each person is now (0.0–1.0).
     pub levels: HashMap<String, f32>,
+    /// Joined again once after the connection failed: the next failure ends it.
+    #[cfg_attr(not(feature = "calls"), allow(dead_code))]
+    rejoined: bool,
+    /// The microphones' and speakers' names, while the list is open.
+    pub devices: Option<(Vec<String>, Vec<String>)>,
+}
+
+/// The microphone and speaker picked (`[calls]`), by name: on Linux the
+/// ids are positions, which change as devices come and go.
+static PREFERRED: std::sync::Mutex<(Option<String>, Option<String>)> = std::sync::Mutex::new((None, None));
+
+/// Calls use these devices from now on (and the one going on switches).
+pub fn prefer(config: &crate::config::CallsConfig) {
+    *PREFERRED.lock().unwrap() = (config.microphone.clone(), config.speaker.clone());
+    #[cfg(feature = "calls")]
+    if let Some(media) = MEDIA.get() {
+        use_preferred(media);
+    }
+}
+
+/// Switches to the picked devices that are plugged in.
+#[cfg(feature = "calls")]
+fn use_preferred(media: &dm_call::Media) {
+    let (mic, speaker) = PREFERRED.lock().unwrap().clone();
+    if let Some(d) = mic.and_then(|name| media.microphones().into_iter().find(|d| d.name == name)) {
+        media.set_microphone(&d.id);
+    }
+    if let Some(d) = speaker.and_then(|name| media.speakers().into_iter().find(|d| d.name == name)) {
+        media.set_speaker(&d.id);
+    }
 }
 
 /// A call ringing here: someone started one in a direct or group message.
@@ -93,16 +128,18 @@ pub fn available(chat: &Chat) -> bool {
 }
 
 #[cfg(feature = "calls")]
+static MEDIA: std::sync::OnceLock<dm_call::Media> = std::sync::OnceLock::new();
+
+#[cfg(feature = "calls")]
 fn media() -> &'static dm_call::Media {
-    static MEDIA: std::sync::OnceLock<dm_call::Media> = std::sync::OnceLock::new();
     MEDIA.get_or_init(dm_call::Media::new)
 }
 
 pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
     match msg {
-        Msg::Join(channel_id) => join(chat, channel_id),
+        Msg::Join(channel_id) => join(chat, channel_id, false),
         Msg::Accept => match chat.ringing.take() {
-            Some(r) => join(chat, r.channel_id),
+            Some(r) => join(chat, r.channel_id, false),
             None => Task::none(),
         },
         Msg::Decline => {
@@ -127,6 +164,8 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
                     muted: false,
                     since: Instant::now(),
                     levels: HashMap::new(),
+                    rejoined: joined.rejoined,
+                    devices: None,
                 });
                 if let Some(rx) = updates {
                     let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|u| (u, rx)) });
@@ -145,6 +184,12 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
             match u {
                 dm_call::Update::Connected => active.link = Link::Connected,
                 dm_call::Update::Reconnecting => active.link = Link::Reconnecting,
+                // Once, join again from scratch; then give up.
+                dm_call::Update::Failed(e) if !active.rejoined => {
+                    tracing::warn!("the call dropped ({e}); joining again");
+                    let channel = active.channel_id.clone();
+                    return join(chat, channel, true);
+                }
                 dm_call::Update::Failed(e) => {
                     chat.error = Some(format!("The call dropped: {e}"));
                     return leave(chat);
@@ -164,6 +209,14 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
             Task::none()
         }
         Msg::Leave => leave(chat),
+        Msg::Devices => {
+            let Some(active) = &mut chat.call else { return Task::none() };
+            active.devices = match active.devices.take() {
+                Some(_) => None,
+                None => Some(devices()),
+            };
+            Task::none()
+        }
         Msg::Calls(calls) => {
             chat.calls = calls.into_iter().map(|c| (c.channel_id.clone(), c)).collect();
             Task::none()
@@ -171,7 +224,18 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
     }
 }
 
-fn join(chat: &mut Chat, channel_id: String) -> Task<Message> {
+/// The microphones and speakers there are, by name.
+fn devices() -> (Vec<String>, Vec<String>) {
+    #[cfg(feature = "calls")]
+    {
+        let names = |l: Vec<dm_call::AudioDevice>| l.into_iter().map(|d| d.name).collect();
+        (names(media().microphones()), names(media().speakers()))
+    }
+    #[cfg(not(feature = "calls"))]
+    (Vec::new(), Vec::new())
+}
+
+fn join(chat: &mut Chat, channel_id: String, rejoined: bool) -> Task<Message> {
     if !available(chat) {
         chat.error = Some("This build of Darkmatter can't make calls yet.".into());
         return Task::none();
@@ -180,11 +244,18 @@ fn join(chat: &mut Chat, channel_id: String) -> Task<Message> {
         chat.error = Some("Read-only: calls are off.".into());
         return Task::none();
     }
-    if chat.call.as_ref().is_some_and(|a| a.channel_id == channel_id) {
+    if !rejoined && chat.call.as_ref().is_some_and(|a| a.channel_id == channel_id) {
         return Task::none();
     }
-    // One call at a time: leave the one you're in.
-    let leaving = leave(chat);
+    // One call at a time: leave the one you're in. Joining again after a
+    // drop just replaces the connection (the server moves you to it), so a
+    // direct message doesn't end and ring again.
+    let leaving = if rejoined {
+        let _ = chat.call.take();
+        Task::none()
+    } else {
+        leave(chat)
+    };
     #[cfg(feature = "calls")]
     {
         let client = chat.client.clone();
@@ -192,12 +263,15 @@ fn join(chat: &mut Chat, channel_id: String) -> Task<Message> {
         // out (`DM_CALL_TONE=440`).
         let mic = match std::env::var("DM_CALL_TONE").ok().and_then(|v| v.parse().ok()) {
             Some(pitch) => dm_call::Mic::Tone(pitch),
-            None => dm_call::Mic::Device,
+            None => {
+                use_preferred(media());
+                dm_call::Mic::Device
+            }
         };
         let joining = Task::perform(
             async move {
                 let (call, info) = dm_call::Call::join(media(), &client, &channel_id, mic).await.map_err(|e| e.to_string())?;
-                Ok(Joined { call, channel_id, info })
+                Ok(Joined { call, channel_id, info, rejoined })
             },
             |r| Message::Call(Msg::Joined(r)),
         );
@@ -247,19 +321,24 @@ pub fn updated(chat: &mut Chat, u: CallUpdate) -> Task<Message> {
         chat.ringing = None;
     }
     if chat.call.as_ref().is_some_and(|a| a.channel_id == u.channel_id) && !u.call.as_ref().is_some_and(mine) {
-        // Answered on another device, or taken out: this device is done.
-        chat.notice = Some("The call carries on on another of your devices.".into());
+        // Answered on another device, or the connection dropped: done here.
+        chat.notice = Some("You're out of the call here: it moved to another of your devices, or the connection dropped.".into());
         let _ = chat.call.take();
         return Task::none();
     }
     let personal = chat.store.channels.get(&u.channel_id).is_some_and(|c| matches!(c.kind, mm_api::models::ChannelType::Direct | mm_api::models::ChannelType::Group));
-    if let Some(call) = &u.call
-        && u.started
-        && personal
-        && call.owner_id != me
-        && chat.call.is_none()
-        && available(chat)
-    {
+    let calling = u.call.as_ref().filter(|c| u.started && personal && c.owner_id != me && available(chat));
+    // Already in a call: busy. The caller hears it's turned down.
+    if calling.is_some() && chat.call.is_some() {
+        let (client, channel) = (chat.client.clone(), u.channel_id.clone());
+        return Task::future(async move {
+            if let Err(e) = client.decline_call(&channel).await {
+                tracing::warn!("couldn't say we're busy: {e}");
+            }
+        })
+        .discard();
+    }
+    if let Some(call) = calling {
         let from = chat.store.users.get(&call.owner_id).map_or_else(|| "Someone".into(), |u| format!("@{}", u.username));
         chat.ringing = Some(Ringing { channel_id: u.channel_id.clone(), from: from.clone(), since: Instant::now() });
         if !chat.muted {
@@ -347,8 +426,26 @@ pub fn bar<'a>(chat: &'a Chat, c: Colors) -> Option<Element<'a, Message>> {
         }
     }
     let mute = button(text(if active.muted { "Unmute" } else { "Mute" }).size(12)).padding([3, 10]).on_press(Message::Call(Msg::Mute)).style(c.chip(active.muted));
+    let gear = button(text("🎚").size(12)).padding([3, 8]).on_press(Message::Call(Msg::Devices)).style(c.chip(active.devices.is_some()));
     let leave = button(text("Leave").size(12).color(c.red)).padding([3, 10]).on_press(Message::Call(Msg::Leave)).style(c.chip(false));
-    Some(container(column![title, people, row![mute, leave].spacing(8)].spacing(8)).width(Length::Fill).padding([10, 12]).style(c.panel(c.surface)).into())
+    let mut col = column![title, people, row![mute, gear, leave].spacing(8)].spacing(8);
+    if let Some((mics, speakers)) = &active.devices {
+        let (mic, speaker) = PREFERRED.lock().unwrap().clone();
+        let list = |label: &'a str, devices: &'a [String], picked: Option<String>, microphone: bool| {
+            let mut l = Column::new().spacing(1).push(text(label).size(11).color(c.muted));
+            if devices.is_empty() {
+                l = l.push(text("none found").size(11).color(c.muted));
+            }
+            for d in devices {
+                let on = picked.as_deref() == Some(d.as_str());
+                let name = text(format!("{} {d}", if on { "✓" } else { " " })).size(12).color(if on { c.fg_bright } else { c.fg });
+                l = l.push(button(name).width(Length::Fill).padding([2, 6]).on_press(Message::CallDevice(microphone, d.clone())).style(c.row_button(on)));
+            }
+            l
+        };
+        col = col.push(list("Microphone", mics, mic, true)).push(list("Speaker", speakers, speaker, false));
+    }
+    Some(container(col).width(Length::Fill).padding([10, 12]).style(c.panel(c.surface)).into())
 }
 
 #[cfg(all(test, feature = "calls"))]

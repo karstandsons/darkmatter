@@ -118,12 +118,40 @@ impl Media {
         (0..f.playout_devices().max(0) as u16).map(|i| AudioDevice { id: f.playout_device_guid(i), name: f.playout_device_name(i) }).collect()
     }
 
+    /// Records from this microphone, switching to it mid-call if one is on.
     pub fn set_microphone(&self, id: &str) -> bool {
-        self.devices().is_ok() && self.0.factory.set_recording_device_by_guid(id)
+        if self.devices().is_err() {
+            return false;
+        }
+        let f = &self.0.factory;
+        let on = f.recording_is_initialized();
+        if on {
+            f.stop_recording();
+        }
+        let set = f.set_recording_device_by_guid(id);
+        if on {
+            f.init_recording();
+            f.start_recording();
+        }
+        set
     }
 
+    /// Plays out through this speaker, switching mid-call if one is on.
     pub fn set_speaker(&self, id: &str) -> bool {
-        self.devices().is_ok() && self.0.factory.set_playout_device_by_guid(id)
+        if self.devices().is_err() {
+            return false;
+        }
+        let f = &self.0.factory;
+        let on = f.playout_is_initialized();
+        if on {
+            f.stop_playout();
+        }
+        let set = f.set_playout_device_by_guid(id);
+        if on {
+            f.init_playout();
+            f.start_playout();
+        }
+        set
     }
 }
 
