@@ -1,0 +1,25 @@
+# M3 Phase 0: can str0m carry our calls? See README.md.
+[package]
+name = "calls-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[workspace]
+
+[dependencies]
+str0m = { version = "=0.24.1", default-features = false, features = ["aws-lc-rs"] }
+libwebrtc = "=0.3.53"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+rouille = { version = "3.6", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+strip = true

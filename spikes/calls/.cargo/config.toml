@@ -1,0 +1,4 @@
+# The prebuilt libwebrtc, checked by fetch-webrtc.sh. Set so webrtc-sys never
+# downloads an unchecked copy itself.
+[env]
+LK_CUSTOM_WEBRTC = { value = ".webrtc/linux-x64-release", relative = true }
