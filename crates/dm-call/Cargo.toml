@@ -12,6 +12,8 @@ publish = false
 # dev/fetch-webrtc.sh (see .cargo/config.toml).
 libwebrtc = "=0.3.53"
 mm-api = { path = "../mm-api" }
+# The camera: V4L2 on Linux, AVFoundation on macOS; MJPEG decoded.
+nokhwa = { version = "0.10", features = ["input-native"] }
 tokio = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde.workspace = true

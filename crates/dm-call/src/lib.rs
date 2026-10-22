@@ -31,6 +31,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+mod video;
+pub use video::{Cam, Picture};
+
 pub use mm_api::models::Call as CallInfo;
 
 const RATE: u32 = 48_000;
@@ -146,6 +149,11 @@ impl Media {
     }
 
     /// Plays out through this speaker, switching mid-call if one is on.
+    /// The cameras there are, by index (as [`Cam::Device`] takes them).
+    pub fn cameras(&self) -> Vec<AudioDevice> {
+        video::cameras().into_iter().map(|(i, name)| AudioDevice { id: i.to_string(), name }).collect()
+    }
+
     pub fn set_speaker(&self, id: &str) -> bool {
         if self.devices().is_err() {
             return false;
@@ -176,6 +184,8 @@ pub enum Update {
     /// How loud each person in the call is now (user id, 0.0–1.0), a few
     /// times a second. People who aren't sending aren't in it.
     Levels(Vec<(String, f32)>),
+    /// There's a new picture to show ([`Call::pictures`]); at most 30 a second.
+    Video,
 }
 
 /// This device in a channel's call. Cheap to clone.
@@ -188,9 +198,14 @@ struct CallInner {
     pc: PeerConnection,
     mic: RtcAudioTrack,
     keys: KeyProvider,
-    /// This device's sender's encryptor, and the receivers' decryptors
-    /// (only held, so they stay on).
+    /// This device's senders' encryptors (sound, picture), and the
+    /// receivers' decryptors (only held, so they stay on).
     sending: FrameCryptor,
+    video_sending: FrameCryptor,
+    video: libwebrtc::video_source::native::NativeVideoSource,
+    camera: Mutex<Option<video::Feed>>,
+    pictures: Arc<video::Pictures>,
+    me: String,
     _receiving: Arc<Mutex<Vec<FrameCryptor>>>,
     /// The newest epoch whose keys are set.
     epoch: Mutex<Option<u64>>,
@@ -250,9 +265,28 @@ impl Call {
         let heard = levels.clone();
         let spawn = handle.clone();
         let (decrypt, decryptors, factory2) = (keys.clone(), receiving.clone(), factory.clone());
+        let pictures: Arc<video::Pictures> = Arc::default();
+        let shown = pictures.clone();
         pc.on_track(Some(Box::new(move |ev: TrackEvent| {
-            let MediaStreamTrack::Audio(track) = ev.track else { return };
             let user = ev.streams.first().map(|s| s.id()).unwrap_or_default();
+            let track = match ev.track {
+                MediaStreamTrack::Audio(track) => track,
+                // Someone's picture: decrypted, then kept as RGBA.
+                MediaStreamTrack::Video(track) => {
+                    let cryptor = FrameCryptor::new_for_rtp_receiver(&factory2, user.clone(), EncryptionAlgorithm::AesGcm, decrypt.clone(), ev.receiver);
+                    cryptor.set_enabled(true);
+                    decryptors.lock().unwrap().push(cryptor);
+                    let shown = shown.clone();
+                    spawn.spawn(async move {
+                        let mut stream = libwebrtc::video_stream::native::NativeVideoStream::new(track);
+                        while let Some(frame) = stream.next().await {
+                            shown.put(&user, video::rgba_of(&frame));
+                        }
+                        shown.remove(&user);
+                    });
+                    return;
+                }
+            };
             tracing::debug!("{user}'s sound arrives (mid {:?})", ev.transceiver.mid());
             // Playout stops when the last incoming sound ends (someone left)
             // and libwebrtc doesn't always start it again for the next.
@@ -279,6 +313,17 @@ impl Call {
                 heard.lock().unwrap().remove(&user);
             });
         })));
+        // A new picture: say so, at most 30 times a second.
+        let (fresh, notify) = (pictures.clone(), tx.clone());
+        tasks.push(handle.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(33));
+            loop {
+                tick.tick().await;
+                if fresh.fresh.swap(false, Ordering::Relaxed) && notify.send(Update::Video).is_err() {
+                    break;
+                }
+            }
+        }));
         let report = tx.clone();
         tasks.push(handle.spawn(async move {
             let mut tick = tokio::time::interval(LEVELS_EVERY);
@@ -333,9 +378,25 @@ impl Call {
         let sender = pc.add_track(mic_track.clone().into(), &["me"]).map_err(media_err)?;
         // Encrypted from the first frame: without a key yet, nothing goes.
         let me = api.me().await?.id;
-        let sending = FrameCryptor::new_for_rtp_sender(factory, me, EncryptionAlgorithm::AesGcm, keys.clone(), sender);
+        let sending = FrameCryptor::new_for_rtp_sender(factory, me.clone(), EncryptionAlgorithm::AesGcm, keys.clone(), sender);
         sending.on_state_change(Some(Box::new(|_, state| tracing::debug!("encrypting: {state:?}"))));
         sending.set_enabled(true);
+
+        // The picture: a track from the start, with frames only while the
+        // camera is on, so turning it on needs no renegotiation.
+        let video = libwebrtc::video_source::native::NativeVideoSource::new(VideoResolution { width: video::WIDTH, height: video::HEIGHT }, false);
+        let vtrack = factory.create_video_track("camera", video.clone());
+        let vsender = pc.add_track(vtrack.into(), &["me"]).map_err(media_err)?;
+        let mut params = vsender.parameters();
+        for e in &mut params.encodings {
+            e.max_bitrate = Some(video::MAX_BITRATE);
+            e.max_framerate = Some(video::FPS as f64);
+        }
+        if let Err(e) = vsender.set_parameters(params) {
+            tracing::warn!("couldn't cap the camera's bitrate: {e}");
+        }
+        let video_sending = FrameCryptor::new_for_rtp_sender(factory, me.clone(), EncryptionAlgorithm::AesGcm, keys.clone(), vsender);
+        video_sending.set_enabled(true);
 
         // The SFU is ICE-lite: it learns this device's address from its
         // checks, so the offer goes without waiting for candidates.
@@ -352,6 +413,11 @@ impl Call {
             mic: mic_track,
             keys,
             sending,
+            video_sending,
+            video,
+            camera: Mutex::new(None),
+            pictures,
+            me,
             _receiving: receiving,
             epoch: Mutex::new(None),
             updates: Mutex::new(Some(rx)),
@@ -393,6 +459,7 @@ impl Call {
         };
         if first {
             self.0.sending.set_key_index(slot);
+            self.0.video_sending.set_key_index(slot);
             return;
         }
         let call = Arc::downgrade(&self.0);
@@ -403,8 +470,29 @@ impl Call {
             {
                 tracing::debug!("sending with epoch {epoch}'s key");
                 call.sending.set_key_index(slot);
+                call.video_sending.set_key_index(slot);
             }
         });
+    }
+
+    /// Turns the camera (or test picture) on, or off with `None`.
+    pub fn set_camera(&self, cam: Option<Cam>) -> Result<(), Error> {
+        let mut camera = self.0.camera.lock().unwrap();
+        // The old one stops first: a camera opens once.
+        camera.take();
+        if let Some(cam) = cam {
+            *camera = Some(video::start(cam, self.0.video.clone(), self.0.pictures.clone(), self.0.me.clone()).map_err(Error::Media)?);
+        }
+        Ok(())
+    }
+
+    pub fn camera_on(&self) -> bool {
+        self.0.camera.lock().unwrap().is_some()
+    }
+
+    /// Everyone's latest picture, by user id, this device's own included.
+    pub fn pictures(&self) -> HashMap<String, Picture> {
+        self.0.pictures.latest.lock().unwrap().clone()
     }
 
     /// How many media packets this device has sent: none until it has keys.
@@ -424,6 +512,7 @@ impl Call {
 
     /// Hangs up: the connection closes and the server takes this device out.
     pub async fn leave(&self) -> Result<(), Error> {
+        self.0.camera.lock().unwrap().take();
         self.0.pc.close();
         for t in self.0.tasks.lock().unwrap().drain(..) {
             t.abort();

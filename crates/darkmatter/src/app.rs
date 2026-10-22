@@ -99,6 +99,14 @@ struct LoginForm {
 }
 
 
+/// A kind of device calls use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Device {
+    Microphone,
+    Speaker,
+    Camera,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     /// A message for one account (by its key), whichever is on screen.
@@ -246,8 +254,8 @@ pub enum Message {
     ReloadOpen,
     Verify(crate::verify::Msg),
     Call(crate::call::Msg),
-    /// A microphone (true) or speaker picked for calls, by name: saved.
-    CallDevice(bool, String),
+    /// A microphone, speaker or camera picked for calls, by name: saved.
+    CallDevice(Device, String),
     /// A device waiting to be linked recovers instead, or starts over.
     Recover(crate::account::Recover),
     Recovered(Result<std::sync::Arc<crate::crypto::Crypto>, String>),
@@ -1279,11 +1287,11 @@ impl App {
                 let task = self.run(command, arg);
                 if refocus { Task::batch([task, Task::done(Message::FocusComposer)]) } else { task }
             }
-            Message::CallDevice(microphone, name) => {
-                if microphone {
-                    self.config.calls.microphone = Some(name);
-                } else {
-                    self.config.calls.speaker = Some(name);
+            Message::CallDevice(kind, name) => {
+                match kind {
+                    Device::Microphone => self.config.calls.microphone = Some(name),
+                    Device::Speaker => self.config.calls.speaker = Some(name),
+                    Device::Camera => self.config.calls.camera = Some(name),
                 }
                 crate::call::prefer(&self.config.calls);
                 self.save_config();

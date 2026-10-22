@@ -583,7 +583,7 @@ impl Chat {
         let here = pv.n == self.focused().n;
         let error = self.error.as_ref().filter(|_| here).map(|e| container(text(e).size(12).color(c.red)).padding([4, 20]).into());
         let note = self.notice.as_ref().filter(|_| here).map(|n| container(text(n).size(12).color(c.muted)).padding([4, 20]).into());
-        let col = column![rule::horizontal(1), timeline, slot(older), slot(error), slot(note), slot(self.key_change_note(&pv.channel, c))];
+        let col = column![rule::horizontal(1), slot(crate::call::stage(self, &pv.channel, c)), timeline, slot(older), slot(error), slot(note), slot(self.key_change_note(&pv.channel, c))];
         let composer = row![self.plus_button(false, c), composer].spacing(8).align_y(iced::Center);
         let typing = self.editing_note(&pv.channel, c).unwrap_or_else(|| self.typing_line(&pv.channel, "", c));
         let mut footer = column![typing].spacing(6);

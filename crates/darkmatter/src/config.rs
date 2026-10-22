@@ -17,8 +17,8 @@ pub struct Config {
     pub calls: CallsConfig,
 }
 
-/// `[calls]`: the microphone and speaker calls use, by name (the system's
-/// default when unset, or not plugged in).
+/// `[calls]`: the microphone, speaker and camera calls use, by name (the
+/// system's default or the first camera when unset, or not plugged in).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct CallsConfig {
@@ -26,6 +26,8 @@ pub struct CallsConfig {
     pub microphone: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

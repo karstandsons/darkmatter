@@ -37,8 +37,10 @@ pub enum Msg {
     Decline,
     /// The calls going on in this account's channels (fetched on connecting).
     Calls(Vec<CallInfo>),
-    /// Show or hide the microphones and speakers to pick from.
+    /// Show or hide the microphones, speakers and cameras to pick from.
     Devices,
+    /// Turn the camera on or off.
+    Camera,
     /// The call's group has a new handshake: catch up.
     Sync(String),
     /// The call's keys, new or changed (`None`: unchanged).
@@ -95,17 +97,28 @@ pub struct Active {
     pub call_id: String,
     /// The code everyone in the call sees the same, once encrypted.
     pub code: Option<String>,
-    /// The microphones' and speakers' names, while the list is open.
-    pub devices: Option<(Vec<String>, Vec<String>)>,
+    /// The microphones', speakers' and cameras' names, while the list is open.
+    pub devices: Option<(Vec<String>, Vec<String>, Vec<String>)>,
+    /// This device's camera is on.
+    pub camera: bool,
+    /// Everyone's latest picture as an image, made once per picture (not
+    /// on every redraw): when it came, and the image.
+    pub pictures: HashMap<String, (Instant, iced::widget::image::Handle)>,
 }
+
+/// A picture older than this is from a camera that's off: not shown.
+const STALE: Duration = Duration::from_millis(1500);
 
 /// The microphone and speaker picked (`[calls]`), by name: on Linux the
 /// ids are positions, which change as devices come and go.
 static PREFERRED: std::sync::Mutex<(Option<String>, Option<String>)> = std::sync::Mutex::new((None, None));
+/// The camera picked, by name.
+static CAMERA: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Calls use these devices from now on (and the one going on switches).
 pub fn prefer(config: &crate::config::CallsConfig) {
     *PREFERRED.lock().unwrap() = (config.microphone.clone(), config.speaker.clone());
+    *CAMERA.lock().unwrap() = config.camera.clone();
     #[cfg(feature = "calls")]
     if let Some(media) = CURRENT.lock().unwrap().as_ref() {
         use_preferred(media);
@@ -176,6 +189,8 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
                     devices: None,
                     call_id: joined.info.id.clone(),
                     code: None,
+                    camera: false,
+                    pictures: HashMap::new(),
                 });
                 match updates {
                     Some(rx) => {
@@ -212,6 +227,16 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
                     return leave(chat);
                 }
                 dm_call::Update::Levels(levels) => active.levels = levels.into_iter().collect(),
+                dm_call::Update::Video => {
+                    let latest = active.call.pictures();
+                    active.pictures.retain(|user, _| latest.contains_key(user));
+                    for (user, p) in latest {
+                        if active.pictures.get(&user).is_none_or(|(at, _)| *at != p.at) {
+                            let image = iced::widget::image::Handle::from_rgba(p.width, p.height, p.rgba.to_vec());
+                            active.pictures.insert(user, (p.at, image));
+                        }
+                    }
+                }
             }
             Task::none()
         }
@@ -261,6 +286,27 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
             chat.error = Some(format!("This call can't be encrypted: {e}"));
             leave(chat)
         }
+        Msg::Camera => {
+            let Some(active) = &mut chat.call else { return Task::none() };
+            #[cfg(feature = "calls")]
+            {
+                let cam = if std::env::var("DM_CALL_TONE").is_ok_and(|v| !v.is_empty()) {
+                    dm_call::Cam::Pattern
+                } else {
+                    let wanted = CAMERA.lock().unwrap().clone();
+                    let index = wanted.and_then(|name| active.call.media().cameras().into_iter().find(|d| d.name == name)).and_then(|d| d.id.parse().ok());
+                    dm_call::Cam::Device(index)
+                };
+                let on = !active.camera;
+                match active.call.set_camera(on.then_some(cam)) {
+                    Ok(()) => active.camera = on,
+                    Err(e) => chat.error = Some(format!("Camera: {e}")),
+                }
+            }
+            #[cfg(not(feature = "calls"))]
+            let _ = active;
+            Task::none()
+        }
         Msg::Devices => {
             let Some(active) = &mut chat.call else { return Task::none() };
             active.devices = match active.devices.take() {
@@ -276,16 +322,16 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
     }
 }
 
-/// The microphones and speakers there are, by name.
-fn devices() -> (Vec<String>, Vec<String>) {
+/// The microphones, speakers and cameras there are, by name.
+fn devices() -> (Vec<String>, Vec<String>, Vec<String>) {
     #[cfg(feature = "calls")]
     {
         let names = |l: Vec<dm_call::AudioDevice>| l.into_iter().map(|d| d.name).collect();
         let media = CURRENT.lock().unwrap().clone().unwrap_or_default();
-        (names(media.microphones()), names(media.speakers()))
+        (names(media.microphones()), names(media.speakers()), names(media.cameras()))
     }
     #[cfg(not(feature = "calls"))]
-    (Vec::new(), Vec::new())
+    (Vec::new(), Vec::new(), Vec::new())
 }
 
 fn join(chat: &mut Chat, channel_id: String, rejoined: bool) -> Task<Message> {
@@ -527,15 +573,17 @@ pub fn bar<'a>(chat: &'a Chat, c: Colors) -> Option<Element<'a, Message>> {
         }
     }
     let mute = button(text(if active.muted { "Unmute" } else { "Mute" }).size(12)).padding([3, 10]).on_press(Message::Call(Msg::Mute)).style(c.chip(active.muted));
+    let camera = button(text(if active.camera { "Camera off" } else { "Camera" }).size(12)).padding([3, 10]).on_press(Message::Call(Msg::Camera)).style(c.chip(active.camera));
     let gear = button(text("Devices").size(12)).padding([3, 10]).on_press(Message::Call(Msg::Devices)).style(c.chip(active.devices.is_some()));
     let leave = button(text("Leave").size(12).color(c.red)).padding([3, 10]).on_press(Message::Call(Msg::Leave)).style(c.chip(false));
-    let mut col = column![title, code, people, row![mute, gear, leave].spacing(8)].spacing(8);
-    if let Some((mics, speakers)) = &active.devices {
+    let mut col = column![title, code, people, row![mute, camera].spacing(8), row![gear, leave].spacing(8)].spacing(8);
+    if let Some((mics, speakers, cameras)) = &active.devices {
         let (mic, speaker) = PREFERRED.lock().unwrap().clone();
         // Nothing picked, or it's unplugged: the system's default ("default: …", listed first).
         let picked = |p: Option<String>, devices: &[String]| p.filter(|p| devices.contains(p)).or_else(|| devices.first().cloned());
         let (mic, speaker) = (picked(mic, mics), picked(speaker, speakers));
-        let list = |label: &'a str, devices: &'a [String], picked: Option<String>, microphone: bool| {
+        let camera = picked(CAMERA.lock().unwrap().clone(), cameras);
+        let list = |label: &'a str, devices: &'a [String], picked: Option<String>, kind: crate::app::Device| {
             let mut l = Column::new().spacing(1).push(text(label).size(11).color(c.muted));
             if devices.is_empty() {
                 l = l.push(text("none found").size(11).color(c.muted));
@@ -543,11 +591,12 @@ pub fn bar<'a>(chat: &'a Chat, c: Colors) -> Option<Element<'a, Message>> {
             for d in devices {
                 let on = picked.as_deref() == Some(d.as_str());
                 let name = text(format!("{} {d}", if on { "✓" } else { " " })).size(12).color(if on { c.fg_bright } else { c.fg });
-                l = l.push(button(name).width(Length::Fill).padding([2, 6]).on_press(Message::CallDevice(microphone, d.clone())).style(c.row_button(on)));
+                l = l.push(button(name).width(Length::Fill).padding([2, 6]).on_press(Message::CallDevice(kind, d.clone())).style(c.row_button(on)));
             }
             l
         };
-        col = col.push(list("Microphone", mics, mic, true)).push(list("Speaker", speakers, speaker, false));
+        use crate::app::Device;
+        col = col.push(list("Microphone", mics, mic, Device::Microphone)).push(list("Speaker", speakers, speaker, Device::Speaker)).push(list("Camera", cameras, camera, Device::Camera));
     }
     Some(container(col).width(Length::Fill).padding([10, 12]).style(c.panel(c.surface)).into())
 }
@@ -628,4 +677,33 @@ mod tests {
         let _ = updated(&mut chat, update("d1", Some(call("bob", &["bob"])), true));
         assert!(chat.ringing.is_none());
     }
+}
+
+/// Everyone with their camera on, over the call's channel: a tile each,
+/// this device's last.
+pub fn stage<'a>(chat: &'a Chat, channel_id: &str, c: Colors) -> Option<Element<'a, Message>> {
+    let active = chat.call.as_ref().filter(|a| a.channel_id == channel_id)?;
+    let me = &chat.store.me.id;
+    let mut showing: Vec<(&String, &iced::widget::image::Handle)> = active.pictures.iter().filter(|(_, (at, _))| at.elapsed() < STALE).map(|(u, (_, h))| (u, h)).collect();
+    if showing.is_empty() {
+        return None;
+    }
+    showing.sort_by_key(|(u, _)| (*u == me, (*u).clone()));
+    let tiles = showing.into_iter().map(|(user, image)| {
+        let name = if user == me { "You".to_string() } else { chat.store.users.get(user).map_or_else(|| user.clone(), |u| format!("@{}", u.username)) };
+        let speaking = user != me && active.levels.get(user).is_some_and(|l| *l > 0.02);
+        let picture = iced::widget::image(image.clone()).width(Length::Fill).height(Length::Fill).content_fit(iced::ContentFit::Contain);
+        let border = if speaking { c.green } else { iced::Color::TRANSPARENT };
+        container(column![picture, text(name).size(11).color(c.muted)].spacing(2))
+            .width(280)
+            .height(180)
+            .padding(4)
+            .style(move |_: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(c.surface)),
+                border: iced::Border { color: border, width: 2.0, radius: 6.0.into() },
+                ..Default::default()
+            })
+            .into()
+    });
+    Some(container(iced::widget::Row::with_children(tiles).spacing(8).wrap()).padding([8, 20]).width(Length::Fill).into())
 }

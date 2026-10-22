@@ -15,7 +15,8 @@ Karst & Sons, who decide what goes in and where the project heads.
   Run `dev/fetch-webrtc.sh` once first: calls (`crates/dm-call`) link a
   prebuilt libwebrtc, which it downloads and checks against its published
   SHA-256. On Linux that build also needs glib's headers (`libglib2.0-dev`)
-  and clang 21 or newer (set `CXX` to it if it isn't the default).
+  and clang 21 or newer (set `CXX` to it if it isn't the default), and the
+  camera crate needs libclang.
   Keep the code in the style around it.
 - **Testing UI changes:** `dev/seed.sh` starts a local Mattermost with test
   users. Never test write actions against a real server; `--read-only` exists

@@ -33,11 +33,12 @@ jobs:
           key: webrtc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dev/fetch-webrtc.sh') }}
       - run: dev/fetch-webrtc.sh
       # libwebrtc's C++ glue builds against its own libc++, which tracks LLVM
-      # and needs clang 21 or newer; the runner has 18.
+      # and needs clang 21 or newer; the runner has 18. The camera crate's
+      # V4L2 bindings are generated with libclang.
       - run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
           echo "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
-          sudo apt-get update && sudo apt-get install -y clang-21
+          sudo apt-get update && sudo apt-get install -y clang-21 libclang-21-dev
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
