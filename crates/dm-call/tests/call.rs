@@ -306,3 +306,64 @@ async fn a_late_joiner_sees_a_camera_that_was_already_on() {
     a.leave().await.unwrap();
     b.leave().await.unwrap();
 }
+
+/// A real camera and microphone, end to end (both picked by a word in
+/// their names, `DM_TEST_DEVICE`, e.g. "USB"): the other side gets a
+/// picture that isn't blank, and sound. Saves the last picture received to
+/// `DM_TEST_PICTURE` if set. `cargo test -p dm-call -- --ignored camera`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn the_camera_and_microphone_are_received() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let keys = vec![(alice_id.clone(), vec![1; 32]), (bob_id.clone(), vec![2; 32])];
+    let word = std::env::var("DM_TEST_DEVICE").unwrap_or_default();
+
+    let media = Media::new();
+    let cameras = media.cameras();
+    let camera = cameras.iter().find(|d| d.name.contains(&word)).expect("a camera");
+    println!("camera: {} (index {})", camera.name, camera.id);
+    // Picked before the call, as Darkmatter does: it must hold once the
+    // call is recording.
+    if let Some(mic) = media.microphones().into_iter().find(|d| d.name.contains(&word)) {
+        println!("microphone: {}", mic.name);
+        assert!(media.set_microphone(&mic.id));
+    }
+    let (b, _) = Call::join(&Media::new(), &bob, &town, Mic::Tone(440.0)).await.unwrap();
+    b.set_muted(true);
+    let (a, _) = Call::join(&media, &alice, &town, Mic::Device).await.unwrap();
+    a.set_keys(0, &keys);
+    b.set_keys(0, &keys);
+    a.set_camera(Some(dm_call::Cam::Device(camera.id.parse().ok()))).unwrap();
+
+    let mut updates = b.updates().unwrap();
+    let (mut loudest, mut heard) = (0f32, 0);
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until {
+        if let Ok(Some(Update::Levels(levels))) = tokio::time::timeout(Duration::from_secs(1), updates.recv()).await
+            && let Some((_, l)) = levels.iter().find(|(u, _)| *u == alice_id)
+        {
+            loudest = loudest.max(*l);
+            heard += (*l > 0.02) as u32;
+        }
+    }
+    let picture = b.pictures().get(&alice_id).cloned().expect("bob got a picture");
+    let px = picture.rgba.as_chunks::<4>().0;
+    let mean = px.iter().map(|p| (p[0] as u64 + p[1] as u64 + p[2] as u64) / 3).sum::<u64>() / px.len() as u64;
+    let spread = px.iter().map(|p| ((p[0] as i64 + p[1] as i64 + p[2] as i64) / 3 - mean as i64).unsigned_abs()).sum::<u64>() / px.len() as u64;
+    println!("picture: {}x{}, mean brightness {mean}, spread {spread}, {:?} old", picture.width, picture.height, picture.at.elapsed());
+    println!("sound: loudest {loudest:.3}, {heard} of ~40 reports above the speaking mark");
+    if let Ok(path) = std::env::var("DM_TEST_PICTURE") {
+        let mut ppm = format!("P6 {} {} 255\n", picture.width, picture.height).into_bytes();
+        ppm.extend(px.iter().flat_map(|p| [p[0], p[1], p[2]]));
+        std::fs::write(path, ppm).unwrap();
+    }
+    a.leave().await.unwrap();
+    b.leave().await.unwrap();
+    assert!(spread > 5, "the picture is blank");
+    assert!(heard > 0, "nothing from the microphone");
+}

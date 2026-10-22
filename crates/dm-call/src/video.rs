@@ -158,9 +158,12 @@ fn camera(index: Option<u32>, source: &NativeVideoSource, pictures: &Pictures, m
     use nokhwa::pixel_format::RgbAFormat;
     use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
 
+    let index = CameraIndex::Index(index.or_else(|| cameras().first().map(|c| c.0)).unwrap_or(0));
+    // Closest to what calls send; failing that, whatever the camera offers.
     let wanted = CameraFormat::new_from(WIDTH, HEIGHT, FrameFormat::MJPEG, FPS);
-    let format = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::Closest(wanted));
-    let mut camera = nokhwa::Camera::new(CameraIndex::Index(index.unwrap_or(0)), format).map_err(|e| format!("couldn't open the camera: {e}"))?;
+    let mut camera = nokhwa::Camera::new(index.clone(), RequestedFormat::new::<RgbAFormat>(RequestedFormatType::Closest(wanted)))
+        .or_else(|_| nokhwa::Camera::new(index, RequestedFormat::new::<RgbAFormat>(RequestedFormatType::None)))
+        .map_err(|e| format!("couldn't open the camera: {e}"))?;
     camera.open_stream().map_err(|e| format!("couldn't start the camera: {e}"))?;
     let _ = ready.send(Ok(()));
     let started = Instant::now();
@@ -189,15 +192,22 @@ fn camera(index: Option<u32>, source: &NativeVideoSource, pictures: &Pictures, m
     Ok(())
 }
 
-/// The cameras there are: (index, name).
+/// The cameras there are: (index, name). On Linux a camera has several
+/// device nodes (its picture first, then metadata, another format, an
+/// infrared sensor…) under one name: each camera is listed once, by its
+/// first.
 pub(crate) fn cameras() -> Vec<(u32, String)> {
     let Some(backend) = nokhwa::native_api_backend() else { return Vec::new() };
-    nokhwa::query(backend)
+    let mut all: Vec<(u32, String)> = nokhwa::query(backend)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|c| match c.index() {
             nokhwa::utils::CameraIndex::Index(i) => Some((*i, c.human_name())),
             _ => None,
         })
-        .collect()
+        .collect();
+    all.sort();
+    let mut seen = std::collections::HashSet::new();
+    all.retain(|(_, name)| seen.insert(name.clone()));
+    all
 }

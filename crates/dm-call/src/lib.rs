@@ -88,6 +88,10 @@ struct MediaInner {
     factory: PeerConnectionFactory,
     /// The platform's audio devices are open.
     devices: AtomicBool,
+    /// The microphone and speaker picked, by id: set again once a call is
+    /// recording, since starting to record goes back to the default.
+    microphone: Mutex<Option<String>>,
+    speaker: Mutex<Option<String>>,
 }
 
 impl Drop for MediaInner {
@@ -132,6 +136,7 @@ impl Media {
 
     /// Records from this microphone, switching to it mid-call if one is on.
     pub fn set_microphone(&self, id: &str) -> bool {
+        *self.0.microphone.lock().unwrap() = Some(id.to_string());
         if self.devices().is_err() {
             return false;
         }
@@ -148,13 +153,14 @@ impl Media {
         set
     }
 
-    /// Plays out through this speaker, switching mid-call if one is on.
     /// The cameras there are, by index (as [`Cam::Device`] takes them).
     pub fn cameras(&self) -> Vec<AudioDevice> {
         video::cameras().into_iter().map(|(i, name)| AudioDevice { id: i.to_string(), name }).collect()
     }
 
+    /// Plays out through this speaker, switching mid-call if one is on.
     pub fn set_speaker(&self, id: &str) -> bool {
+        *self.0.speaker.lock().unwrap() = Some(id.to_string());
         if self.devices().is_err() {
             return false;
         }
@@ -405,6 +411,18 @@ impl Call {
         let joined = api.join_call(channel_id, &offer.to_string()).await?;
         let answer = SessionDescription::parse(&settings(&joined.answer), SdpType::Answer).map_err(media_err)?;
         pc.set_remote_description(answer).await.map_err(media_err)?;
+
+        // Recording has started, and with it the default devices: the
+        // picked ones again.
+        if matches!(mic, Mic::Device) {
+            let (microphone, speaker) = (media.0.microphone.lock().unwrap().clone(), media.0.speaker.lock().unwrap().clone());
+            if let Some(id) = microphone {
+                media.set_microphone(&id);
+            }
+            if let Some(id) = speaker {
+                media.set_speaker(&id);
+            }
+        }
 
         let call = Call(Arc::new(CallInner {
             channel_id: channel_id.into(),
