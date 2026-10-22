@@ -1,0 +1,4 @@
+# The prebuilt libwebrtc dm-call links, fetched and checked by
+# dev/fetch-webrtc.sh. Set so webrtc-sys never downloads an unchecked copy.
+[env]
+LK_CUSTOM_WEBRTC = { value = ".webrtc/current", relative = true }

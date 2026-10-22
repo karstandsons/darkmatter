@@ -1,0 +1,25 @@
+[package]
+name = "dm-call"
+description = "Darkmatter's calls: microphone, speakers and media through axiond's SFU"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Google's WebRTC through LiveKit's bindings: echo cancellation, Opus,
+# congestion control. The prebuilt archive is fetched and checked by
+# dev/fetch-webrtc.sh (see .cargo/config.toml).
+libwebrtc = "=0.3.53"
+mm-api = { path = "../mm-api" }
+tokio = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+axiond = { path = "../axiond" }
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

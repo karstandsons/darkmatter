@@ -1,0 +1,396 @@
+//! Calls in Darkmatter: the microphone and speakers, and media to and from
+//! axiond's SFU, on Google's WebRTC (LiveKit's `libwebrtc` bindings).
+//!
+//! [`Media`] is the app's sound: devices to pick from, and libwebrtc's audio
+//! device module with its echo cancellation and noise suppression. A
+//! [`Call`] is this device in one channel's call: it joins with an offer
+//! over the API, answers the SFU when it adds someone's track (over a data
+//! channel), and reports how the connection is and who's speaking.
+//!
+//! Media is DTLS-SRTP to the server only: end-to-end encryption of calls is
+//! M3 Phase 2.
+
+use std::collections::HashMap;
+use std::f32::consts::TAU;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use libwebrtc::audio_source::native::NativeAudioSource;
+use libwebrtc::audio_stream::native::NativeAudioStream;
+use libwebrtc::peer_connection::TrackEvent;
+use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
+use libwebrtc::prelude::*;
+use mm_api::Client;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+pub use mm_api::models::Call as CallInfo;
+
+const RATE: u32 = 48_000;
+/// How often [`Update::Levels`] comes.
+const LEVELS_EVERY: Duration = Duration::from_millis(250);
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Api(#[from] mm_api::Error),
+    #[error("{0}")]
+    Media(String),
+}
+
+fn media(e: impl std::fmt::Display) -> Error {
+    Error::Media(e.to_string())
+}
+
+/// Where this device's sound comes from.
+#[derive(Clone, Copy, Debug)]
+pub enum Mic {
+    /// The microphone picked in [`Media`], through libwebrtc's audio
+    /// processing (echo cancellation, noise suppression, gain).
+    Device,
+    /// A steady tone at this pitch (Hz), with nothing played out: for tests.
+    Tone(f32),
+}
+
+/// A microphone or speaker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioDevice {
+    /// Stable across plugging things in and out.
+    pub id: String,
+    pub name: String,
+}
+
+/// The app's sound and WebRTC. One per app; cheap to clone.
+#[derive(Clone, Default)]
+pub struct Media(Arc<MediaInner>);
+
+#[derive(Default)]
+struct MediaInner {
+    factory: PeerConnectionFactory,
+    /// The platform's audio devices are open.
+    devices: AtomicBool,
+}
+
+impl Drop for MediaInner {
+    fn drop(&mut self) {
+        if self.devices.load(Ordering::Relaxed) {
+            self.factory.release_platform_adm();
+        }
+    }
+}
+
+impl Media {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Opens the platform's audio devices (PulseAudio/ALSA, CoreAudio) the
+    /// first time they're needed, with sound played out through them.
+    fn devices(&self) -> Result<(), Error> {
+        let inner = &self.0;
+        if !inner.devices.swap(true, Ordering::Relaxed) {
+            if !inner.factory.acquire_platform_adm() {
+                inner.devices.store(false, Ordering::Relaxed);
+                return Err(Error::Media("couldn't open the sound devices".into()));
+            }
+            inner.factory.set_adm_recording_enabled(true);
+            inner.factory.set_adm_playout_enabled(true);
+        }
+        Ok(())
+    }
+
+    pub fn microphones(&self) -> Vec<AudioDevice> {
+        let f = &self.0.factory;
+        if self.devices().is_err() {
+            return Vec::new();
+        }
+        (0..f.recording_devices().max(0) as u16).map(|i| AudioDevice { id: f.recording_device_guid(i), name: f.recording_device_name(i) }).collect()
+    }
+
+    pub fn speakers(&self) -> Vec<AudioDevice> {
+        let f = &self.0.factory;
+        if self.devices().is_err() {
+            return Vec::new();
+        }
+        (0..f.playout_devices().max(0) as u16).map(|i| AudioDevice { id: f.playout_device_guid(i), name: f.playout_device_name(i) }).collect()
+    }
+
+    pub fn set_microphone(&self, id: &str) -> bool {
+        self.devices().is_ok() && self.0.factory.set_recording_device_by_guid(id)
+    }
+
+    pub fn set_speaker(&self, id: &str) -> bool {
+        self.devices().is_ok() && self.0.factory.set_playout_device_by_guid(id)
+    }
+}
+
+/// What a call reports, from [`Call::updates`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Update {
+    /// Media is flowing (again).
+    Connected,
+    /// The connection dropped; it's being tried again.
+    Reconnecting,
+    /// It's over: the connection couldn't be brought back.
+    Failed(String),
+    /// How loud each person in the call is now (user id, 0.0–1.0), a few
+    /// times a second. People who aren't sending aren't in it.
+    Levels(Vec<(String, f32)>),
+}
+
+/// This device in a channel's call. Cheap to clone.
+#[derive(Clone)]
+pub struct Call(Arc<CallInner>);
+
+struct CallInner {
+    channel_id: String,
+    api: Client,
+    pc: PeerConnection,
+    mic: RtcAudioTrack,
+    updates: Mutex<Option<mpsc::UnboundedReceiver<Update>>>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    _media: Media,
+}
+
+impl Drop for CallInner {
+    fn drop(&mut self) {
+        self.pc.close();
+        for t in self.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Sdp {
+    r#type: String,
+    sdp: String,
+}
+
+impl Call {
+    /// Joins `channel_id`'s call from this device (starting it if there's
+    /// none). Returns the call as the server has it now.
+    pub async fn join(media: &Media, api: &Client, channel_id: &str, mic: Mic) -> Result<(Call, CallInfo), Error> {
+        let factory = &media.0.factory;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pc = factory.create_peer_connection(RtcConfiguration::default()).map_err(media_err)?;
+        let mut tasks = Vec::new();
+        let handle = tokio::runtime::Handle::current();
+
+        let state = tx.clone();
+        pc.on_connection_state_change(Some(Box::new(move |s| {
+            let update = match s {
+                PeerConnectionState::Connected => Update::Connected,
+                PeerConnectionState::Disconnected => Update::Reconnecting,
+                PeerConnectionState::Failed => Update::Failed("lost the connection to the call".into()),
+                _ => return,
+            };
+            let _ = state.send(update);
+        })));
+
+        // Each person's sound, for who's speaking. It plays out through the
+        // device module by itself (with `Mic::Device`).
+        let levels: Arc<Mutex<HashMap<String, f32>>> = Arc::default();
+        let heard = levels.clone();
+        let spawn = handle.clone();
+        pc.on_track(Some(Box::new(move |ev: TrackEvent| {
+            let MediaStreamTrack::Audio(track) = ev.track else { return };
+            let user = ev.streams.first().map(|s| s.id()).unwrap_or_default();
+            let heard = heard.clone();
+            spawn.spawn(async move {
+                let mut stream = NativeAudioStream::new(track, RATE as i32, 1);
+                while let Some(frame) = stream.next().await {
+                    let n = frame.data.len().max(1) as f32;
+                    let rms = (frame.data.iter().map(|s| (*s as f32).powi(2)).sum::<f32>() / n).sqrt() / i16::MAX as f32;
+                    let mut levels = heard.lock().unwrap();
+                    let level = levels.entry(user.clone()).or_default();
+                    *level = level.max(rms);
+                }
+                heard.lock().unwrap().remove(&user);
+            });
+        })));
+        let report = tx.clone();
+        tasks.push(handle.spawn(async move {
+            let mut tick = tokio::time::interval(LEVELS_EVERY);
+            loop {
+                tick.tick().await;
+                let mut now: Vec<(String, f32)> = levels.lock().unwrap().iter_mut().map(|(u, l)| (u.clone(), std::mem::take(l))).collect();
+                now.sort_by(|a, b| a.0.cmp(&b.0));
+                if report.send(Update::Levels(now)).is_err() {
+                    break;
+                }
+            }
+        }));
+
+        // The SFU offers each new track over this channel; we answer.
+        let dc = pc.create_data_channel("signal", DataChannelInit::default()).map_err(media_err)?;
+        let (offers, mut offered) = mpsc::unbounded_channel::<String>();
+        dc.on_message(Some(Box::new(move |b: DataBuffer| {
+            let _ = offers.send(String::from_utf8_lossy(b.data).into_owned());
+        })));
+        let (pc2, dc2) = (pc.clone(), dc.clone());
+        tasks.push(handle.spawn(async move {
+            while let Some(json) = offered.recv().await {
+                let Ok(offer) = serde_json::from_str::<Sdp>(&json) else { continue };
+                if offer.r#type != "offer" {
+                    continue;
+                }
+                match answer(&pc2, &offer.sdp).await {
+                    Ok(sdp) => {
+                        let body = serde_json::to_string(&Sdp { r#type: "answer".into(), sdp }).unwrap_or_default();
+                        let _ = dc2.send(body.as_bytes(), false);
+                    }
+                    Err(e) => tracing::warn!("couldn't take a call update: {e}"),
+                }
+            }
+        }));
+
+        let mic_track = match mic {
+            Mic::Device => {
+                media.devices()?;
+                factory.create_device_audio_track("mic")
+            }
+            Mic::Tone(pitch) => {
+                let source = NativeAudioSource::new(AudioSourceOptions::default(), RATE, 1, 100);
+                let track = factory.create_audio_track("mic", source.clone());
+                tasks.push(handle.spawn(tone(source, pitch)));
+                track
+            }
+        };
+        pc.add_track(mic_track.clone().into(), &["me"]).map_err(media_err)?;
+
+        // The SFU is ICE-lite: it learns this device's address from its
+        // checks, so the offer goes without waiting for candidates.
+        let offer = pc.create_offer(OfferOptions::default()).await.map_err(media_err)?;
+        pc.set_local_description(offer.clone()).await.map_err(media_err)?;
+        let joined = api.join_call(channel_id, &offer.to_string()).await?;
+        let answer = SessionDescription::parse(&settings(&joined.answer), SdpType::Answer).map_err(media_err)?;
+        pc.set_remote_description(answer).await.map_err(media_err)?;
+
+        let call = Call(Arc::new(CallInner {
+            channel_id: channel_id.into(),
+            api: api.clone(),
+            pc,
+            mic: mic_track,
+            updates: Mutex::new(Some(rx)),
+            tasks: Mutex::new(tasks),
+            _media: media.clone(),
+        }));
+        Ok((call, joined.call))
+    }
+
+    pub fn channel_id(&self) -> &str {
+        &self.0.channel_id
+    }
+
+    /// What the call reports. Only the first caller gets them.
+    pub fn updates(&self) -> Option<mpsc::UnboundedReceiver<Update>> {
+        self.0.updates.lock().unwrap().take()
+    }
+
+    /// Mutes the microphone (nothing is sent but silence) or unmutes it.
+    pub fn set_muted(&self, muted: bool) {
+        self.0.mic.set_enabled(!muted);
+    }
+
+    pub fn muted(&self) -> bool {
+        !self.0.mic.enabled()
+    }
+
+    /// Hangs up: the connection closes and the server takes this device out.
+    pub async fn leave(&self) -> Result<(), Error> {
+        self.0.pc.close();
+        for t in self.0.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
+        Ok(self.0.api.leave_call(&self.0.channel_id).await?)
+    }
+}
+
+fn media_err(e: impl std::fmt::Display) -> Error {
+    media(e)
+}
+
+/// Takes the SFU's offer (someone's track added or gone) and returns the answer.
+async fn answer(pc: &PeerConnection, sdp: &str) -> Result<String, Error> {
+    let offer = SessionDescription::parse(&settings(sdp), SdpType::Offer).map_err(media_err)?;
+    pc.set_remote_description(offer).await.map_err(media_err)?;
+    let answer = pc.create_answer(AnswerOptions::default()).await.map_err(media_err)?;
+    pc.set_local_description(answer.clone()).await.map_err(media_err)?;
+    Ok(answer.to_string())
+}
+
+/// The server's SDP with what this device sends pinned down, since libwebrtc
+/// encodes as the other side asks:
+/// - Opus at a constant bitrate (`cbr=1`) and never paused in silences
+///   (`usedtx=0`): packet sizes and gaps would give away when and how
+///   someone speaks, even encrypted;
+/// - Opus's own loss recovery on (`useinbandfec=1`);
+/// - no audio-level header, which would tell the server who's talking.
+fn settings(sdp: &str) -> String {
+    let opus: Vec<String> = sdp
+        .lines()
+        .filter_map(|l| l.strip_prefix("a=rtpmap:"))
+        .filter(|l| l.to_ascii_lowercase().contains(" opus/"))
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .collect();
+    let mut out = String::with_capacity(sdp.len() + 64);
+    for line in sdp.lines() {
+        if line.starts_with("a=extmap:") && line.contains("ssrc-audio-level") {
+            continue;
+        }
+        match line.strip_prefix("a=fmtp:").and_then(|rest| rest.split_once(' ')) {
+            Some((pt, params)) if opus.iter().any(|p| p == pt) => {
+                let mut kept: Vec<(String, String)> = params
+                    .split(';')
+                    .filter_map(|p| p.trim().split_once('='))
+                    .filter(|(k, _)| !matches!(*k, "cbr" | "usedtx" | "useinbandfec"))
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                kept.extend([("useinbandfec", "1"), ("usedtx", "0"), ("cbr", "1")].map(|(k, v)| (k.to_string(), v.to_string())));
+                let params: Vec<String> = kept.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+                out.push_str(&format!("a=fmtp:{pt} {}", params.join(";")));
+            }
+            _ => out.push_str(line),
+        }
+        out.push_str("\r\n");
+    }
+    out
+}
+
+/// Feeds a steady tone, 10 ms at a time.
+async fn tone(source: NativeAudioSource, pitch: f32) {
+    let samples = RATE / 100;
+    let step = TAU * pitch / RATE as f32;
+    let mut phase = 0f32;
+    let mut tick = tokio::time::interval(Duration::from_millis(10));
+    loop {
+        tick.tick().await;
+        let mut frame = AudioFrame::new(RATE, 1, samples);
+        for s in frame.data.to_mut() {
+            *s = (phase.sin() * 8000.0) as i16;
+            phase = (phase + step) % TAU;
+        }
+        if source.capture_frame(&frame).await.is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::settings;
+
+    #[test]
+    fn opus_is_pinned_and_audio_levels_dropped() {
+        let sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111 0\r\na=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\na=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=0;usedtx=1\r\na=rtpmap:0 PCMU/8000\r\na=fmtp:0 x=y\r\n";
+        let out = settings(sdp);
+        assert!(out.contains("a=fmtp:111 minptime=10;useinbandfec=1;usedtx=0;cbr=1\r\n"), "{out}");
+        assert!(!out.contains("ssrc-audio-level"));
+        assert!(out.contains("abs-send-time"));
+        assert!(out.contains("a=fmtp:0 x=y\r\n"));
+    }
+}

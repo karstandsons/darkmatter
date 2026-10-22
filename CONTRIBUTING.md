@@ -12,6 +12,9 @@ Karst & Sons, who decide what goes in and where the project heads.
   Please only send code you wrote or have the right to share.
 - **Before a pull request:** `cargo clippy --workspace --all-targets -- -D warnings`
   and `cargo test --workspace` must pass (CI checks both, on Linux and macOS).
+  Run `dev/fetch-webrtc.sh` once first: calls (`crates/dm-call`) link a
+  prebuilt libwebrtc, which it downloads and checks against its published
+  SHA-256. On Linux that build also needs glib's headers (`libglib2.0-dev`).
   Keep the code in the style around it.
 - **Testing UI changes:** `dev/seed.sh` starts a local Mattermost with test
   users. Never test write actions against a real server; `--read-only` exists
