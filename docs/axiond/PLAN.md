@@ -294,7 +294,7 @@ Reliability is the second priority, for the server and the apps alike:
   - The SFU forwards each person's audio and video without decoding it. That keeps "one binary, one container".
   - **1:1 calls go through it too:** one code path, and people's IP addresses stay hidden from each other, so no TURN relay is needed to get through NATs.
   - **One UDP port** for media (443/udp suggested), not a range, plus ICE over TCP on 443 for networks that block UDP. TURN over TLS is a later option for networks that let nothing but TLS through.
-  - A 2-vCPU VPS should carry one 20-person video call or several small ones (estimated from LiveKit's and Mattermost's benchmarks; Phase 0 measures it). **The real limit is monthly traffic:** a 20-person video call sends about 50 GB an hour, so a 1 TB plan covers about 20 hours a month and a 20 TB plan (Hetzner EU) about 400.
+  - **Video is for up to 5 people at once** (decided 2026-10-22); audio-only calls can be bigger. At that size every camera is forwarded to everyone at one modest quality, so the first version needs no simulcast or layer switching: under congestion the SFU pauses video and keeps audio. A 5-person video call sends about 5 GB an hour, well inside any VPS plan's traffic, and a 2-vCPU VPS carries several at once (Phase 0 measures it). Simulcast comes back only if bigger video calls are ever wanted.
 - **Clients use libwebrtc** (Google's WebRTC) through LiveKit's `libwebrtc` crate, with our own signalling (not LiveKit's server). It brings echo cancellation, noise suppression, codecs and congestion control, which would take over a year to rebuild. **Before calls leave beta we build libwebrtc ourselves without H.264/H.265 and FFmpeg**, which the prebuilt archives link (LGPL and patent problems).
 - **Encryption:**
   - DTLS-SRTP on every hop, as all WebRTC does.
@@ -381,7 +381,7 @@ Reordered 2026-10-19 around the priorities (encryption and security, then reliab
 | **M5: the group moves over** | The Mattermost importer (bulk export, or reading Postgres directly), Slack if still needed, webhooks and bot accounts, then the switch. | 3–4 weeks |
 | **M6: extensions** | WASM server plugins, sealed sender and padding, maybe federation, Postgres. | Ongoing |
 
-At this pace the switch is roughly two and a half years away (M1–M4 is about 30 person-months). The quickest ways to shorten it: ship encrypted **voice** calls first (about 2.5–3 person-months on desktop) and video later, and give the group the M3 MVP while hardening continues. Until then the group keeps using Darkmatter on the friend's Mattermost server. If that's too long, the lever is M4: the same Rust core under Flutter, rather than two native apps, saves roughly 30–40% of the UI work.
+At this pace the switch is roughly two and a half years away (M1–M4 is about 30 person-months). The quickest way to shorten it: give the group the M3 MVP while hardening continues. (Voice and video ship together, decided 2026-10-22; capping video at 5 people takes simulcast and layer switching out of the MVP.) Until then the group keeps using Darkmatter on the friend's Mattermost server. If that's too long, the lever is M4: the same Rust core under Flutter, rather than two native apps, saves roughly 30–40% of the UI work.
 
 **M0 as built** (see `crates/axiond/README.md`):
 - Darkmatter logs in, reads, posts, replies, edits and deletes. Unreads, mentions, DMs, joining and leaving work, and live events resume after a drop.
@@ -471,7 +471,7 @@ At this pace the switch is roughly two and a half years away (M1–M4 is about 3
 6. **Slack:** is Slack still in use? If so, what plan, and do private channels and DMs need to come across?
 7. **Scale:** how many people are in the group? That decides when Postgres matters.
 8. **SSO:** does anyone need OIDC (Google, GitLab, Authentik…), or are passwords plus passkeys enough?
-9. **Calls:** decided 2026-10-19 that calls are a core feature; the research answered the library choices. Still open: the largest group that needs video (20 is feasible on 2 vCPU), and whether encrypted voice calls should ship before video.
+9. **Calls:** decided 2026-10-19 that calls are a core feature; the research answered the library choices. Decided 2026-10-22: voice and video ship together, and video is for up to 5 people at once.
 10. **Which phone first** in M4, Android or iPhone?
 11. **Encryption library (decided 2026-10-20):** openmls 0.9, the one with an independent audit (see [Review without a paid audit](#review-without-a-paid-audit-decided-2026-10-19)).
 12. **Review without a paid audit (decided):** no paid audit; we rely on reviewed libraries, our own testing and community review.
