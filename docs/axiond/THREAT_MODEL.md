@@ -31,7 +31,7 @@ refreshes its own key weekly and after a day away.
 | The same, *acting*: adding devices, swapping keys, moving or replaying messages | See [A malicious server](#a-malicious-server). |
 | A stolen copy of the server's database or backups | Ciphertext, argon2id password hashes, hashed session tokens, and the identity key backups, which need the recovery key or passphrase. |
 | A stolen copy of a device's files | Darkmatter's local database (decrypted messages, MLS state, search index) is SQLCipher, under a key in the system keychain. A copy of the files alone is unreadable. |
-| Someone removed from a conversation | Reads nothing sent after: they're removed from the group before anything else is sent. |
+| Someone removed from a conversation | Reads nothing sent after: they're removed from the group before anything else is sent. The server refuses messages for the epoch their removal was proposed in, or any before it, so one encrypted a moment before they left (or sent late) is refused, and the sender's app commits the removal and sends it again. |
 | Someone who left a call | Hears at most the next second: a new epoch begins as they leave, and senders switch to its keys a second later. |
 | A plugin in Darkmatter | Gets no encrypted text unless you tick "May read encrypted conversations" for it. |
 
@@ -51,6 +51,7 @@ clients catch it. Each row is a test in
 | Swap or weaken a backup | A backup is bound to its user, and clients refuse argon2id settings below OWASP's floor. |
 | Drop, delay or reorder messages | Possible. Within an epoch MLS shows gaps; the server can always refuse service. |
 | Add a device to a call, or split it | Can't add one: devices join a call's group by themselves, with certificates the server can't make. A split shows: everyone's call code is the same only if they share one group. |
+| Keep a removed member in the group, by dropping its removal | Can't: before sending, apps take out the devices of anyone no longer in the channel themselves. |
 | Withhold a commit from some members | They fall out of step; a device that can't apply a handshake rejoins the group. |
 | Learn who talks to whom, when, how much | Yes: see [What isn't protected](#what-isnt-protected). |
 
