@@ -4,10 +4,12 @@ The Darkmatter chat server. It speaks the part of the Mattermost API that
 Darkmatter uses, so Darkmatter logs in to it unchanged. The plan, and why it
 exists, is in [docs/axiond/PLAN.md](../../docs/axiond/PLAN.md).
 
-**Status: M1, a foundation to try out.** Everything Darkmatter does on
-Mattermost works, plus HTTPS, invites, two-factor codes, backups and the
-deploy kit. Messages aren't end-to-end encrypted yet (that's M2), so don't
-use it for anything secret yet.
+**Status: M1 to M3 built; hardening for real-world use (M5).** Everything
+Darkmatter does on Mattermost works, plus HTTPS, invites, two-factor codes,
+backups, the deploy kit, end-to-end encrypted conversations and calls. The
+encryption and calls are **beta** until they've had outside review and
+months of use. There's no import from Mattermost: moving to axiond is a
+fresh start.
 
 ## What works
 
@@ -31,11 +33,11 @@ use it for anything secret yet.
 - Teams, public channels and direct messages: joining, leaving, and finding
   channels by name.
 - Messages: posting, threads, editing, deleting and reactions.
-- Calls (in progress, M3): one per channel, through a small SFU built in
-  (str0m) on one UDP port; joining from another device moves you there,
-  and leaving the channel or signing out takes you out. Media is encrypted
-  to the server only so far, so Darkmatter keeps calls behind a build
-  feature until they're end-to-end encrypted.
+- Calls (beta): one per channel, through a small SFU built in (str0m) on
+  one UDP port, or over TCP on the HTTPS port where UDP is blocked; joining
+  from another device moves you there, and leaving the channel or signing
+  out takes you out. Voice, video for up to 5 people and screen sharing,
+  end-to-end encrypted with SFrame keyed from each call's MLS group.
 - Files and pictures, up to 100 MB each (`max_file_mb`). Pictures get a
   thumbnail and a preview. Files are stored under random names and only ever
   served as downloads.

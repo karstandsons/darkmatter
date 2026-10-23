@@ -1,5 +1,7 @@
 # Darkmatter mobile: our own iOS and Android apps
 
+> **Since then (2026-10-23):** phones (M4) are on hold until axiond and Darkmatter on Linux are at 100%. This research is kept for when M4 starts. See [PLAN.md](../PLAN.md#backlog-phones-and-push).
+
 Research for task **RST-2** (mm-rust/2), 2026-10-19. Research only: nothing in the repo was changed. The real server (the team's current Mattermost server) was never contacted.
 
 ## Summary
