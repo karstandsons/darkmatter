@@ -221,3 +221,51 @@ async fn a_swapped_identity_key_is_noticed() {
     assert_eq!(alice.key_changes(std::slice::from_ref(&bob.user_id)).await, vec![(bob.user_id.clone(), false)]);
     let _ = alice_api;
 }
+
+#[tokio::test]
+async fn a_removed_member_reads_nothing_sent_after() {
+    let s = server().await;
+    let (alice_api, alice) = device(&s, "alice").await;
+    let (bob_api, bob) = device(&s, "bob").await;
+    let team = alice_api.my_teams().await.unwrap()[0].id.clone();
+    // A public channel: bob can still fetch its posts after he leaves.
+    let lobby = alice_api.create_channel(&team, "lobby", "Lobby", false).await.unwrap().id;
+    alice_api.encrypt_channel(&lobby).await.unwrap();
+    alice_api.execute_command(&team, &lobby, "", "/invite @bob").await.unwrap();
+    let hello = send(&alice_api, &alice, &lobby, "hello bob").await;
+    assert_eq!(text(bob.decrypt_post(&fetch(&bob_api, &lobby, &hello.id).await.unwrap()).await).as_deref(), Some("hello bob"));
+
+    // Alice encrypts a message, then bob leaves before it reaches the server
+    // (or her app sends it late on purpose): it's for an epoch he can read.
+    let late = NewPost { channel_id: lobby.clone(), message: "bob's surprise party".into(), pending_post_id: "alice:late".into(), ..Default::default() };
+    let late = alice.encrypt_post(&late).await.unwrap();
+    bob_api.leave_channel(&lobby, &bob.user_id).await.unwrap();
+    // His removal waits for a commit: nothing is taken meanwhile.
+    let refused = alice_api.create_post(&late).await.unwrap_err();
+    assert!(matches!(&refused, mm_api::Error::Api(a) if a.status_code == 409), "{refused}");
+    // Alice's app catches up and commits the removal before it sends again.
+    let after = send(&alice_api, &alice, &lobby, "bob's surprise party").await;
+    // The old epoch's ciphertext is still refused once the removal is in.
+    let refused = alice_api.create_post(&late).await.unwrap_err();
+    assert!(matches!(&refused, mm_api::Error::Api(a) if a.status_code == 409), "{refused}");
+    let seen = fetch(&bob_api, &lobby, &after.id).await.expect("public: still fetchable");
+    assert_eq!(text(bob.decrypt_post(&seen).await), None, "read after he left");
+    let dump: Vec<String> = sqlx::query_scalar("SELECT props FROM posts WHERE channel_id = ?").bind(&lobby).fetch_all(&s.app.db).await.unwrap();
+    assert_eq!(dump.iter().filter(|p| p.contains("dm_e2ee")).count(), 2, "only hello and the message sent after the commit");
+}
+
+#[tokio::test]
+async fn a_removal_the_server_drops_is_made_anyway() {
+    let s = server().await;
+    let (alice_api, alice, bob_api, bob, _, plans) = two(&s).await;
+    let team = alice_api.my_teams().await.unwrap()[0].id.clone();
+    alice_api.execute_command(&team, &plans, "", "/kick @bob").await.unwrap();
+    // The server keeps bob in the group: its removal proposal is gone.
+    exec(&s, "DELETE FROM e2ee_handshakes WHERE channel_id = ? AND kind = 'proposal'", &[&plans]).await;
+    let after = send(&alice_api, &alice, &plans, "now he's gone").await;
+    assert!(!alice.group_members(&plans).unwrap().iter().any(|(u, _)| *u == bob.user_id), "alice's app took him out itself");
+    // Private: he can't fetch it, but even handed the post he can't read it.
+    let post = fetch(&alice_api, &plans, &after.id).await.unwrap();
+    assert_eq!(text(bob.decrypt_post(&post).await), None);
+    let _ = bob_api;
+}
