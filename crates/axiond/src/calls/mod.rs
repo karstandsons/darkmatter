@@ -284,6 +284,11 @@ pub async fn device_gone(app: &App, user_id: &str, device_id: &str) {
     announce_all(app, changes).await;
 }
 
+/// Every device in a call, as (user, device).
+pub fn devices(app: &App) -> Vec<(String, String)> {
+    app.calls.calls.lock().unwrap().values().flat_map(|c| c.members.iter().map(|m| (m.user_id.clone(), m.device_id.clone()))).collect()
+}
+
 async fn member_channel(app: &App, me: &Me, channel_id: &str) -> Result<db::ChannelRow> {
     let channel = db::channel(&app.db, channel_id).await?.ok_or_else(|| Error::not_found("Channel"))?;
     if db::member(&app.db, channel_id, &me.user_id).await?.is_none() {
