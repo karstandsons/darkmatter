@@ -27,12 +27,21 @@ const MAX_EMOJI_SIDE: u32 = 1024;
 const MAX_PICTURE_BYTES: usize = 10 * 1024 * 1024;
 const PICTURE_SIDE: u32 = 256;
 
-fn emoji_path(app: &App, id: &str) -> PathBuf {
-    app.config.data_dir.join("emoji").join(id)
+/// Where an emoji is kept. Only well-formed ids get a path, so nothing like
+/// `..%2F` can point outside the data folder.
+fn emoji_path(app: &App, id: &str) -> Result<PathBuf> {
+    if !ids::is_id(id) {
+        return Err(Error::not_found("Emoji"));
+    }
+    Ok(app.config.data_dir.join("emoji").join(id))
 }
 
-fn picture_path(app: &App, user_id: &str) -> PathBuf {
-    app.config.data_dir.join("pictures").join(format!("{user_id}.png"))
+/// Where someone's picture is kept, for well-formed ids only.
+fn picture_path(app: &App, user_id: &str) -> Result<PathBuf> {
+    if !ids::is_id(user_id) {
+        return Err(Error::not_found("Picture"));
+    }
+    Ok(app.config.data_dir.join("pictures").join(format!("{user_id}.png")))
 }
 
 /// The picture's format, if it's one we accept and its size is sane.
@@ -85,7 +94,7 @@ pub async fn add_emoji(app: &App, creator_id: &str, name: &str, bytes: &[u8]) ->
         return Err(Error::bad_request(format!(":{name}: already exists.")));
     }
     let id = ids::new_id();
-    let path = emoji_path(app, &id);
+    let path = emoji_path(app, &id)?;
     write_file(&path, bytes).await?;
     let now = ids::now();
     sqlx::query("INSERT INTO emoji (id, creator_id, name, create_at, update_at) VALUES (?1, ?2, ?3, ?4, ?4)")
@@ -170,21 +179,23 @@ pub async fn by_name(State(app): State<App>, _: Me, Path(name): Path<String>) ->
 }
 
 pub async fn emoji_image(State(app): State<App>, _: Me, Path(id): Path<String>) -> Result<Response> {
+    let path = emoji_path(&app, &id)?;
     let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emoji WHERE id = ? AND delete_at = 0").bind(&id).fetch_one(&app.db).await?;
     if live == 0 {
         return Err(Error::not_found("Emoji"));
     }
-    picture_response(tokio::fs::read(emoji_path(&app, &id)).await.map_err(|_| Error::not_found("Emoji"))?)
+    picture_response(tokio::fs::read(path).await.map_err(|_| Error::not_found("Emoji"))?)
 }
 
 pub async fn delete(State(app): State<App>, me: Me, Path(id): Path<String>) -> Result<Json<Value>> {
+    let path = emoji_path(&app, &id)?;
     let creator: Option<String> = sqlx::query_scalar("SELECT creator_id FROM emoji WHERE id = ? AND delete_at = 0").bind(&id).fetch_optional(&app.db).await?;
     let creator = creator.ok_or_else(|| Error::not_found("Emoji"))?;
     if creator != me.user_id && !me.is_admin() {
         return Err(Error::forbidden());
     }
     sqlx::query("UPDATE emoji SET delete_at = ?1, update_at = ?1 WHERE id = ?2").bind(ids::now()).bind(&id).execute(&app.db).await?;
-    let _ = tokio::fs::remove_file(emoji_path(&app, &id)).await;
+    let _ = tokio::fs::remove_file(path).await;
     super::ok()
 }
 
@@ -205,9 +216,10 @@ pub async fn set_picture(app: &App, user_id: &str, bytes: Vec<u8>) -> Result<()>
     if bytes.len() > MAX_PICTURE_BYTES || check_picture(&bytes, 16_384).is_none() {
         return Err(Error::bad_request("Pictures must be PNG, JPEG, GIF or WebP, at most 10 MB."));
     }
+    let path = picture_path(app, user_id)?;
     let png = tokio::task::spawn_blocking(move || square_png(&bytes)).await.map_err(|_| Error::internal())?;
     let png = png.ok_or_else(|| Error::bad_request("Couldn't read that picture."))?;
-    write_file(&picture_path(app, user_id), &png).await?;
+    write_file(&path, &png).await?;
     picture_changed(app, user_id).await
 }
 
@@ -249,14 +261,14 @@ pub async fn upload_picture(State(app): State<App>, me: Me, Path(user_id): Path<
 
 pub async fn remove_picture(State(app): State<App>, me: Me, Path(user_id): Path<String>) -> Result<Json<Value>> {
     may_change(&me, &user_id)?;
-    let _ = tokio::fs::remove_file(picture_path(&app, &user_id)).await;
+    let _ = tokio::fs::remove_file(picture_path(&app, &user_id)?).await;
     picture_changed(&app, &user_id).await?;
     super::ok()
 }
 
 /// Someone's picture, or 404 so apps draw their initials.
 pub async fn picture(State(app): State<App>, _: Me, Path(user_id): Path<String>) -> Result<Response> {
-    let bytes = tokio::fs::read(picture_path(&app, &user_id)).await.map_err(|_| Error::not_found("Picture"))?;
+    let bytes = tokio::fs::read(picture_path(&app, &user_id)?).await.map_err(|_| Error::not_found("Picture"))?;
     picture_response(bytes)
 }
 
