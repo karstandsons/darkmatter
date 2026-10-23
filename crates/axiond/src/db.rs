@@ -250,9 +250,11 @@ pub struct PostRow {
 }
 
 /// Columns of `posts p`, with the size of the thread each post is in.
+/// `r.root_id != ''` changes nothing in the result but lets SQLite count
+/// through the `posts_root` partial index instead of scanning every post.
 pub const POST_COLUMNS: &str = "p.id, p.channel_id, p.user_id, p.root_id, p.create_at, p.update_at, p.edit_at, \
      p.delete_at, p.message, p.type, p.props, p.file_ids, p.is_pinned, p.pending_post_id, \
-     (SELECT COUNT(*) FROM posts r WHERE r.delete_at = 0 \
+     (SELECT COUNT(*) FROM posts r WHERE r.root_id != '' AND r.delete_at = 0 \
         AND r.root_id = CASE p.root_id WHEN '' THEN p.id ELSE p.root_id END) AS reply_count";
 
 impl From<PostRow> for Post {
@@ -393,5 +395,16 @@ mod tests {
     fn emoji_codes_in_text() {
         let found: Vec<String> = super::emoji_names("hi :grad: and :party-parrot: at 10:30").collect();
         assert_eq!(found, ["grad", "party-parrot"]);
+    }
+
+    /// Counting a thread's replies must use the index, not scan every post.
+    #[tokio::test]
+    async fn reply_count_uses_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = super::open(dir.path()).await.unwrap();
+        let sql = format!("EXPLAIN QUERY PLAN SELECT {} FROM posts p WHERE p.id = 'x'", super::POST_COLUMNS);
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(&sql).fetch_all(&db).await.unwrap();
+        assert!(plan.iter().any(|(.., d)| d.contains("posts_root")), "{plan:?}");
+        assert!(!plan.iter().any(|(.., d)| d.starts_with("SCAN r")), "{plan:?}");
     }
 }
