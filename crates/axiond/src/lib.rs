@@ -93,6 +93,10 @@ impl App {
         let db = self.db.clone();
         let tls = self.config.tls()?;
         self.schedule_backups();
+        // Make the hash unknown logins are checked against now, so the first
+        // one doesn't take longer than a real user's.
+        let warm = self.clone();
+        tokio::spawn(async move { warm.passwords.verify(None, "").await });
         housekeeping::start(&self);
         calls::start(&self, listener.local_addr()?).await?;
         let config = self.config.clone();
