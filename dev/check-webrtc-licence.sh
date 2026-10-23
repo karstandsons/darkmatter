@@ -18,5 +18,8 @@ if grep -Eiq '^# *(ffmpeg|openh264)$' "$dir/LICENSE.md"; then fail "has FFmpeg o
 lib=$(find "$dir/lib" -name 'libwebrtc.a' | head -1)
 [[ -n $lib ]] || fail "no libwebrtc.a"
 nm=$(command -v llvm-nm || command -v nm)
-if "$nm" --defined-only "$lib" 2>/dev/null | grep -Eiq 'avcodec_|ff_h264|WelsCreate'; then fail "has FFmpeg or OpenH264 code"; fi
+symbols=$("$nm" --defined-only "$lib" 2>/dev/null || true)
+# A library nm can't read would otherwise pass for one without the codecs.
+grep -q 'webrtc' <<<"$symbols" || fail "$nm can't read $lib"
+if grep -Eiq 'avcodec_|ff_h264|WelsCreate' <<<"$symbols"; then fail "has FFmpeg or OpenH264 code"; fi
 echo "libwebrtc in $dir: no H.264 or FFmpeg (nor H.265 on Linux)"
