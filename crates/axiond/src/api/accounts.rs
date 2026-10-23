@@ -1,7 +1,7 @@
 //! Joining with an invite, deactivating people, changing your password,
 //! deleting your own account, and the audit log.
 
-use axum::Json;
+use axum::{Extension, Json};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use mm_api::models::User;
@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::admin::{self, NewUser};
 use crate::auth::{self, Me};
 use crate::error::{Error, Result};
+use crate::limits::ClientIp;
 use crate::{App, audit, db, ids};
 
 /// Invite codes last a week and work once, unless made otherwise.
@@ -227,21 +228,21 @@ pub struct DeleteBody {
 
 /// `DELETE users/{id}`: your own account (with your password), or anyone's
 /// for an admin.
-pub async fn delete(State(app): State<App>, me: Me, Path(user_id): Path<String>, body: Option<Json<DeleteBody>>) -> Result<Json<Value>> {
-    delete_user(app, me, user_id, body).await
+pub async fn delete(State(app): State<App>, me: Me, Extension(ip): Extension<ClientIp>, Path(user_id): Path<String>, body: Option<Json<DeleteBody>>) -> Result<Json<Value>> {
+    delete_user(app, me, ip, user_id, body).await
 }
 
 /// `DELETE users/me`.
-pub async fn delete_me(State(app): State<App>, me: Me, body: Option<Json<DeleteBody>>) -> Result<Json<Value>> {
+pub async fn delete_me(State(app): State<App>, me: Me, Extension(ip): Extension<ClientIp>, body: Option<Json<DeleteBody>>) -> Result<Json<Value>> {
     let id = me.user_id.clone();
-    delete_user(app, me, id, body).await
+    delete_user(app, me, ip, id, body).await
 }
 
-async fn delete_user(app: App, me: Me, user_id: String, body: Option<Json<DeleteBody>>) -> Result<Json<Value>> {
+async fn delete_user(app: App, me: Me, ip: ClientIp, user_id: String, body: Option<Json<DeleteBody>>) -> Result<Json<Value>> {
     let user_id = if user_id == "me" { me.user_id.clone() } else { user_id };
     let body = body.map(|Json(b)| b).unwrap_or_default();
     if user_id == me.user_id {
-        auth::confirm_password(&app, &user_id, &body.password, "Enter your password to delete your account.").await?;
+        auth::confirm_password(&app, &user_id, ip.0, &body.password, "Enter your password to delete your account.").await?;
     } else {
         admin_only(&me)?;
     }
@@ -258,12 +259,12 @@ pub struct NewPassword {
 
 /// `PUT users/{id}/password`: changing your own password, with the current
 /// one. Your other apps are signed out; this one stays.
-pub async fn change_password(State(app): State<App>, me: Me, Path(user_id): Path<String>, Json(body): Json<NewPassword>) -> Result<Json<Value>> {
+pub async fn change_password(State(app): State<App>, me: Me, Extension(ip): Extension<ClientIp>, Path(user_id): Path<String>, Json(body): Json<NewPassword>) -> Result<Json<Value>> {
     if user_id != "me" && user_id != me.user_id {
         return Err(Error::forbidden());
     }
     auth::check_new_password(&body.new_password).map_err(Error::bad_request)?;
-    auth::confirm_password(&app, &me.user_id, &body.current_password, "That isn't your current password.").await?;
+    auth::confirm_password(&app, &me.user_id, ip.0, &body.current_password, "That isn't your current password.").await?;
     let hash = app.passwords.hash(&body.new_password).await.map_err(|_| Error::internal())?;
     sqlx::query("UPDATE users SET password_hash = ?, update_at = ? WHERE id = ?").bind(&hash).bind(ids::now()).bind(&me.user_id).execute(&app.db).await?;
     super::sessions::end_all(&app, &me.user_id, Some(&me.session_id)).await?;

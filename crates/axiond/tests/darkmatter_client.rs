@@ -14,6 +14,8 @@ const PASSWORD: &str = "correct horse battery";
 struct Server {
     url: String,
     app: App,
+    /// The axiond serving the data folder now (`restarted` stops it).
+    running: tokio::sync::Mutex<tokio::task::JoinHandle<anyhow::Result<()>>>,
     _dir: tempfile::TempDir,
 }
 
@@ -33,8 +35,8 @@ async fn server_with(change: impl FnOnce(&mut Config)) -> Server {
     admin::add_channel(&app, "home", "rust", "Rust").await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(app.clone().serve(listener));
-    Server { url, app, _dir: dir }
+    let running = tokio::sync::Mutex::new(tokio::spawn(app.clone().serve(listener)));
+    Server { url, app, running, _dir: dir }
 }
 
 async fn login(s: &Server, name: &str) -> Client {
@@ -1046,14 +1048,19 @@ async fn plain_link_previews_are_checked() {
     assert!(alice.create_post(&post("see https://example.com/b", serde_json::json!({ "url": "https://example.com/b", "image": png }))).await.is_err());
 }
 
-/// Another axiond on the same data folder, as after a restart.
+/// Stops the axiond serving the data folder and starts another on it, as a
+/// restart does. (Only one may serve a data folder at a time: the admin
+/// socket says so.)
 async fn restarted(s: &Server, change: impl FnOnce(&mut Config)) -> (String, App) {
+    let mut running = s.running.lock().await;
+    running.abort();
+    let _ = (&mut *running).await;
     let mut config = Config { data_dir: s.app.config.data_dir.clone(), ..Config::default() };
     change(&mut config);
     let app = App::open(config).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(app.clone().serve(listener));
+    *running = tokio::spawn(app.clone().serve(listener));
     (url, app)
 }
 
@@ -1292,4 +1299,24 @@ async fn an_open_socket_ends_with_its_session() {
     alice.create_post(&NewPost { channel_id: town, message: "after the limit".into(), ..Default::default() }).await.unwrap();
     let got = arrivals(&mut events, 2).await;
     assert!(!got.iter().any(|m| matches!(m, Message::Event(Event::Posted { .. }))), "{got:?}");
+}
+
+#[tokio::test]
+async fn a_guesser_locks_out_only_their_own_address() {
+    let s = server_with(|c| c.behind_proxy = true).await;
+    let http = reqwest::Client::new();
+    let try_login = |from: &'static str, password: &'static str| {
+        http.post(format!("{}/api/v4/users/login", s.url))
+            .header("x-forwarded-for", from)
+            .json(&serde_json::json!({ "login_id": "bob", "password": password }))
+            .send()
+    };
+    // Someone who only knows Bob's username guesses until they're made to wait…
+    for _ in 0..5 {
+        assert_eq!(try_login("203.0.113.9", "wrong").await.unwrap().status(), 401);
+    }
+    assert_eq!(try_login("203.0.113.9", PASSWORD).await.unwrap().status(), 429);
+    // …but Bob, somewhere else, still signs in.
+    assert_eq!(try_login("198.51.100.1", PASSWORD).await.unwrap().status(), 200);
+    assert_eq!(try_login("203.0.113.9", PASSWORD).await.unwrap().status(), 429, "the guesser still waits");
 }

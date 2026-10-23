@@ -250,7 +250,12 @@ pub async fn create_session(app: &App, user_id: &str, device_id: &str, user_agen
 // slow password check (and forgotten once it turns out right), so guesses
 // sent all at once can't each slip in before the others are counted.
 
+/// Wrong passwords for an account from one address before it waits…
 const FREE_TRIES: u32 = 5;
+/// …and from everywhere together. Higher, so someone guessing from their
+/// own address locks only that address out, not the account's owner; a
+/// guesser spread over many addresses still hits it.
+const ACCOUNT_FREE_TRIES: u32 = 50;
 const MAX_LOCK: Duration = Duration::from_secs(3600);
 /// A day without a wrong password starts the count again.
 const FORGET_MS: i64 = DAY_MS;
@@ -263,20 +268,20 @@ pub fn guard_key(user_id: Option<&str>, login: &str) -> String {
     }
 }
 
-/// How long until `key` may try again, if it's locked.
-pub async fn locked<'c>(db: impl sqlx::SqliteExecutor<'c>, key: &str) -> sqlx::Result<Option<Duration>> {
+/// How long until `key` may try again, if it's locked after `free` failures.
+pub async fn locked<'c>(db: impl sqlx::SqliteExecutor<'c>, key: &str, free: u32) -> sqlx::Result<Option<Duration>> {
     let now = ids::now();
     let row: Option<(i64, i64)> = sqlx::query_as("SELECT count, last_at FROM login_failures WHERE k = ? AND last_at > ?").bind(key).bind(now - FORGET_MS).fetch_optional(db).await?;
-    Ok(row.and_then(|(count, last)| lock_for(count as u32)?.checked_sub(Duration::from_millis((now - last).max(0) as u64))))
+    Ok(row.and_then(|(count, last)| lock_for(count as u32, free)?.checked_sub(Duration::from_millis((now - last).max(0) as u64))))
 }
 
 /// Starts a try for `key`: if it's locked, how long to wait (and the try
 /// isn't counted); otherwise it's counted as a failure until `succeeded`
 /// (or `release`) says otherwise. One write transaction, so tries at the
 /// same moment are counted one after another.
-pub async fn attempt(db: &Db, key: &str) -> sqlx::Result<Option<Duration>> {
+pub async fn attempt(db: &Db, key: &str, free: u32) -> sqlx::Result<Option<Duration>> {
     let mut tx = crate::db::write(db).await?;
-    if let Some(wait) = locked(&mut *tx, key).await? {
+    if let Some(wait) = locked(&mut *tx, key, free).await? {
         return Ok(Some(wait));
     }
     let now = ids::now();
@@ -305,6 +310,40 @@ pub async fn succeeded(db: &Db, key: &str) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// A password try, counted for the account from this address and for the
+/// account as a whole until it turns out right.
+pub struct Try {
+    here: String,
+    account: String,
+}
+
+impl Try {
+    /// Starts one, or says how long to wait.
+    pub async fn start(db: &Db, account: &str, ip: Option<std::net::IpAddr>) -> Result<Try, Error> {
+        let here = format!("{account} from {}", ip.map_or_else(|| "?".to_string(), |ip| ip.to_string()));
+        if let Some(wait) = attempt(db, &here, FREE_TRIES).await? {
+            return Err(locked_error(wait));
+        }
+        if let Some(wait) = attempt(db, account, ACCOUNT_FREE_TRIES).await? {
+            release(db, &here).await?;
+            return Err(locked_error(wait));
+        }
+        Ok(Try { here, account: account.to_string() })
+    }
+
+    /// The password (and code) were right: both counts start again.
+    pub async fn passed(self, db: &Db) -> sqlx::Result<()> {
+        succeeded(db, &self.here).await?;
+        succeeded(db, &self.account).await
+    }
+
+    /// Not a guess after all (the password was right; the code comes next).
+    pub async fn not_a_guess(self, db: &Db) -> sqlx::Result<()> {
+        release(db, &self.here).await?;
+        release(db, &self.account).await
+    }
+}
+
 /// Counts that no longer lock anything (for housekeeping).
 pub async fn forget_old_failures(db: &Db) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM login_failures WHERE last_at < ?").bind(ids::now() - FORGET_MS).execute(db).await?;
@@ -319,22 +358,20 @@ pub fn locked_error(wait: Duration) -> Error {
 /// For someone already signed in who has to type their password again
 /// (deleting the account, changing the password, starting encryption
 /// over): checked like a login, so a stolen session can't guess faster.
-pub async fn confirm_password(app: &App, user_id: &str, password: &str, wrong: &str) -> Result<(), Error> {
-    if let Some(wait) = attempt(&app.db, user_id).await? {
-        return Err(locked_error(wait));
-    }
+pub async fn confirm_password(app: &App, user_id: &str, ip: Option<std::net::IpAddr>, password: &str, wrong: &str) -> Result<(), Error> {
+    let attempt = Try::start(&app.db, user_id, ip).await?;
     let hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?").bind(user_id).fetch_one(&app.db).await?;
     if !app.passwords.verify(Some(hash), password).await? {
-        // Already counted by `attempt`.
+        // Already counted by `Try::start`.
         return Err(Error::bad_request(wrong));
     }
-    succeeded(&app.db, user_id).await?;
+    attempt.passed(&app.db).await?;
     Ok(())
 }
 
-/// 30 s after the fifth failure, doubling each time, up to an hour.
-fn lock_for(failures: u32) -> Option<Duration> {
-    let over = failures.checked_sub(FREE_TRIES)?;
+/// 30 s after the `free`th failure, doubling each time, up to an hour.
+fn lock_for(failures: u32, free: u32) -> Option<Duration> {
+    let over = failures.checked_sub(free)?;
     Some(Duration::from_secs(30).saturating_mul(1 << over.min(10)).min(MAX_LOCK))
 }
 
@@ -383,34 +420,58 @@ mod tests {
 
     #[tokio::test]
     async fn guessing_gets_slower_per_account_and_survives_a_restart() {
-        assert_eq!(lock_for(4), None);
-        assert_eq!(lock_for(5), Some(Duration::from_secs(30)));
-        assert_eq!(lock_for(7), Some(Duration::from_secs(120)));
-        assert_eq!(lock_for(40), Some(MAX_LOCK));
+        assert_eq!(lock_for(4, FREE_TRIES), None);
+        assert_eq!(lock_for(5, FREE_TRIES), Some(Duration::from_secs(30)));
+        assert_eq!(lock_for(7, FREE_TRIES), Some(Duration::from_secs(120)));
+        assert_eq!(lock_for(40, FREE_TRIES), Some(MAX_LOCK));
         assert_eq!(guard_key(Some("u1"), "Alice"), "u1");
         assert_eq!(guard_key(None, " Alice "), guard_key(None, "alice"));
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::open(dir.path()).await.unwrap();
         for _ in 0..5 {
-            assert!(attempt(&db, "u1").await.unwrap().is_none());
+            assert!(attempt(&db, "u1", FREE_TRIES).await.unwrap().is_none());
         }
-        assert!(locked(&db, "u1").await.unwrap().is_some());
-        assert!(attempt(&db, "u1").await.unwrap().is_some(), "refused");
+        assert!(locked(&db, "u1", FREE_TRIES).await.unwrap().is_some());
+        assert!(attempt(&db, "u1", FREE_TRIES).await.unwrap().is_some(), "refused");
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count FROM login_failures WHERE k = 'u1'").fetch_one(&db).await.unwrap(), 5, "a refused try isn't counted");
-        assert!(locked(&db, "u2").await.unwrap().is_none());
+        assert!(locked(&db, "u2", FREE_TRIES).await.unwrap().is_none());
         db.close().await;
         let db = crate::db::open(dir.path()).await.unwrap();
-        let wait = locked(&db, "u1").await.unwrap().expect("still locked after a restart");
+        let wait = locked(&db, "u1", FREE_TRIES).await.unwrap().expect("still locked after a restart");
         assert!(wait <= Duration::from_secs(30) && wait > Duration::from_secs(25));
         succeeded(&db, "u1").await.unwrap();
-        assert!(locked(&db, "u1").await.unwrap().is_none());
+        assert!(locked(&db, "u1", FREE_TRIES).await.unwrap().is_none());
         // Failures a day old are forgotten.
         sqlx::query("INSERT INTO login_failures (k, count, last_at) VALUES ('u3', 9, ?)").bind(ids::now() - FORGET_MS - 1).execute(&db).await.unwrap();
-        assert!(locked(&db, "u3").await.unwrap().is_none());
-        attempt(&db, "u3").await.unwrap();
+        assert!(locked(&db, "u3", FREE_TRIES).await.unwrap().is_none());
+        attempt(&db, "u3", FREE_TRIES).await.unwrap();
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count FROM login_failures WHERE k = 'u3'").fetch_one(&db).await.unwrap(), 1);
         release(&db, "u3").await.unwrap();
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count FROM login_failures WHERE k = 'u3'").fetch_one(&db).await.unwrap(), 0);
+    }
+
+    /// Guessing from one address locks that address out of the account,
+    /// not the owner elsewhere; enough from everywhere locks the account.
+    #[tokio::test]
+    async fn guessing_locks_the_guessers_address_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let (guesser, owner) = (Some("203.0.113.9".parse().unwrap()), Some("198.51.100.1".parse().unwrap()));
+        for _ in 0..FREE_TRIES {
+            let _wrong = Try::start(&db, "u1", guesser).await.unwrap();
+        }
+        assert_eq!(Try::start(&db, "u1", guesser).await.err().map(|e| e.status.as_u16()), Some(429));
+        Try::start(&db, "u1", owner).await.expect("the owner's address isn't locked").passed(&db).await.unwrap();
+        // Many addresses together: the account-wide count.
+        for i in 0..ACCOUNT_FREE_TRIES {
+            let ip = Some(std::net::IpAddr::from([10, 0, (i / 250) as u8, (i % 250) as u8]));
+            let _wrong = Try::start(&db, "u2", ip).await.unwrap();
+        }
+        assert!(Try::start(&db, "u2", owner).await.is_err(), "locked everywhere");
+        // A try that wasn't a guess isn't held against anyone.
+        let t = Try::start(&db, "u3", owner).await.unwrap();
+        t.not_a_guess(&db).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT SUM(count) FROM login_failures WHERE k LIKE 'u3%'").fetch_one(&db).await.unwrap(), 0);
     }
 
     /// Tries sent at the same moment are counted before any is checked, so
@@ -419,7 +480,7 @@ mod tests {
     async fn a_burst_of_tries_is_counted_as_it_comes() {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::open(dir.path()).await.unwrap();
-        let tries = futures_util::future::join_all((0..40).map(|_| attempt(&db, "u1"))).await;
+        let tries = futures_util::future::join_all((0..40).map(|_| attempt(&db, "u1", FREE_TRIES))).await;
         assert_eq!(tries.iter().filter(|t| t.as_ref().unwrap().is_none()).count(), FREE_TRIES as usize);
     }
 }

@@ -1,4 +1,4 @@
-use axum::Json;
+use axum::{Extension, Json};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue};
 use mm_api::models::{Team, User};
@@ -9,6 +9,7 @@ use crate::auth::{self, Me};
 use crate::db::{self, TeamRow, USER_COLUMNS, UserRow};
 use crate::error::{Error, Result};
 use crate::App;
+use crate::limits::ClientIp;
 
 #[derive(Deserialize)]
 pub struct Login {
@@ -23,7 +24,7 @@ pub struct Login {
 }
 
 /// `POST users/login`: the user, with the session token in the `Token` header.
-pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body): Json<Login>) -> Result<(HeaderMap, Json<User>)> {
+pub async fn login(State(app): State<App>, Extension(ip): Extension<ClientIp>, request_headers: HeaderMap, Json(body): Json<Login>) -> Result<(HeaderMap, Json<User>)> {
     let login = body.login_id.trim();
     let found: Option<(String, String, bool)> = sqlx::query_as(
         "SELECT id, password_hash, mfa_active FROM users WHERE (username = lower(?1) OR lower(email) = lower(?1)) AND delete_at = 0",
@@ -31,15 +32,14 @@ pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body
     .bind(login)
     .fetch_optional(&app.db)
     .await?;
-    // One count per account, whether it's typed as a username or an email.
+    // Counted per account (whether it's typed as a username or an email),
+    // from this address and from everywhere.
     let key = auth::guard_key(found.as_ref().map(|f| f.0.as_str()), login);
-    if let Some(wait) = auth::attempt(&app.db, &key).await? {
-        return Err(auth::locked_error(wait));
-    }
+    let attempt = auth::Try::start(&app.db, &key, ip.0).await?;
     let mfa = found.as_ref().is_some_and(|f| f.2);
     let (id, hash) = found.map(|(id, hash, _)| (id, hash)).unzip();
     let ok = app.passwords.verify(hash.clone(), &body.password).await?;
-    // A wrong password stays counted (`attempt` counted it).
+    // A wrong password stays counted (`Try::start` counted it).
     let Some(id) = id.filter(|_| ok) else {
         return Err(Error {
             status: axum::http::StatusCode::UNAUTHORIZED,
@@ -51,7 +51,7 @@ pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body
     if mfa {
         if body.token.trim().is_empty() {
             // Not a guess: the password was right, and the app asks for the code next.
-            auth::release(&app.db, &key).await?;
+            attempt.not_a_guess(&app.db).await?;
             return Err(Error {
                 status: axum::http::StatusCode::UNAUTHORIZED,
                 id: "mfa.validate_token.authenticate.app_error",
@@ -66,7 +66,7 @@ pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body
             });
         }
     }
-    auth::succeeded(&app.db, &key).await?;
+    attempt.passed(&app.db).await?;
     // A hash from before the cost was tuned (or changed) is redone now that
     // the password is known.
     if let Some(old) = hash.filter(|h| app.passwords.outdated(h)) {

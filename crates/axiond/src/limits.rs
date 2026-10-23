@@ -78,9 +78,16 @@ pub fn too_many(wait: Duration) -> Response {
     response
 }
 
+/// The address a request came from, for handlers (wrong passwords count
+/// per account and per address).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClientIp(pub Option<IpAddr>);
+
 /// Middleware: the per-address limits.
-pub async fn by_address(State(app): State<App>, req: Request, next: Next) -> Response {
-    if let Some(ip) = client_ip(&app, &req) {
+pub async fn by_address(State(app): State<App>, mut req: Request, next: Next) -> Response {
+    let found = client_ip(&app, &req);
+    req.extensions_mut().insert(ClientIp(found));
+    if let Some(ip) = found {
         let ip = ip.to_string();
         if let Err(wait) = app.limiter.take(&ip, REQUESTS) {
             return too_many(wait);

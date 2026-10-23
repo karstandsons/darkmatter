@@ -27,6 +27,9 @@ pub fn start(app: &App) {
     });
 }
 
+/// Sessions end this long after signing in, however much they're used.
+const MAX_AGE_MS: i64 = crate::auth::SESSION_MAX_DAYS * 86_400_000;
+
 /// How often the server checks that open connections and calls still have
 /// a session.
 const SESSION_WATCH: Duration = Duration::from_secs(5);
@@ -54,10 +57,11 @@ pub async fn ended_sessions(app: &App) -> sqlx::Result<()> {
     if !live.is_empty() {
         let kept: Vec<String> = sqlx::query_scalar(
             "SELECT s.id FROM sessions s JOIN users u ON u.id = s.user_id \
-             WHERE s.id IN (SELECT value FROM json_each(?1)) AND s.expires_at > ?2 AND u.delete_at = 0",
+             WHERE s.id IN (SELECT value FROM json_each(?1)) AND s.expires_at > ?2 AND s.create_at > ?2 - ?3 AND u.delete_at = 0",
         )
         .bind(serde_json::to_string(&live).unwrap_or_default())
         .bind(now)
+        .bind(MAX_AGE_MS)
         .fetch_all(&app.db)
         .await?;
         for id in live.iter().filter(|id| !kept.contains(id)) {
@@ -68,10 +72,11 @@ pub async fn ended_sessions(app: &App) -> sqlx::Result<()> {
     if !devices.is_empty() {
         let kept: Vec<(String, String)> = sqlx::query_as(
             "SELECT DISTINCT s.user_id, s.device_id FROM sessions s JOIN users u ON u.id = s.user_id \
-             WHERE s.user_id IN (SELECT json_extract(value, '$[0]') FROM json_each(?1)) AND s.expires_at > ?2 AND u.delete_at = 0",
+             WHERE s.user_id IN (SELECT json_extract(value, '$[0]') FROM json_each(?1)) AND s.expires_at > ?2 AND s.create_at > ?2 - ?3 AND u.delete_at = 0",
         )
         .bind(serde_json::to_string(&devices).unwrap_or_default())
         .bind(now)
+        .bind(MAX_AGE_MS)
         .fetch_all(&app.db)
         .await?;
         for (user, device) in devices.iter().filter(|d| !kept.contains(d)) {
@@ -97,7 +102,7 @@ pub async fn run(app: &App) -> anyhow::Result<usize> {
     }
     let expired: Vec<(String, String, String)> = sqlx::query_as("DELETE FROM sessions WHERE expires_at < ?1 OR create_at < ?1 - ?2 RETURNING id, user_id, device_id")
         .bind(now)
-        .bind(crate::auth::SESSION_MAX_DAYS * 86_400_000)
+        .bind(MAX_AGE_MS)
         .fetch_all(&app.db)
         .await?;
     for (session, user, device) in expired {
