@@ -341,7 +341,10 @@ Reliability is the second priority, for the server and the apps alike:
   - Tests through a proxy that loses, delays and blacks out packets.
   - Not yet: ICE over TCP on 443, carrying calls over a server restart, drawing video with a shader.
 - **Phase 6 (2026-10-23, SFrame):** frames are encrypted with RFC 9605 SFrame keyed from the call's MLS group (§5.2), through our own frame transformer in a vendored `webrtc-sys` ([vendor/README.md](../../vendor/README.md)). Per-sender, per-stream keys, replay protection, and VP8's readable header authenticated. The SFU offers only Opus and VP8. See [E2EE.md §11](E2EE.md#11-calls).
-  - Next: our own libwebrtc build without H.264/H.265/FFmpeg, then the `calls` feature in releases.
+- **Our own libwebrtc (2026-10-23):** `dev/build-webrtc.sh` builds LiveKit's m150 libwebrtc at the same commits with `rtc_use_h264=false`, `rtc_use_h265=false` and Chromium's FFmpeg branding, for the archives on the `webrtc-89d790b-free` release that `dev/fetch-webrtc.sh` takes. `dev/check-webrtc-licence.sh` refuses a build with H.264, H.265 or FFmpeg in its arguments, licences or symbols, in CI and before every release build.
+  - Linux x64 and arm64: built (arm64 cross-built), and Darkmatter's calls tests pass on x64 against it.
+  - macOS: the `libwebrtc` workflow builds both, by hand (macOS minutes). Until then, a release stops at the licence check.
+- **Releases build Darkmatter with calls** (`--features calls`), on Linux and macOS.
 
 ## Mobile and push
 

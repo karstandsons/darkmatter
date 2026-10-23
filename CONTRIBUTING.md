@@ -12,9 +12,10 @@ Karst & Sons, who decide what goes in and where the project heads.
   Please only send code you wrote or have the right to share.
 - **Before a pull request:** `cargo clippy --workspace --all-targets -- -D warnings`
   and `cargo test --workspace` must pass (CI checks both, on Linux and macOS).
-  Run `dev/fetch-webrtc.sh` once first: calls (`crates/dm-call`) link a
-  prebuilt libwebrtc, which it downloads and checks against its published
-  SHA-256. On Linux that build also needs glib's headers (`libglib2.0-dev`)
+  Run `dev/fetch-webrtc.sh` once first: calls (`crates/dm-call`) link
+  libwebrtc, which it downloads and checks against its SHA-256 (our build
+  without H.264, H.265 or FFmpeg, from `dev/build-webrtc.sh`; LiveKit's
+  prebuilt on macOS until ours is made). On Linux that build also needs glib's headers (`libglib2.0-dev`)
   and clang 21 or newer (set `CXX` to it if it isn't the default), and the
   camera crate needs libclang.
   Keep the code in the style around it.

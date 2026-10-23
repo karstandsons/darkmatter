@@ -1,0 +1,38 @@
+# Builds libwebrtc without H.264, H.265 or FFmpeg (dev/build-webrtc.sh) and
+# uploads it to the webrtc-89d790b-free release, where dev/fetch-webrtc.sh
+# finds it. Run by hand only: a macOS build takes an hour or two, and macOS
+# minutes count ten times on a private repository. Linux ones can be built
+# locally the same way and uploaded with `gh release upload`.
+#
+# After a run, put each archive's SHA-256 (in the log) into
+# dev/fetch-webrtc.sh.
+name: libwebrtc
+on:
+  workflow_dispatch:
+    inputs:
+      triples:
+        description: 'Which to build, as JSON'
+        default: '["mac-arm64", "mac-x64"]'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        triple: ${{ fromJSON(inputs.triples) }}
+    runs-on: ${{ startsWith(matrix.triple, 'mac') && 'macos-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: dev/build-webrtc.sh ${{ matrix.triple }} "$RUNNER_TEMP/webrtc"
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=webrtc-89d790b-free
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --prerelease --title "libwebrtc m150 (89d790b), without H.264/H.265/FFmpeg" \
+            --notes "libwebrtc for calls, built by dev/build-webrtc.sh. Not a Darkmatter release."
+          gh release upload "$tag" "$RUNNER_TEMP/webrtc/webrtc-${{ matrix.triple }}-release.zip" --clobber

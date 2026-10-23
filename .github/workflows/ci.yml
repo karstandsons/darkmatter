@@ -26,12 +26,16 @@ jobs:
       # Headers for winit (Wayland/X11 keyboard handling), and glib's for
       # libwebrtc's glue (calls).
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libglib2.0-dev
-      # libwebrtc for calls (dm-call), checked against its published SHA-256.
+      # libwebrtc for calls (dm-call): our build without H.264, H.265 or
+      # FFmpeg, checked against its SHA-256.
       - uses: actions/cache@v4
         with:
           path: .webrtc
           key: webrtc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dev/fetch-webrtc.sh') }}
       - run: dev/fetch-webrtc.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: dev/check-webrtc-licence.sh
       # libwebrtc's C++ glue builds against its own libc++, which tracks LLVM
       # and needs clang 21 or newer; the runner has 18. The camera crate's
       # V4L2 bindings are generated with libclang.
@@ -42,7 +46,7 @@ jobs:
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      # Calls stay behind a feature until they're end-to-end encrypted.
+      # Calls are a build feature: they need libwebrtc, fetched above.
       - run: cargo clippy -p darkmatter --features calls --all-targets --locked -- -D warnings
       - run: cargo test -p darkmatter --features calls --locked
       - run: cargo build --release --locked -p darkmatter
@@ -74,9 +78,9 @@ jobs:
           MM_TEST_URL: http://127.0.0.1:8065
 
   # macOS minutes count ten times on a private repository, so this runs for
-  # release tags and by hand, not every push.
+  # release tags and by hand, not every push (nor libwebrtc's tags).
   macos:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

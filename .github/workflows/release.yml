@@ -56,8 +56,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}
-      - run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev
-      - run: cargo build --release --locked -p darkmatter
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libglib2.0-dev
+      # libwebrtc for calls: our build without H.264, H.265 or FFmpeg, and
+      # refused if it has them.
+      - run: dev/fetch-webrtc.sh && dev/check-webrtc-licence.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+      # Its C++ glue needs clang 21 or newer (as in CI); the camera crate's
+      # bindings need libclang.
+      - run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update && sudo apt-get install -y clang-21 libclang-21-dev
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
+      - run: cargo build --release --locked -p darkmatter --features calls
       - run: packaging/linux/tarball.sh target/release/darkmatter ${{ matrix.arch }} dist
       - uses: actions/upload-artifact@v4
         with:
@@ -85,9 +97,20 @@ jobs:
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
+      # libwebrtc for calls, one for each target, refused if it has H.264,
+      # H.265 or FFmpeg in it.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for t in arm64 x64; do
+            dev/fetch-webrtc.sh mac-$t
+            dir=$(readlink .webrtc/current)
+            dev/check-webrtc-licence.sh "$dir"
+            echo "WEBRTC_$t=$dir" >> "$GITHUB_ENV"
+          done
       - run: |
-          cargo build --release --locked -p darkmatter --target aarch64-apple-darwin
-          cargo build --release --locked -p darkmatter --target x86_64-apple-darwin
+          LK_CUSTOM_WEBRTC=$WEBRTC_arm64 cargo build --release --locked -p darkmatter --features calls --target aarch64-apple-darwin
+          LK_CUSTOM_WEBRTC=$WEBRTC_x64 cargo build --release --locked -p darkmatter --features calls --target x86_64-apple-darwin
           # One binary for Apple Silicon and Intel.
           lipo -create -output darkmatter \
             target/aarch64-apple-darwin/release/darkmatter target/x86_64-apple-darwin/release/darkmatter

@@ -193,7 +193,7 @@ built-in ones in [`plugins/`](plugins) are good starting points.
 ## Tests
 
 ```sh
-dev/fetch-webrtc.sh   # once: the checked prebuilt libwebrtc that calls (dm-call) link
+dev/fetch-webrtc.sh   # once: the libwebrtc that calls (dm-call) link, checked
 cargo test --workspace   # REST against wiremock, WebSocket against a scripted local server, fixtures in fixtures/; axiond end to end
 ```
 

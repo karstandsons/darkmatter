@@ -10,13 +10,15 @@ pkgdesc="Darkmatter: an Omarchy-themed Mattermost client"
 arch=('x86_64' 'aarch64')
 url="https://github.com/karstandsons/darkmatter"
 license=('MIT OR Apache-2.0')
-depends=('gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'hicolor-icon-theme' 'openssl')
+depends=('gcc-libs' 'glibc' 'glib2' 'libxkbcommon' 'wayland' 'hicolor-icon-theme' 'openssl')
 optdepends=(
   'vulkan-icd-loader: GPU rendering'
   'libx11: running under X11'
   'gnome-keyring: keep the login in a keyring (or any Secret Service)'
   'xdg-desktop-portal: file picker for attachments'
   'libnotify: mention notifications'
+  'libpulse: sound in calls (with PulseAudio or pipewire-pulse)'
+  'pipewire: sharing a screen in calls (with xdg-desktop-portal)'
   'python: the built-in plugins (meme, gif, kaomoji, quote)'
   'imagemagick: the meme plugin'
 )
