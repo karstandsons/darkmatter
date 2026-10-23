@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use libwebrtc::native::yuv_helper;
 use libwebrtc::prelude::*;
 use libwebrtc::video_source::native::NativeVideoSource;
@@ -55,8 +56,9 @@ pub enum Cam {
 pub struct Picture {
     pub width: u32,
     pub height: u32,
-    /// `width * height * 4` bytes, R, G, B, A.
-    pub rgba: Arc<Vec<u8>>,
+    /// `width * height * 4` bytes, R, G, B, A: shared, never copied (iced
+    /// takes them as they are).
+    pub rgba: Bytes,
     /// When it came: a picture that stops coming (camera off) goes stale.
     pub at: Instant,
 }
@@ -96,7 +98,7 @@ pub(crate) fn rgba_of(frame: &BoxVideoFrame) -> Picture {
     let mut rgba = vec![0u8; (w * h * 4) as usize];
     // libyuv's "ABGR" is R, G, B, A in memory.
     frame.buffer.to_argb(VideoFormatType::ABGR, &mut rgba, w * 4, w as i32, h as i32);
-    Picture { width: w, height: h, rgba: Arc::new(rgba), at: Instant::now() }
+    Picture { width: w, height: h, rgba: Bytes::from(rgba), at: Instant::now() }
 }
 
 /// A running camera (or pattern): stops when dropped.
@@ -175,7 +177,7 @@ fn pattern(source: &NativeVideoSource, pictures: &Pictures, me: &str, stop: &Ato
         }
         let buffer = to_i420(&rgba, w * 4, w, h);
         send(source, buffer, started);
-        pictures.put(me, Picture { width: w, height: h, rgba: Arc::new(rgba), at: Instant::now() });
+        pictures.put(me, Picture { width: w, height: h, rgba: Bytes::from(rgba), at: Instant::now() });
         n += 1;
         std::thread::sleep(Duration::from_millis(1000 / FPS as u64));
     }
@@ -222,7 +224,7 @@ fn camera(index: Option<u32>, source: &NativeVideoSource, pictures: &Pictures, m
         let (width, height) = (image.width(), image.height());
         let rgba = image.into_raw();
         send(source, to_i420(&rgba, width * 4, width & !1, height & !1), started);
-        pictures.put(me, Picture { width, height, rgba: Arc::new(rgba), at: Instant::now() });
+        pictures.put(me, Picture { width, height, rgba: Bytes::from(rgba), at: Instant::now() });
     }
     let _ = camera.stop_stream();
     Ok(())
@@ -282,7 +284,7 @@ fn screen(source: &NativeVideoSource, pictures: &Pictures, key: &str, stop: &Ato
                 let (sy, su, sv) = buffer.strides();
                 let (y, u, v) = buffer.data();
                 yuv_helper::i420_to_abgr(y, sy, u, su, v, sv, &mut rgba, ew * 4, ew as i32, eh as i32);
-                pictures.put(key, Picture { width: ew, height: eh, rgba: Arc::new(rgba), at: Instant::now() });
+                pictures.put(key, Picture { width: ew, height: eh, rgba: Bytes::from(rgba), at: Instant::now() });
             }
             send(source, buffer, started);
             n += 1;

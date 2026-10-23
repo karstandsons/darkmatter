@@ -264,7 +264,7 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
                     active.pictures.retain(|user, _| latest.contains_key(user));
                     for (user, p) in latest {
                         if active.pictures.get(&user).is_none_or(|(at, _)| *at != p.at) {
-                            let image = iced::widget::image::Handle::from_rgba(p.width, p.height, p.rgba.to_vec());
+                            let image = iced::widget::image::Handle::from_rgba(p.width, p.height, p.rgba.clone());
                             active.pictures.insert(user, (p.at, image));
                         }
                     }
