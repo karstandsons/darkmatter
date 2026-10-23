@@ -2092,6 +2092,7 @@ name = "dm-call"
 version = "0.5.0"
 dependencies = [
  "axiond",
+ "bytes",
  "dm-client",
  "dm-crypto",
  "futures-util",

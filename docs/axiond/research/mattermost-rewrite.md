@@ -1,5 +1,7 @@
 # Could axiond become a full Mattermost server? (RST-1)
 
+> **Since then (2026-10-23):** there's no import from Mattermost. Moving to axiond is a fresh start, so the importers below (§2.6) aren't planned, and Slack is no longer in use. See [PLAN.md](../PLAN.md#starting-fresh-on-axiond).
+
 **Short answer: no. Keep the non-goal.** A drop-in Rust replacement for Mattermost works out to about **40–70 person-months** (one developer working with Claude), or 120–200 person-months at a traditional pace. After that it needs **0.3–0.5 of a person indefinitely** just to keep up, because Mattermost adds about 7 endpoints a month. It also works against the plan's main goal: the official apps can never take part in E2EE.
 
 Two cheaper options make sense:

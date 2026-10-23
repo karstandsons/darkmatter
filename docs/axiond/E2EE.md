@@ -186,7 +186,7 @@ The server can't read a message, so it can't find @mentions in it. The sender's 
 - A client can't lie its way into someone else's mention count beyond what any channel member could do by mentioning them.
 - **As built:** `dm_mentions` holds user ids, and `@channel`, `@all` or `@here`. The server counts only channel members, never the author, and not someone who blocked the author.
 - **Unread counts** work as today: they count posts, not content.
-- **Push notifications** on phones (M4) carry no content: the phone wakes, fetches the post by ID, decrypts it and shows the text itself.
+- **Push notifications** on phones (M4, on hold) carry no content: the phone wakes, fetches the post by ID, decrypts it and shows the text itself.
 
 ## 10. Search
 

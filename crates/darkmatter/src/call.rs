@@ -98,6 +98,8 @@ pub struct Active {
     /// (back to 0 once connected).
     #[cfg_attr(not(feature = "calls"), allow(dead_code))]
     attempt: u32,
+    /// Joining again is already on its way: not asked for twice.
+    rejoining: bool,
     #[cfg_attr(not(feature = "calls"), allow(dead_code))]
     pub call_id: String,
     /// The code everyone in the call sees the same, once encrypted.
@@ -166,9 +168,12 @@ static CURRENT: std::sync::Mutex<Option<dm_call::Media>> = std::sync::Mutex::new
 pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
     match msg {
         Msg::Join(channel_id) => join(chat, channel_id, 0),
-        Msg::Rejoin(channel_id, attempt) => match &chat.call {
+        Msg::Rejoin(channel_id, attempt) => match &mut chat.call {
             // Still the call it was for (not left meanwhile).
-            Some(a) if a.channel_id == channel_id => join(chat, channel_id, attempt),
+            Some(a) if a.channel_id == channel_id => {
+                a.rejoining = false;
+                join(chat, channel_id, attempt)
+            }
             _ => Task::none(),
         },
         Msg::Accept => match chat.ringing.take() {
@@ -200,6 +205,7 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
                     since: Instant::now(),
                     levels: HashMap::new(),
                     attempt: joined.attempt,
+                    rejoining: false,
                     devices: None,
                     call_id: joined.info.id.clone(),
                     code: None,
@@ -258,7 +264,7 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
                     active.pictures.retain(|user, _| latest.contains_key(user));
                     for (user, p) in latest {
                         if active.pictures.get(&user).is_none_or(|(at, _)| *at != p.at) {
-                            let image = iced::widget::image::Handle::from_rgba(p.width, p.height, p.rgba.to_vec());
+                            let image = iced::widget::image::Handle::from_rgba(p.width, p.height, p.rgba.clone());
                             active.pictures.insert(user, (p.at, image));
                         }
                     }
@@ -358,7 +364,11 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
         }
         Msg::Calls(calls) => {
             chat.calls = calls.into_iter().map(|c| (c.channel_id.clone(), c)).collect();
-            Task::none()
+            // After the connection to the server was lost (it may have
+            // restarted, forgetting every call): still in ours?
+            let Some(channel) = chat.call.as_ref().map(|a| a.channel_id.clone()) else { return Task::none() };
+            let call = chat.calls.get(&channel).cloned();
+            still_in(chat, call.as_ref()).unwrap_or_else(Task::none)
         }
     }
 }
@@ -375,6 +385,29 @@ fn devices() -> (Vec<String>, Vec<String>, Vec<String>) {
     (Vec::new(), Vec::new(), Vec::new())
 }
 
+/// Whether this device is still in its call, as the server has it (`call`:
+/// the call in its channel, if any). `Some` when it isn't: moved to another
+/// of your devices (ended here), or taken out (the connection went quiet,
+/// or the server restarted): joined again, unless that's on its way or
+/// it's still joining.
+fn still_in(chat: &mut Chat, call: Option<&CallInfo>) -> Option<Task<Message>> {
+    let me = chat.store.me.id.clone();
+    let device = chat.crypto.as_ref().map(|c| c.device.device_id.clone()).unwrap_or_default();
+    let here = |c: &CallInfo| c.participants.iter().any(|p| p.user_id == me && p.device_id == device);
+    let elsewhere = |c: &CallInfo| c.participants.iter().any(|p| p.user_id == me && p.device_id != device);
+    match call {
+        Some(c) if here(c) => None,
+        // Answered on another device: done here.
+        Some(c) if elsewhere(c) => {
+            chat.notice = Some("The call moved to another of your devices.".into());
+            let _ = end(chat);
+            Some(Task::none())
+        }
+        _ if chat.call.as_ref().is_some_and(|a| a.link != Link::Connecting && !a.rejoining) => Some(rejoin(chat)),
+        _ => None,
+    }
+}
+
 /// How many times in a row a dropped call is joined again before giving up.
 const REJOINS: u32 = 5;
 
@@ -382,11 +415,15 @@ const REJOINS: u32 = 5;
 /// out): join again after a while, longer each time, up to [`REJOINS`].
 fn rejoin(chat: &mut Chat) -> Task<Message> {
     let Some(active) = &mut chat.call else { return Task::none() };
+    if active.rejoining {
+        return Task::none();
+    }
     if active.attempt >= REJOINS {
         chat.error = Some("The call dropped and couldn't be joined again.".into());
         return leave(chat);
     }
     active.link = Link::Reconnecting;
+    active.rejoining = true;
     let (channel, attempt) = (active.channel_id.clone(), active.attempt + 1);
     let wait = Duration::from_secs(1 << (attempt - 1));
     Task::perform(tokio::time::sleep(wait), move |_| Message::Call(Msg::Rejoin(channel.clone(), attempt)))
@@ -505,23 +542,10 @@ pub fn updated(chat: &mut Chat, u: CallUpdate) -> Task<Message> {
     if chat.ringing.as_ref().is_some_and(|r| r.channel_id == u.channel_id) && u.call.as_ref().is_none_or(mine) {
         chat.ringing = None;
     }
-    if chat.call.as_ref().is_some_and(|a| a.channel_id == u.channel_id) {
-        let device = chat.crypto.as_ref().map(|c| c.device.device_id.clone()).unwrap_or_default();
-        let here = |c: &CallInfo| c.participants.iter().any(|p| p.user_id == me && p.device_id == device);
-        let elsewhere = |c: &CallInfo| c.participants.iter().any(|p| p.user_id == me && p.device_id != device);
-        match &u.call {
-            Some(c) if here(c) => {}
-            // Answered on another device: done here.
-            Some(c) if elsewhere(c) => {
-                chat.notice = Some("The call moved to another of your devices.".into());
-                let _ = end(chat);
-                return Task::none();
-            }
-            // The server took this device out (its connection went quiet):
-            // join again, unless it's already doing so.
-            _ if chat.call.as_ref().is_some_and(|a| a.link == Link::Connected) => return rejoin(chat),
-            _ => {}
-        }
+    if chat.call.as_ref().is_some_and(|a| a.channel_id == u.channel_id)
+        && let Some(task) = still_in(chat, u.call.as_ref())
+    {
+        return task;
     }
     let personal = chat.store.channels.get(&u.channel_id).is_some_and(|c| matches!(c.kind, mm_api::models::ChannelType::Direct | mm_api::models::ChannelType::Group));
     let calling = u.call.as_ref().filter(|c| u.started && personal && c.owner_id != me && available(chat));
