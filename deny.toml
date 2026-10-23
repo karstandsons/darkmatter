@@ -1,27 +1,26 @@
-# cargo-deny (`cargo deny check`), run in CI next to `cargo audit`. An
-# advisory against anything we build fails the build; each ignore below says
-# why it's safe.
+# cargo-deny, run in CI next to `cargo audit` as `cargo deny check
+# advisories bans sources`: an advisory against anything we build fails the
+# build. Licences aren't checked yet.
 
 [graph]
 all-features = true
 
 [advisories]
-ignore = [
-    # rsa's Marvin attack. rsa is only in Cargo.lock: sqlx's macros list
-    # sqlx-mysql, which needs it, but we build sqlx for SQLite alone, so it's
-    # never compiled. There's no fixed rsa release to move to either.
-    { id = "RUSTSEC-2023-0071", reason = "lockfile only (sqlx-mysql), never built" },
-]
-
-[licenses]
-allow = []
-confidence-threshold = 0.9
+# Unmaintained crates fail only when we depend on them ourselves. Those deep
+# in iced's and zbus's trees (paste, proc-macro-error2, ttf-parser,
+# zbus_names, zvariant*) are theirs to replace; they show up as warnings in
+# `cargo audit`. Unsound ones the same way (by default): lru, through iced's
+# text renderer (cryoglyph), until iced moves to lru 0.18.2.
+unmaintained = "workspace"
+yanked = "deny"
+# rsa (RUSTSEC-2023-0071, the Marvin attack) is ignored in
+# .cargo/audit.toml, not here: it's only in Cargo.lock, and cargo-deny,
+# which walks what's built, never sees it.
 
 [bans]
 multiple-versions = "allow"
-wildcards = "deny"
-allow-wildcard-paths = true
 
+# Crates come from crates.io (and vendor/), nowhere else.
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
