@@ -11,6 +11,7 @@ mod auth;
 pub mod backup;
 mod calls;
 pub mod config;
+pub mod control;
 mod db;
 pub mod e2ee;
 mod error;
@@ -98,6 +99,8 @@ impl App {
         let warm = self.clone();
         tokio::spawn(async move { warm.passwords.verify(None, "").await });
         housekeeping::start(&self);
+        housekeeping::watch_sessions(&self);
+        let _admin_socket = control::listen(&self)?;
         calls::start(&self, listener.local_addr()?).await?;
         let config = self.config.clone();
         let app = self.clone();

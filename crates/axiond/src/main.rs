@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use axiond::admin::{self, NewUser};
+use axiond::control::{self, Request};
 use axiond::{App, Config};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -191,9 +192,8 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::User(UserCommand::Password { username }) => {
-            let app = App::open(config).await?;
             let password = new_password(&username)?;
-            admin::set_password(&app, &username, &password).await?;
+            control::apply(config, Request::Password { username: username.clone(), password }).await?;
             println!("Changed {username}'s password and signed them out everywhere.");
             Ok(())
         }
@@ -220,23 +220,22 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::User(UserCommand::MfaOff { username }) => {
-            let app = App::open(config).await?;
-            admin::mfa_off(&app, &username).await?;
+            control::apply(config, Request::MfaOff { username: username.clone() }).await?;
             println!("Turned off {username}'s two-factor codes and signed them out everywhere.");
             Ok(())
         }
         Command::User(UserCommand::Deactivate { username }) => {
-            admin::set_active(&App::open(config).await?, &username, false).await?;
+            control::apply(config, Request::SetActive { username: username.clone(), active: false }).await?;
             println!("Deactivated {username}.");
             Ok(())
         }
         Command::User(UserCommand::Activate { username }) => {
-            admin::set_active(&App::open(config).await?, &username, true).await?;
+            control::apply(config, Request::SetActive { username: username.clone(), active: true }).await?;
             println!("{username} can sign in again.");
             Ok(())
         }
         Command::User(UserCommand::Delete { username, delete_messages }) => {
-            admin::delete_user(&App::open(config).await?, &username, delete_messages).await?;
+            control::apply(config, Request::Delete { username: username.clone(), delete_messages }).await?;
             println!("Deleted {username}'s account{}.", if delete_messages { " and messages" } else { "" });
             Ok(())
         }

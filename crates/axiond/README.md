@@ -21,6 +21,12 @@ use it for anything secret yet.
   default). Admins can also deactivate people (`axiond user deactivate`),
   and anyone can delete their own account; `axiond user delete` does it for
   someone else.
+- Admin commands that sign someone out (`user deactivate`, `delete`,
+  `password` and `mfa-off`) are done by the running server, through
+  `admin.sock` in the data folder, so that person's open apps and calls
+  are cut off at once. With no server running, the command does it
+  itself. The server also checks every 5 seconds that each open
+  connection and call still has a session.
 - Blocking someone (no direct messages either way, no notifications from
   them) and reporting messages or people to the admins (`axiond reports`).
 - An audit log of what admins did (`axiond audit`).
