@@ -1226,3 +1226,70 @@ async fn password_hashing_is_tuned_and_old_hashes_are_redone() {
     assert!(hash(&app).await.starts_with("$argon2id$v=19$m=19456,t=3,p=1$"));
     Client::new(&url).unwrap().login("alice", PASSWORD, None).await.expect("the new hash verifies");
 }
+
+/// What reaches a socket in the next `secs` seconds.
+async fn arrivals(stream: &mut ws::EventStream, secs: u64) -> Vec<Message> {
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while let Ok(Some(m)) = tokio::time::timeout_at(deadline, stream.next()).await {
+        got.push(m);
+    }
+    got
+}
+
+#[tokio::test]
+async fn a_burst_of_password_guesses_gets_five() {
+    let s = server().await;
+    let bob = login(&s, "bob").await;
+    let bob_id = bob.me().await.unwrap().id;
+    // A stolen session sends 40 guesses at once.
+    let tries = futures_util::future::join_all((0..40).map(|i| {
+        let (bob, bob_id) = (&bob, &bob_id);
+        async move { bob.change_password(bob_id, &format!("guess {i}"), "another long password").await.unwrap_err() }
+    }))
+    .await;
+    let status = |e: &mm_api::Error| match e {
+        mm_api::Error::Api(a) => a.status_code,
+        other => panic!("{other:?}"),
+    };
+    let checked = tries.iter().filter(|e| status(e) == 400).count();
+    assert!(checked <= 5, "only five are checked, got {checked}");
+    assert!(tries.iter().all(|e| matches!(status(e), 400 | 429)));
+    let counted: i64 = sqlx::query_scalar("SELECT count FROM login_failures WHERE k = ?").bind(&bob_id).fetch_one(&s.app.db).await.unwrap();
+    assert_eq!(counted as usize, checked);
+}
+
+#[tokio::test]
+async fn an_open_socket_ends_with_its_session() {
+    let s = server().await;
+    let day = 86_400_000i64;
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let alice = login(&s, "alice").await;
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let token_hash = |c: &Client| sha256_hex(c.token().unwrap());
+
+    // Past the limit while connected: housekeeping deletes the session and
+    // closes its socket, so later events don't reach it.
+    let bob = login(&s, "bob").await;
+    let mut events = ws::connect(&bob).unwrap();
+    assert!(matches!(events.next().await, Some(Message::Connected { .. })));
+    sqlx::query("UPDATE sessions SET create_at = ? WHERE token_hash = ?").bind(now() - 91 * day).bind(token_hash(&bob)).execute(&s.app.db).await.unwrap();
+    axiond::housekeeping::run(&s.app).await.unwrap();
+    alice.create_post(&NewPost { channel_id: town.clone(), message: "after expiry".into(), ..Default::default() }).await.unwrap();
+    let got = arrivals(&mut events, 3).await;
+    assert!(got.contains(&Message::Disconnected), "{got:?}");
+    assert!(!got.iter().any(|m| matches!(m, Message::Event(Event::Posted { .. }))), "{got:?}");
+
+    // A socket closes at its session's limit by itself, without waiting
+    // for housekeeping.
+    let carol = login(&s, "bob").await;
+    sqlx::query("UPDATE sessions SET create_at = ? WHERE token_hash = ?").bind(now() - 90 * day + 2_000).bind(token_hash(&carol)).execute(&s.app.db).await.unwrap();
+    let mut events = ws::connect(&carol).unwrap();
+    assert!(matches!(events.next().await, Some(Message::Connected { .. })));
+    let got = arrivals(&mut events, 5).await;
+    assert!(got.contains(&Message::Disconnected), "{got:?}");
+    alice.create_post(&NewPost { channel_id: town, message: "after the limit".into(), ..Default::default() }).await.unwrap();
+    let got = arrivals(&mut events, 2).await;
+    assert!(!got.iter().any(|m| matches!(m, Message::Event(Event::Posted { .. }))), "{got:?}");
+}

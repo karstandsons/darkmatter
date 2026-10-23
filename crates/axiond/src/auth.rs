@@ -168,6 +168,9 @@ pub struct Me {
     /// The device this session signs in (end-to-end encryption).
     pub device_id: String,
     pub roles: String,
+    /// When the session ends however much it's used (unix ms): an open
+    /// websocket closes then.
+    pub ends_at: i64,
 }
 
 impl Me {
@@ -208,7 +211,7 @@ impl FromRequestParts<App> for Me {
                 .execute(&app.db)
                 .await?;
         }
-        Ok(Me { user_id, session_id, device_id, roles })
+        Ok(Me { user_id, session_id, device_id, roles, ends_at: created + SESSION_MAX_DAYS * DAY_MS })
     }
 }
 
@@ -243,7 +246,9 @@ pub async fn create_session(app: &App, user_id: &str, device_id: &str, user_agen
 // Failed logins per account, in the database (so a restart doesn't clear
 // them). An account is one counter whether you type its username or email;
 // a login that matches no one counts by what was typed. After a few
-// failures, each further try waits longer.
+// failures, each further try waits longer. A try is counted *before* the
+// slow password check (and forgotten once it turns out right), so guesses
+// sent all at once can't each slip in before the others are counted.
 
 const FREE_TRIES: u32 = 5;
 const MAX_LOCK: Duration = Duration::from_secs(3600);
@@ -259,13 +264,21 @@ pub fn guard_key(user_id: Option<&str>, login: &str) -> String {
 }
 
 /// How long until `key` may try again, if it's locked.
-pub async fn locked(db: &Db, key: &str) -> sqlx::Result<Option<Duration>> {
+pub async fn locked<'c>(db: impl sqlx::SqliteExecutor<'c>, key: &str) -> sqlx::Result<Option<Duration>> {
     let now = ids::now();
     let row: Option<(i64, i64)> = sqlx::query_as("SELECT count, last_at FROM login_failures WHERE k = ? AND last_at > ?").bind(key).bind(now - FORGET_MS).fetch_optional(db).await?;
     Ok(row.and_then(|(count, last)| lock_for(count as u32)?.checked_sub(Duration::from_millis((now - last).max(0) as u64))))
 }
 
-pub async fn failed(db: &Db, key: &str) -> sqlx::Result<()> {
+/// Starts a try for `key`: if it's locked, how long to wait (and the try
+/// isn't counted); otherwise it's counted as a failure until `succeeded`
+/// (or `release`) says otherwise. One write transaction, so tries at the
+/// same moment are counted one after another.
+pub async fn attempt(db: &Db, key: &str) -> sqlx::Result<Option<Duration>> {
+    let mut tx = crate::db::write(db).await?;
+    if let Some(wait) = locked(&mut *tx, key).await? {
+        return Ok(Some(wait));
+    }
     let now = ids::now();
     sqlx::query(
         "INSERT INTO login_failures (k, count, last_at) VALUES (?1, 1, ?2) \
@@ -274,8 +287,16 @@ pub async fn failed(db: &Db, key: &str) -> sqlx::Result<()> {
     .bind(key)
     .bind(now)
     .bind(now - FORGET_MS)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
+    Ok(None)
+}
+
+/// Takes back a try that wasn't a guess (the password was right, and
+/// what's missing is the two-factor code).
+pub async fn release(db: &Db, key: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE login_failures SET count = count - 1 WHERE k = ? AND count > 0").bind(key).execute(db).await?;
     Ok(())
 }
 
@@ -299,12 +320,12 @@ pub fn locked_error(wait: Duration) -> Error {
 /// (deleting the account, changing the password, starting encryption
 /// over): checked like a login, so a stolen session can't guess faster.
 pub async fn confirm_password(app: &App, user_id: &str, password: &str, wrong: &str) -> Result<(), Error> {
-    if let Some(wait) = locked(&app.db, user_id).await? {
+    if let Some(wait) = attempt(&app.db, user_id).await? {
         return Err(locked_error(wait));
     }
     let hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?").bind(user_id).fetch_one(&app.db).await?;
     if !app.passwords.verify(Some(hash), password).await? {
-        failed(&app.db, user_id).await?;
+        // Already counted by `attempt`.
         return Err(Error::bad_request(wrong));
     }
     succeeded(&app.db, user_id).await?;
@@ -371,10 +392,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::open(dir.path()).await.unwrap();
         for _ in 0..5 {
-            assert!(locked(&db, "u1").await.unwrap().is_none());
-            failed(&db, "u1").await.unwrap();
+            assert!(attempt(&db, "u1").await.unwrap().is_none());
         }
         assert!(locked(&db, "u1").await.unwrap().is_some());
+        assert!(attempt(&db, "u1").await.unwrap().is_some(), "refused");
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count FROM login_failures WHERE k = 'u1'").fetch_one(&db).await.unwrap(), 5, "a refused try isn't counted");
         assert!(locked(&db, "u2").await.unwrap().is_none());
         db.close().await;
         let db = crate::db::open(dir.path()).await.unwrap();
@@ -385,7 +407,19 @@ mod tests {
         // Failures a day old are forgotten.
         sqlx::query("INSERT INTO login_failures (k, count, last_at) VALUES ('u3', 9, ?)").bind(ids::now() - FORGET_MS - 1).execute(&db).await.unwrap();
         assert!(locked(&db, "u3").await.unwrap().is_none());
-        failed(&db, "u3").await.unwrap();
+        attempt(&db, "u3").await.unwrap();
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count FROM login_failures WHERE k = 'u3'").fetch_one(&db).await.unwrap(), 1);
+        release(&db, "u3").await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count FROM login_failures WHERE k = 'u3'").fetch_one(&db).await.unwrap(), 0);
+    }
+
+    /// Tries sent at the same moment are counted before any is checked, so
+    /// a burst gets the same five as tries one after another.
+    #[tokio::test]
+    async fn a_burst_of_tries_is_counted_as_it_comes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let tries = futures_util::future::join_all((0..40).map(|_| attempt(&db, "u1"))).await;
+        assert_eq!(tries.iter().filter(|t| t.as_ref().unwrap().is_none()).count(), FREE_TRIES as usize);
     }
 }

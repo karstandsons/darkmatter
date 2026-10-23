@@ -33,14 +33,14 @@ pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body
     .await?;
     // One count per account, whether it's typed as a username or an email.
     let key = auth::guard_key(found.as_ref().map(|f| f.0.as_str()), login);
-    if let Some(wait) = auth::locked(&app.db, &key).await? {
+    if let Some(wait) = auth::attempt(&app.db, &key).await? {
         return Err(auth::locked_error(wait));
     }
     let mfa = found.as_ref().is_some_and(|f| f.2);
     let (id, hash) = found.map(|(id, hash, _)| (id, hash)).unzip();
     let ok = app.passwords.verify(hash.clone(), &body.password).await?;
+    // A wrong password stays counted (`attempt` counted it).
     let Some(id) = id.filter(|_| ok) else {
-        auth::failed(&app.db, &key).await?;
         return Err(Error {
             status: axum::http::StatusCode::UNAUTHORIZED,
             id: "api.user.login.invalid_credentials_email_username",
@@ -50,6 +50,8 @@ pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body
     // Asked only once the password is right, so it doesn't say who has codes on.
     if mfa {
         if body.token.trim().is_empty() {
+            // Not a guess: the password was right, and the app asks for the code next.
+            auth::release(&app.db, &key).await?;
             return Err(Error {
                 status: axum::http::StatusCode::UNAUTHORIZED,
                 id: "mfa.validate_token.authenticate.app_error",
@@ -57,7 +59,6 @@ pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body
             });
         }
         if !super::sessions::check_code(&app, &id, &body.token).await? {
-            auth::failed(&app.db, &key).await?;
             return Err(Error {
                 status: axum::http::StatusCode::UNAUTHORIZED,
                 id: "mfa.validate_token.authenticate.app_error",

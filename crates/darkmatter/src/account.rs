@@ -13,6 +13,10 @@ use crate::style::{Colors, bold};
 pub const CODE: &str = "account-code";
 pub const LINK_CODE: &str = "account-link-code";
 pub const CURRENT_PASSWORD: &str = "account-current-password";
+pub const NEW_PASSWORD: &str = "account-new-password";
+pub const NEW_PASSWORD_AGAIN: &str = "account-new-password-again";
+/// The password form's boxes, in Tab order.
+const PASSWORD_BOXES: [&str; 3] = [CURRENT_PASSWORD, NEW_PASSWORD, NEW_PASSWORD_AGAIN];
 
 #[derive(Debug, Clone)]
 pub enum Msg {
@@ -35,6 +39,8 @@ pub enum Msg {
     NewPassword(String),
     NewPasswordAgain(String),
     ChangePassword,
+    /// Tab (or Shift+Tab, `back`) from the box that has the keyboard.
+    Tab(iced::widget::Id, bool),
     /// The new password was taken (or why not).
     PasswordChanged(Result<(), String>),
     Password(String),
@@ -311,6 +317,10 @@ pub fn update(state: &mut Option<Account>, client: &Client, axiond: bool, crypto
             Task::perform(async move { c.change_password(&me, &current, &new).await.map_err(|e| e.to_string()) }, |r| {
                 Message::Account(Msg::PasswordChanged(r))
             })
+        }
+        Msg::Tab(from, back) => {
+            let Some(i) = PASSWORD_BOXES.iter().position(|b| iced::widget::Id::new(b) == from) else { return (Task::none(), false) };
+            iced::widget::operation::focus(PASSWORD_BOXES[next_box(i, back)])
         }
         Msg::PasswordChanged(Ok(())) => {
             a.password_form = false;
@@ -647,6 +657,7 @@ impl Account {
                 .size(13)
                 .style(c.input()),
             text_input("New password", new)
+                .id(NEW_PASSWORD)
                 .secure(true)
                 .on_input(|p| Message::Account(Msg::NewPassword(p)))
                 .on_submit_maybe(ok.then_some(Message::Account(Msg::ChangePassword)))
@@ -655,6 +666,7 @@ impl Account {
                 .style(c.input()),
             row![
                 text_input("New password again", again)
+                    .id(NEW_PASSWORD_AGAIN)
                     .secure(true)
                     .on_input(|p| Message::Account(Msg::NewPasswordAgain(p)))
                     .on_submit_maybe(ok.then_some(Message::Account(Msg::ChangePassword)))
@@ -837,6 +849,16 @@ impl Account {
     }
 }
 
+/// Tab moves through the password form's boxes, around at the ends.
+pub fn tab(back: bool) -> Task<Message> {
+    iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::find_focused()).map(move |id| Message::Account(Msg::Tab(id, back)))
+}
+
+fn next_box(i: usize, back: bool) -> usize {
+    let n = PASSWORD_BOXES.len();
+    if back { (i + n - 1) % n } else { (i + 1) % n }
+}
+
 /// Whether the form can be sent: the current password, and a new one typed
 /// the same twice. The server has the final say on how long it must be.
 fn password_ready(current: &str, new: &str, again: &str) -> bool {
@@ -845,6 +867,13 @@ fn password_ready(current: &str, new: &str, again: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tab_goes_round_the_password_boxes() {
+        use super::next_box;
+        assert_eq!([next_box(0, false), next_box(1, false), next_box(2, false)], [1, 2, 0]);
+        assert_eq!([next_box(0, true), next_box(1, true), next_box(2, true)], [2, 0, 1]);
+    }
+
     #[test]
     fn the_password_form_needs_the_new_one_twice() {
         use super::password_ready;

@@ -1,5 +1,6 @@
-//! Rate limits: token buckets per IP address (every request, and a much
-//! tighter one for logging in and signing up) and per person (posting).
+//! Rate limits: token buckets per IP address (every request, and much
+//! tighter ones for logging in and signing up, and for retyping your
+//! password) and per person (posting).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -89,12 +90,35 @@ pub async fn by_address(State(app): State<App>, req: Request, next: Next) -> Res
         if sensitive && let Err(wait) = app.limiter.take(&format!("login {ip}"), LOGINS) {
             return too_many(wait);
         }
+        if retypes_password(req.method(), path) && let Err(wait) = app.limiter.take(&format!("password {ip}"), LOGINS) {
+            return too_many(wait);
+        }
     }
     next.run(req).await
 }
 
+/// Requests that check your password again (each one an argon2 check).
+fn retypes_password(method: &Method, path: &str) -> bool {
+    let user_path = path.strip_prefix("/api/v4/users/");
+    (*method == Method::PUT && user_path.is_some_and(|p| p.ends_with("/password") && !p[..p.len() - 9].contains('/')))
+        || (*method == Method::DELETE && user_path.is_some_and(|p| !p.is_empty() && !p.contains('/')))
+        || (*method == Method::POST && path == "/api/v4/e2ee/identity/reset")
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn password_checks_are_rate_limited() {
+        use super::retypes_password;
+        assert!(retypes_password(&Method::PUT, "/api/v4/users/me/password"));
+        assert!(retypes_password(&Method::PUT, "/api/v4/users/abc/password"));
+        assert!(retypes_password(&Method::DELETE, "/api/v4/users/me"));
+        assert!(retypes_password(&Method::POST, "/api/v4/e2ee/identity/reset"));
+        assert!(!retypes_password(&Method::DELETE, "/api/v4/users/me/blocked/x"));
+        assert!(!retypes_password(&Method::PUT, "/api/v4/users/me/status"));
+        assert!(!retypes_password(&Method::GET, "/api/v4/users/me"));
+    }
+
     use super::*;
 
     #[test]

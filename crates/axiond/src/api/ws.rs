@@ -38,6 +38,10 @@ async fn run(app: App, me: Me, resume: Resume, socket: WebSocket) {
     let (mut out, mut incoming) = socket.split();
     let mut ping = tokio::time::interval(PING);
     ping.tick().await;
+    // The session's absolute limit ends the socket too, not just new requests.
+    let left = Duration::from_millis((me.ends_at - crate::ids::now()).max(0) as u64);
+    let ends = tokio::time::sleep(left);
+    tokio::pin!(ends);
 
     for frame in std::mem::take(&mut attached.first) {
         if out.send(Message::Text(frame.as_ref().into())).await.is_err() {
@@ -61,6 +65,7 @@ async fn run(app: App, me: Me, resume: Resume, socket: WebSocket) {
                 Some(Ok(_)) => Ok(()),
             },
             _ = ping.tick() => out.send(Message::Ping(Default::default())).await,
+            () = &mut ends => break,
         };
         if sent.is_err() {
             break;
