@@ -14,10 +14,11 @@ needs is a Linux machine with Docker and a name pointing at it.
   group's chat, and builds axiond in about 8 minutes (5 with 2 vCPU and
   2 GB). With less memory, add swap first (`preflight.sh` says how). x86_64
   and arm64 both work.
-- **Traffic, for calls later (M3):** monthly traffic matters more than CPU.
-  A 20-person video call sends about 50 GB an hour, so a plan with 20 TB a
-  month covers about 400 such hours, and 1 TB about 20. Plans differ a lot
-  here, so check before choosing.
+- **Traffic, for calls:** monthly traffic matters more than CPU. Video is
+  for up to 5 people at a time; a 5-person video call sends up to about
+  7 GB an hour (cameras are capped at 800 kbps), and voice alone well under
+  1 GB, so even a plan with 1 TB a month covers well over 100 hours of video
+  calls. One SFU thread carries several such calls on a small VPS.
 - **Address:** a public IPv4 address. IPv6 as well is good. IPv6 alone
   isn't enough, because people on IPv4-only networks couldn't reach it.
 - **System:** any current Linux that Docker supports. The commands below are
@@ -29,7 +30,7 @@ needs is a Linux machine with Docker and a name pointing at it.
   start.
 - **The provider's firewall:** many providers have one in their control
   panel, outside the server (AWS, Google Cloud, Azure and Oracle always do;
-  DigitalOcean and Hetzner optionally). Allow 22/tcp and 443/tcp in there as
+  DigitalOcean and Hetzner optionally). Allow 22/tcp, 443/tcp and 443/udp in there as
   well, or Let's Encrypt can't reach the server.
 
 ## 2. Lock it down
@@ -58,25 +59,25 @@ printf 'PasswordAuthentication no\nPermitRootLogin no\n' > /etc/ssh/sshd_config.
 systemctl reload ssh 2>/dev/null || systemctl reload sshd
 ```
 
-A firewall that lets in only SSH and HTTPS (calls will add 443/udp), and
+A firewall that lets in only SSH, HTTPS and calls' media (443/udp), and
 security updates installed automatically:
 
 ```sh
 #   Debian/Ubuntu:
 apt install -y ufw unattended-upgrades
-ufw allow OpenSSH && ufw allow 443/tcp && ufw enable
+ufw allow OpenSSH && ufw allow 443/tcp && ufw allow 443/udp && ufw enable
 dpkg-reconfigure -plow unattended-upgrades
 #   Fedora/Rocky/Alma:
 dnf install -y firewalld dnf-automatic
 systemctl enable --now firewalld
-firewall-cmd --permanent --add-service=ssh --add-service=https && firewall-cmd --reload
+firewall-cmd --permanent --add-service=ssh --add-service=https --add-port=443/udp && firewall-cmd --reload
 printf '[commands]\napply_updates = yes\n' > /etc/dnf/automatic.conf
 systemctl enable --now dnf-automatic.timer
 ```
 
 Docker opens the ports it publishes past these firewalls. That's why
-`compose.yaml` publishes 443 only (and the Caddy variant binds to
-127.0.0.1).
+`compose.yaml` publishes 443 only, TCP and UDP (and the Caddy variant
+binds to 127.0.0.1).
 
 ## 3. Start axiond
 
@@ -178,4 +179,6 @@ chat.example.com {
 }
 ```
 
-Calls (M3) will want axiond on 443 itself, so they can share the port.
+Calls still need their UDP port published to axiond itself (a proxy for
+HTTPS doesn't carry them): add `"443:443/udp"` under `ports`, with
+`AXIOND_CALLS_UDP=0.0.0.0:443` and `AXIOND_CALLS_PUBLIC_IP` as above.

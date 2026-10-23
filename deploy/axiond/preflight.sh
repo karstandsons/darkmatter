@@ -41,6 +41,12 @@ else
     if grep -q '^AXIOND_ACME_STAGING=true' .env; then
         ok "staging certificate first (switch to false once it works)"
     fi
+    public=$(sed -n 's/^AXIOND_CALLS_PUBLIC_IP=//p' .env | tr -d '"'"'"' ')
+    if [ -z "$public" ]; then
+        warn "AXIOND_CALLS_PUBLIC_IP is empty: calls are off (this server's addresses: $(hostname -I 2>/dev/null))"
+    else
+        ok "calls' media goes to $public, 443/udp"
+    fi
 fi
 
 echo "Data folder"
@@ -101,7 +107,7 @@ fi
 
 echo
 echo "Outside this server, check by hand: if your provider has a firewall in its"
-echo "control panel (most clouds do), it must allow 22/tcp and 443/tcp in."
+echo "control panel (most clouds do), it must allow 22/tcp, 443/tcp and 443/udp in."
 echo
 if [ "$problems" -eq 0 ]; then
     echo "Ready: docker compose up -d --build"

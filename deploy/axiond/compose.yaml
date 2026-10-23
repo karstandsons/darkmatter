@@ -19,10 +19,11 @@ services:
     environment:
       AXIOND_LISTEN: 0.0.0.0:443
       AXIOND_DATA_DIR: /data
+      # Calls: their media on one UDP port (AXIOND_CALLS_PUBLIC_IP in .env).
+      AXIOND_CALLS_UDP: 0.0.0.0:443
     ports:
       - "443:443/tcp"
-      # Calls (M3) will use one UDP port:
-      # - "443:443/udp"
+      - "443:443/udp"
     volumes:
       - ./data:/data
     # Nothing but /data is writable, and the process can't gain privileges.
