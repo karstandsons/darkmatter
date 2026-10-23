@@ -1,0 +1,27 @@
+# cargo-deny (`cargo deny check`), run in CI next to `cargo audit`. An
+# advisory against anything we build fails the build; each ignore below says
+# why it's safe.
+
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+    # rsa's Marvin attack. rsa is only in Cargo.lock: sqlx's macros list
+    # sqlx-mysql, which needs it, but we build sqlx for SQLite alone, so it's
+    # never compiled. There's no fixed rsa release to move to either.
+    { id = "RUSTSEC-2023-0071", reason = "lockfile only (sqlx-mysql), never built" },
+]
+
+[licenses]
+allow = []
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
