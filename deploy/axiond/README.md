@@ -112,10 +112,12 @@ docker compose exec axiond axiond invite --note "for Jo"
 ```
 
 `setup` also measures the machine and sets how hard passwords are to
-check (argon2id, about a quarter of a second each). Wrong passwords lock an
-account for a while after five, doubling up to an hour, and a restart
-doesn't reset that; sessions end 90 days after signing in, however often
-they're used. People change their own passwords in Darkmatter's Account
+check (argon2id, about a quarter of a second each). Wrong passwords for an
+account make the address they come from wait after five, doubling up to an
+hour, so someone guessing locks out only themselves; after fifty from
+everywhere together the whole account waits. A restart doesn't reset
+either count. Sessions end 90 days after signing in, however often they're
+used, and their open connections close then too. People change their own passwords in Darkmatter's Account
 window.
 
 Both admins should turn on two-factor codes for their accounts. Reports from
