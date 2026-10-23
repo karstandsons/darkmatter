@@ -184,7 +184,9 @@ pub async fn join(app: &App, me: &Me, channel_id: &str, offer: &str) -> Result<J
         return Err(Error::bad_request("You can't call this person."));
     }
     let offer = SdpOffer::from_sdp_string(offer).map_err(|_| Error::bad_request("That isn't a WebRTC offer."))?;
-    let mut rtc = Rtc::builder().set_ice_lite(true).build(std::time::Instant::now());
+    // Opus and VP8 only: SFrame leaves VP8's first bytes readable for the
+    // packetizers, and every device has to decode every other's video.
+    let mut rtc = Rtc::builder().set_ice_lite(true).clear_codecs().enable_opus(true, false).enable_vp8(true).build(std::time::Instant::now());
     rtc.add_local_candidate(Candidate::host(sfu.candidate, "udp").map_err(|_| Error::internal())?);
     let answer = rtc.sdp_api().accept_offer(offer).map_err(|e| Error::bad_request(format!("Couldn't accept that offer: {e}")))?;
 

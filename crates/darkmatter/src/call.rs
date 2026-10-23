@@ -303,8 +303,8 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
             active.code = Some(keys.code.clone());
             #[cfg(feature = "calls")]
             {
-                let by_user: Vec<(String, Vec<u8>)> = keys.senders.into_iter().map(|((user, _), key)| (user, key)).collect();
-                active.call.set_keys(keys.epoch, &by_user);
+                let members: Vec<u32> = keys.members.iter().map(|(_, index)| *index).collect();
+                active.call.set_keys(keys.epoch, &keys.base, keys.own, &members);
             }
             Task::none()
         }

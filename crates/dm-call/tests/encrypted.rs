@@ -39,24 +39,23 @@ async fn device(s: &Server, name: &str) -> (Client, E2ee<MemoryStore>) {
     (api, *e2ee)
 }
 
-fn by_user(k: dm_crypto::call::Keys) -> (u64, Vec<(String, Vec<u8>)>) {
-    (k.epoch, k.senders.into_iter().map(|((u, _), key)| (u, key)).collect())
+fn set_keys(call: &Call, k: dm_crypto::call::Keys) {
+    let members: Vec<u32> = k.members.iter().map(|(_, i)| *i).collect();
+    call.set_keys(k.epoch, &k.base, k.own, &members);
 }
 
 /// Joins media and the call's encryption, as Darkmatter does.
 async fn join(api: &Client, e2ee: &E2ee<MemoryStore>, channel: &str, pitch: f32) -> (Call, String) {
     // A fresh Media for each call, as in Darkmatter.
     let (call, info) = Call::join(&Media::new(), api, channel, Mic::Tone(pitch)).await.unwrap();
-    let (epoch, keys) = by_user(e2ee.join_call(channel, &info.id).await.unwrap());
-    call.set_keys(epoch, &keys);
+    set_keys(&call, e2ee.join_call(channel, &info.id).await.unwrap());
     (call, info.id)
 }
 
 /// Catches up with the call's group, as on `call_mls`.
 async fn sync(call: &Call, e2ee: &E2ee<MemoryStore>, channel: &str, call_id: &str) {
     if let Some(k) = e2ee.sync_call(channel, call_id).await.unwrap() {
-        let (epoch, keys) = by_user(k);
-        call.set_keys(epoch, &keys);
+        set_keys(call, k);
     }
 }
 

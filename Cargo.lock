@@ -854,6 +854,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e4b40c7323adcfc0a41c4b88143ed58346ff65a288fc144329c5c45e05d70c6"
 
 [[package]]
+name = "bitfield"
+version = "0.19.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b45721c9db4c7a20899d05efb7ad9235f50b256e980db30ffb229abf732934c3"
+dependencies = [
+ "bitfield-macros",
+]
+
+[[package]]
+name = "bitfield-macros"
+version = "0.19.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0cb6f3d4773a2107b94cbeccaa5b5f0b35a88389b5d522d13d659f64317b22d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2080,6 +2100,7 @@ dependencies = [
  "nokhwa",
  "serde",
  "serde_json",
+ "sframe",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -2844,7 +2865,7 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4386,8 +4407,6 @@ dependencies = [
 [[package]]
 name = "libwebrtc"
 version = "0.3.53"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30c02c77bc04e81cd4b7415b6485abe249bc38979f41808e6496633712e90e55"
 dependencies = [
  "cxx",
  "glib",
@@ -7234,6 +7253,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sframe"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50f22c9a2f91ae500795a0d0cc96146ad8bfc1f5edc297fae4f2dbf1d7292890"
+dependencies = [
+ "bitfield",
+ "cfg-if 1.0.5",
+ "cfg_aliases",
+ "log",
+ "ring",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9004,8 +9038,6 @@ dependencies = [
 [[package]]
 name = "webrtc-sys"
 version = "0.3.50"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6fab7306a96fa68e97cb929ca0a9592ac9ab27b350f961f2d35d29ff8af89a1"
 dependencies = [
  "cc",
  "cxx",

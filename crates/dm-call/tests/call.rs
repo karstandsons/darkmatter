@@ -10,6 +10,8 @@ use mm_api::Client;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const PASSWORD: &str = "correct horse battery";
+/// The leaf indexes in a test's calls: alice 0, bob 1, carol 2.
+const MEMBERS: &[u32] = &[0, 1, 2];
 
 struct Server {
     url: String,
@@ -92,18 +94,17 @@ async fn two_devices_hear_each_other_and_mute() {
     assert!(seen.contains(&Update::Connected), "{seen:?}");
     assert_eq!((a.packets_sent().await, b.packets_sent().await), (0, 0), "nothing leaves without a key");
     // With the same keys, each hears the other, through the SFU.
-    let keys = |epoch: u8| vec![(alice_id.clone(), vec![epoch; 32]), (bob_id.clone(), vec![epoch + 100; 32])];
-    a.set_keys(0, &keys(0));
-    b.set_keys(0, &keys(0));
+    a.set_keys(0, &[1; 16], 0, MEMBERS);
+    b.set_keys(0, &[1; 16], 1, MEMBERS);
     until_heard(&mut a_updates, &bob_id, true).await;
     until_heard(&mut b_updates, &alice_id, true).await;
     assert!(a.packets_sent().await > 0);
 
     // Alice moves to the next epoch's keys and bob doesn't have them: once
     // she switches (a second on), he can't read her; then he gets them.
-    a.set_keys(1, &keys(1));
+    a.set_keys(1, &[2; 16], 0, MEMBERS);
     until_heard(&mut b_updates, &alice_id, false).await;
-    b.set_keys(1, &keys(1));
+    b.set_keys(1, &[2; 16], 1, MEMBERS);
     until_heard(&mut b_updates, &alice_id, true).await;
     until_heard(&mut a_updates, &bob_id, true).await;
 
@@ -144,21 +145,20 @@ async fn a_late_joiner_hears_everyone() {
     let team = alice.my_teams().await.unwrap()[0].id.clone();
     let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
     let media = Media::new();
-    let keys = |epoch: u8| vec![(alice_id.clone(), vec![epoch; 32]), (bob_id.clone(), vec![epoch + 100; 32]), (carol_id.clone(), vec![epoch + 200; 32])];
 
     let (a, _) = Call::join(&media, &alice, &town, Mic::Tone(440.0)).await.unwrap();
     let (b, _) = Call::join(&media, &bob, &town, Mic::Tone(660.0)).await.unwrap();
     let mut a_updates = a.updates().unwrap();
-    a.set_keys(0, &keys(0));
-    b.set_keys(0, &keys(0));
+    a.set_keys(0, &[1; 16], 0, MEMBERS);
+    b.set_keys(0, &[1; 16], 1, MEMBERS);
     until_heard(&mut a_updates, &bob_id, true).await;
 
     // Carol joins: a new epoch, which only she starts in.
     let (c, _) = Call::join(&media, &carol, &town, Mic::Tone(550.0)).await.unwrap();
     let mut c_updates = c.updates().unwrap();
-    c.set_keys(1, &keys(1));
-    a.set_keys(1, &keys(1));
-    b.set_keys(1, &keys(1));
+    c.set_keys(1, &[2; 16], 2, MEMBERS);
+    a.set_keys(1, &[2; 16], 0, MEMBERS);
+    b.set_keys(1, &[2; 16], 1, MEMBERS);
     until_heard(&mut c_updates, &alice_id, true).await;
     until_heard(&mut c_updates, &bob_id, true).await;
     until_heard(&mut a_updates, &carol_id, true).await;
@@ -176,26 +176,25 @@ async fn joining_again_after_leaving() {
     let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
     // Each its own, as two apps would be.
     let (alice_media, bob_media) = (Media::new(), Media::new());
-    let keys = |epoch: u8| vec![(alice_id.clone(), vec![epoch; 32]), (bob_id.clone(), vec![epoch + 100; 32])];
 
     let (a, _) = Call::join(&alice_media, &alice, &town, Mic::Tone(440.0)).await.unwrap();
     let (b, _) = Call::join(&bob_media, &bob, &town, Mic::Tone(660.0)).await.unwrap();
     let mut b_updates = b.updates().unwrap();
-    a.set_keys(0, &keys(0));
-    b.set_keys(0, &keys(0));
+    a.set_keys(0, &[1; 16], 0, MEMBERS);
+    b.set_keys(0, &[1; 16], 1, MEMBERS);
     until_heard(&mut b_updates, &alice_id, true).await;
 
     // Alice leaves (bob alone: epoch 1), then joins again (epoch 2), on a
     // fresh Media as each call is: in the old one, nothing would play.
     a.leave().await.unwrap();
     drop((a, alice_media));
-    b.set_keys(1, &[(bob_id.clone(), vec![101; 32])]);
+    b.set_keys(1, &[101; 16], 1, &[1]);
     tokio::time::sleep(Duration::from_secs(2)).await;
     let alice_media = Media::new();
     let (a, _) = Call::join(&alice_media, &alice, &town, Mic::Tone(440.0)).await.unwrap();
     let mut a_updates = a.updates().unwrap();
-    a.set_keys(2, &keys(2));
-    b.set_keys(2, &keys(2));
+    a.set_keys(2, &[3; 16], 0, MEMBERS);
+    b.set_keys(2, &[3; 16], 1, MEMBERS);
     until_heard(&mut b_updates, &alice_id, true).await;
     until_heard(&mut a_updates, &bob_id, true).await;
 }
@@ -209,16 +208,15 @@ async fn the_microphone_is_heard() {
     let s = server().await;
     let alice = login(&s, "alice").await;
     let bob = login(&s, "bob").await;
-    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let alice_id = alice.me().await.unwrap().id;
     let team = alice.my_teams().await.unwrap()[0].id.clone();
     let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
-    let keys = vec![(alice_id.clone(), vec![1; 32]), (bob_id.clone(), vec![2; 32])];
 
     let (b, _) = Call::join(&Media::new(), &bob, &town, Mic::Tone(440.0)).await.unwrap();
     b.set_muted(true);
     let (a, _) = Call::join(&Media::new(), &alice, &town, Mic::Device).await.unwrap();
-    a.set_keys(0, &keys);
-    b.set_keys(0, &keys);
+    a.set_keys(0, &[1; 16], 0, MEMBERS);
+    b.set_keys(0, &[1; 16], 1, MEMBERS);
     let mut updates = b.updates().unwrap();
     let mut loudest = 0f32;
     let mut heard = 0;
@@ -247,11 +245,10 @@ async fn two_devices_see_each_other() {
     let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
     let team = alice.my_teams().await.unwrap()[0].id.clone();
     let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
-    let keys = vec![(alice_id.clone(), vec![1; 32]), (bob_id.clone(), vec![2; 32])];
     let (a, _) = Call::join(&Media::new(), &alice, &town, Mic::Tone(440.0)).await.unwrap();
     let (b, _) = Call::join(&Media::new(), &bob, &town, Mic::Tone(660.0)).await.unwrap();
-    a.set_keys(0, &keys);
-    b.set_keys(0, &keys);
+    a.set_keys(0, &[1; 16], 0, MEMBERS);
+    b.set_keys(0, &[1; 16], 1, MEMBERS);
     a.set_camera(Some(dm_call::Cam::Pattern)).unwrap();
     b.set_camera(Some(dm_call::Cam::Pattern)).unwrap();
     assert!(a.camera_on());
@@ -285,19 +282,18 @@ async fn a_late_joiner_sees_a_camera_that_was_already_on() {
     let s = server().await;
     let alice = login(&s, "alice").await;
     let bob = login(&s, "bob").await;
-    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let alice_id = alice.me().await.unwrap().id;
     let team = alice.my_teams().await.unwrap()[0].id.clone();
     let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
-    let keys = vec![(alice_id.clone(), vec![1; 32]), (bob_id.clone(), vec![2; 32])];
     let (a, _) = Call::join(&Media::new(), &alice, &town, Mic::Tone(440.0)).await.unwrap();
-    a.set_keys(0, &keys);
+    a.set_keys(0, &[1; 16], 0, MEMBERS);
     a.set_camera(Some(dm_call::Cam::Pattern)).unwrap();
     // Long enough that the first keyframe is well past.
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     let joined = Instant::now();
     let (b, _) = Call::join(&Media::new(), &bob, &town, Mic::Tone(660.0)).await.unwrap();
-    b.set_keys(0, &keys);
+    b.set_keys(0, &[1; 16], 1, MEMBERS);
     while !b.pictures().contains_key(&alice_id) {
         assert!(joined.elapsed() < Duration::from_secs(10), "bob never saw alice's camera");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -317,10 +313,9 @@ async fn the_camera_and_microphone_are_received() {
     let s = server().await;
     let alice = login(&s, "alice").await;
     let bob = login(&s, "bob").await;
-    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let alice_id = alice.me().await.unwrap().id;
     let team = alice.my_teams().await.unwrap()[0].id.clone();
     let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
-    let keys = vec![(alice_id.clone(), vec![1; 32]), (bob_id.clone(), vec![2; 32])];
     let word = std::env::var("DM_TEST_DEVICE").unwrap_or_default();
 
     let media = Media::new();
@@ -336,8 +331,8 @@ async fn the_camera_and_microphone_are_received() {
     let (b, _) = Call::join(&Media::new(), &bob, &town, Mic::Tone(440.0)).await.unwrap();
     b.set_muted(true);
     let (a, _) = Call::join(&media, &alice, &town, Mic::Device).await.unwrap();
-    a.set_keys(0, &keys);
-    b.set_keys(0, &keys);
+    a.set_keys(0, &[1; 16], 0, MEMBERS);
+    b.set_keys(0, &[1; 16], 1, MEMBERS);
     a.set_camera(Some(dm_call::Cam::Device(camera.id.parse().ok()))).unwrap();
 
     let mut updates = b.updates().unwrap();
@@ -378,11 +373,10 @@ async fn a_camera_thats_off_shows_nothing() {
     let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
     let team = alice.my_teams().await.unwrap()[0].id.clone();
     let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
-    let keys = vec![(alice_id.clone(), vec![1; 32]), (bob_id.clone(), vec![2; 32])];
     let (a, _) = Call::join(&Media::new(), &alice, &town, Mic::Tone(440.0)).await.unwrap();
     let (b, _) = Call::join(&Media::new(), &bob, &town, Mic::Tone(660.0)).await.unwrap();
-    a.set_keys(0, &keys);
-    b.set_keys(0, &keys);
+    a.set_keys(0, &[1; 16], 0, MEMBERS);
+    b.set_keys(0, &[1; 16], 1, MEMBERS);
     a.set_camera(Some(dm_call::Cam::Pattern)).unwrap();
     let until = Instant::now() + Duration::from_secs(10);
     while !b.pictures().contains_key(&alice_id) && Instant::now() < until {
@@ -402,14 +396,13 @@ async fn a_shared_screen_comes_apart_from_the_camera() {
     let s = server().await;
     let alice = login(&s, "alice").await;
     let bob = login(&s, "bob").await;
-    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let alice_id = alice.me().await.unwrap().id;
     let team = alice.my_teams().await.unwrap()[0].id.clone();
     let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
-    let keys = vec![(alice_id.clone(), vec![1; 32]), (bob_id.clone(), vec![2; 32])];
     let (a, _) = Call::join(&Media::new(), &alice, &town, Mic::Tone(440.0)).await.unwrap();
     let (b, _) = Call::join(&Media::new(), &bob, &town, Mic::Tone(660.0)).await.unwrap();
-    a.set_keys(0, &keys);
-    b.set_keys(0, &keys);
+    a.set_keys(0, &[1; 16], 0, MEMBERS);
+    b.set_keys(0, &[1; 16], 1, MEMBERS);
     a.set_camera(Some(dm_call::Cam::Pattern)).unwrap();
     a.share(Some(dm_call::Share::Pattern)).unwrap();
     assert!(a.sharing());

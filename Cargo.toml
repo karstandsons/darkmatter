@@ -16,6 +16,12 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tracing = "0.1"
 
+# LiveKit's WebRTC bindings with a frame transformer of ours (SFrame for
+# calls): vendor/README.md says what changed.
+[patch.crates-io]
+webrtc-sys = { path = "vendor/webrtc-sys" }
+libwebrtc = { path = "vendor/libwebrtc" }
+
 # Smaller, faster release binary (`cargo build --release`): link-time
 # optimization across crates and no debug symbols.
 [profile.release]

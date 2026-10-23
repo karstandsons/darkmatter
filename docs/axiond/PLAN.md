@@ -299,10 +299,10 @@ Reliability is the second priority, for the server and the apps alike:
 - **Encryption:**
   - DTLS-SRTP on every hop, as all WebRTC does.
   - **A fresh MLS group per call** (only the people in the call, with the same device identities as chat, so chat verification carries over). Per-sender frame keys come from its MLS exporter and change on every join and leave.
-  - **Phase A:** LiveKit's frame encryption (AES-GCM) keyed from MLS: works on desktop and phones without patching libwebrtc.
-  - **Phase B, before calls lose the beta label:** real **SFrame** ([RFC 9605](https://www.rfc-editor.org/rfc/rfc9605)) through a small libwebrtc patch and the `sframe` crate.
+  - **Phase A (Phases 2–5):** LiveKit's frame encryption (AES-GCM) keyed from MLS.
+  - **Phase B (Phase 6, done):** real **SFrame** ([RFC 9605](https://www.rfc-editor.org/rfc/rfc9605)) through a small libwebrtc patch and the `sframe` crate.
   - **Metadata settings:** Opus at a constant bitrate, no DTX and no audio-level header, because variable packet sizes and silence detection give away speech.
-- **What the server still sees:** who is in a call, from which device and address, when and for how long, packet sizes and rates, which track is a screen share, and (with Phase A) video resolution and keyframes. Not what anyone says or shows.
+- **What the server still sees:** who is in a call, from which device and address, when and for how long, packet sizes and rates, which track is a screen share, and video resolution and keyframes (VP8's header stays readable). Not what anyone says or shows.
 - **Screen sharing:** libwebrtc's own capturers (xdg-desktop-portal and PipeWire on Wayland, ScreenCaptureKit on macOS). Video in iced through a shader widget.
 - **On phones (M4):** CallKit on iOS and Android's Core-Telecom for the ringing screen. **No PushKit VoIP pushes:** the push relay sends an ordinary push, the notification extension decrypts it and starts the ring itself (Apple's documented path for encrypted calls; it needs the same filtering entitlement as messages).
 - **Reliability:** ICE restart on network changes, a two-level reconnect (resume, then rejoin), a call-quality badge, deterministic SFU tests with str0m's network impairment simulator, and headless libwebrtc clients in CI.
@@ -333,7 +333,15 @@ Reliability is the second priority, for the server and the apps alike:
   - The system's own picker chooses the screen: the portal and PipeWire on Wayland, ScreenCaptureKit on macOS. The SFU passes track names on, so a screen arrives apart from the camera.
   - Darkmatter shows others' screens big over the channel, with the camera tiles below them.
   - Still to try: a real share through the Wayland portal, which needs someone to pick a screen.
-  - Next: reliability (Phase 5) and SFrame (Phase 6) before calls lose the beta label, and taking the `calls` feature into releases.
+- **Phase 5 (2026-10-23, reliability):**
+  - Rejoins back off (1, 2, 4, 8, 16 s), and a call survives a network that goes dark for a while: the SFU waits 10 s past ICE's own timeout before dropping anyone.
+  - A quality badge ("weak connection") above 5% loss or 400 ms.
+  - Moving a call to another of your devices is told apart from leaving it.
+  - The SFU answers from the address it advertises, so it works bound to 0.0.0.0 and behind port forwarding (`AXIOND_CALLS_PUBLIC_PORT`).
+  - Tests through a proxy that loses, delays and blacks out packets.
+  - Not yet: ICE over TCP on 443, carrying calls over a server restart, drawing video with a shader.
+- **Phase 6 (2026-10-23, SFrame):** frames are encrypted with RFC 9605 SFrame keyed from the call's MLS group (§5.2), through our own frame transformer in a vendored `webrtc-sys` ([vendor/README.md](../../vendor/README.md)). Per-sender, per-stream keys, replay protection, and VP8's readable header authenticated. The SFU offers only Opus and VP8. See [E2EE.md §11](E2EE.md#11-calls).
+  - Next: our own libwebrtc build without H.264/H.265/FFmpeg, then the `calls` feature in releases.
 
 ## Mobile and push
 

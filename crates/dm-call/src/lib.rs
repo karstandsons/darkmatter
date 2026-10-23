@@ -22,7 +22,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use libwebrtc::audio_source::native::NativeAudioSource;
 use libwebrtc::audio_stream::native::NativeAudioStream;
-use libwebrtc::native::frame_cryptor::{EncryptionAlgorithm, FrameCryptor, KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
+use libwebrtc::native::frame_transform::FrameTransform;
 use libwebrtc::peer_connection::TrackEvent;
 use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
 use libwebrtc::prelude::*;
@@ -31,18 +31,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+mod sframe;
 mod video;
 pub use video::{Cam, Picture, Share};
 
 pub use mm_api::models::Call as CallInfo;
 
 const RATE: u32 = 48_000;
-/// Epochs' keys kept at once: a frame names its key by `epoch % RING`.
-const RING: u64 = 16;
-/// How long after a new epoch's keys arrive a sender switches to them,
-/// so the others have them first. A device just taken out can still read
-/// this long.
-const SWITCH_AFTER: Duration = Duration::from_secs(1);
 /// How often [`Update::Levels`] comes.
 const LEVELS_EVERY: Duration = Duration::from_millis(250);
 
@@ -209,23 +204,19 @@ struct CallInner {
     api: Client,
     pc: PeerConnection,
     mic: RtcAudioTrack,
-    keys: KeyProvider,
-    /// This device's senders' encryptors (sound, picture), and the
-    /// receivers' decryptors (only held, so they stay on).
-    sending: FrameCryptor,
-    video_sending: FrameCryptor,
+    /// The call's SFrame keys.
+    sframe: Arc<sframe::Sframe>,
+    /// Every sender's and receiver's frames go through SFrame here (only
+    /// held, so they stay on).
+    _transforms: Arc<Mutex<Vec<FrameTransform>>>,
     video: libwebrtc::video_source::native::NativeVideoSource,
     camera: Mutex<Option<video::Feed>>,
-    screen_sending: FrameCryptor,
     screen: libwebrtc::video_source::native::NativeVideoSource,
     sharing: Mutex<Option<video::Feed>>,
     /// For reports that don't come from libwebrtc (a share ending).
     tx: mpsc::UnboundedSender<Update>,
     pictures: Arc<video::Pictures>,
     me: String,
-    _receiving: Arc<Mutex<Vec<FrameCryptor>>>,
-    /// The newest epoch whose keys are set.
-    epoch: Mutex<Option<u64>>,
     updates: Mutex<Option<mpsc::UnboundedReceiver<Update>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     _media: Media,
@@ -252,15 +243,19 @@ impl Call {
     pub async fn join(media: &Media, api: &Client, channel_id: &str, mic: Mic) -> Result<(Call, CallInfo), Error> {
         let factory = &media.0.factory;
         let (tx, rx) = mpsc::unbounded_channel();
-        let keys = KeyProvider::new(KeyProviderOptions {
-            shared_key: false,
-            ratchet_window_size: 0,
-            ratchet_salt: b"darkmatter call v1".to_vec(),
-            failure_tolerance: -1,
-            key_ring_size: RING as i32,
-            key_derivation_algorithm: KeyDerivationAlgorithm::HKDF,
-        });
-        let receiving: Arc<Mutex<Vec<FrameCryptor>>> = Arc::default();
+        let sframe: Arc<sframe::Sframe> = Arc::default();
+        let transforms: Arc<Mutex<Vec<FrameTransform>>> = Arc::default();
+        // A receiver's frames: decrypted, or dropped.
+        let receive = |receiver: &libwebrtc::rtp_receiver::RtpReceiver, sframe: &Arc<sframe::Sframe>| {
+            let sframe = sframe.clone();
+            FrameTransform::for_receiver(receiver, move |video, _, data, out| match sframe.decrypt(video, data) {
+                Some(frame) => {
+                    *out = frame;
+                    true
+                }
+                None => false,
+            })
+        };
         let pc = factory.create_peer_connection(RtcConfiguration::default()).map_err(media_err)?;
         let mut tasks = Vec::new();
         let handle = tokio::runtime::Handle::current();
@@ -281,7 +276,7 @@ impl Call {
         let levels: Arc<Mutex<HashMap<String, f32>>> = Arc::default();
         let heard = levels.clone();
         let spawn = handle.clone();
-        let (decrypt, decryptors, factory2) = (keys.clone(), receiving.clone(), factory.clone());
+        let (keys, decryptors) = (sframe.clone(), transforms.clone());
         let pictures: Arc<video::Pictures> = Arc::default();
         let shown = pictures.clone();
         pc.on_track(Some(Box::new(move |ev: TrackEvent| {
@@ -290,9 +285,7 @@ impl Call {
                 MediaStreamTrack::Audio(track) => track,
                 // Someone's picture: decrypted, then kept as RGBA.
                 MediaStreamTrack::Video(track) => {
-                    let cryptor = FrameCryptor::new_for_rtp_receiver(&factory2, user.clone(), EncryptionAlgorithm::AesGcm, decrypt.clone(), ev.receiver);
-                    cryptor.set_enabled(true);
-                    decryptors.lock().unwrap().push(cryptor);
+                    decryptors.lock().unwrap().push(receive(&ev.receiver, &keys));
                     let shown = shown.clone();
                     // A shared screen is kept apart from the camera.
                     let user = if track.id() == "screen" { screen_key(&user) } else { user };
@@ -313,11 +306,7 @@ impl Call {
             // Playout stops when the last incoming sound ends (someone left)
             // and libwebrtc doesn't always start it again for the next.
 
-            // Each person's frames, with their key.
-            let cryptor = FrameCryptor::new_for_rtp_receiver(&factory2, user.clone(), EncryptionAlgorithm::AesGcm, decrypt.clone(), ev.receiver);
-            cryptor.on_state_change(Some(Box::new(|who, state| tracing::debug!("decrypting {who}: {state:?}"))));
-            cryptor.set_enabled(true);
-            decryptors.lock().unwrap().push(cryptor);
+            decryptors.lock().unwrap().push(receive(&ev.receiver, &keys));
             let heard = heard.clone();
             spawn.spawn(async move {
                 let mut stream = NativeAudioStream::new(track, RATE as i32, 1);
@@ -424,12 +413,21 @@ impl Call {
                 track
             }
         };
+        // Each sender's frames are encrypted from the first: without a key
+        // yet, nothing goes.
+        let send = |sender: &libwebrtc::rtp_sender::RtpSender, stream: sframe::Stream| {
+            let sframe = sframe.clone();
+            FrameTransform::for_sender(sender, move |video, _, data, out| match sframe.encrypt(stream, video, data) {
+                Some(frame) => {
+                    *out = frame;
+                    true
+                }
+                None => false,
+            })
+        };
         let sender = pc.add_track(mic_track.clone().into(), &["me"]).map_err(media_err)?;
-        // Encrypted from the first frame: without a key yet, nothing goes.
+        transforms.lock().unwrap().push(send(&sender, sframe::Stream::Audio));
         let me = api.me().await?.id;
-        let sending = FrameCryptor::new_for_rtp_sender(factory, me.clone(), EncryptionAlgorithm::AesGcm, keys.clone(), sender);
-        sending.on_state_change(Some(Box::new(|_, state| tracing::debug!("encrypting: {state:?}"))));
-        sending.set_enabled(true);
 
         // The picture: a track from the start, with frames only while the
         // camera is on, so turning it on needs no renegotiation.
@@ -444,8 +442,7 @@ impl Call {
         if let Err(e) = vsender.set_parameters(params) {
             tracing::warn!("couldn't cap the camera's bitrate: {e}");
         }
-        let video_sending = FrameCryptor::new_for_rtp_sender(factory, me.clone(), EncryptionAlgorithm::AesGcm, keys.clone(), vsender);
-        video_sending.set_enabled(true);
+        transforms.lock().unwrap().push(send(&vsender, sframe::Stream::Camera));
 
         // And a shared screen: likewise a track from the start.
         let screen = libwebrtc::video_source::native::NativeVideoSource::new(VideoResolution { width: 1920, height: 1080 }, true);
@@ -459,8 +456,7 @@ impl Call {
         if let Err(e) = ssender.set_parameters(params) {
             tracing::warn!("couldn't cap the screen share's bitrate: {e}");
         }
-        let screen_sending = FrameCryptor::new_for_rtp_sender(factory, me.clone(), EncryptionAlgorithm::AesGcm, keys.clone(), ssender);
-        screen_sending.set_enabled(true);
+        transforms.lock().unwrap().push(send(&ssender, sframe::Stream::Screen));
 
         // The SFU is ICE-lite: it learns this device's address from its
         // checks, so the offer goes without waiting for candidates.
@@ -487,19 +483,15 @@ impl Call {
             api: api.clone(),
             pc,
             mic: mic_track,
-            keys,
-            sending,
-            video_sending,
+            sframe,
+            _transforms: transforms,
             video,
             camera: Mutex::new(None),
-            screen_sending,
             screen,
             sharing: Mutex::new(None),
             tx: tx.clone(),
             pictures,
             me,
-            _receiving: receiving,
-            epoch: Mutex::new(None),
             updates: Mutex::new(Some(rx)),
             tasks: Mutex::new(tasks),
             _media: media.clone(),
@@ -521,40 +513,13 @@ impl Call {
         self.0.updates.lock().unwrap().take()
     }
 
-    /// An epoch's keys, from the call's group: each person's (by user id).
-    /// Receivers use them at once; this device sends with its own after a
-    /// moment (at once for the first), so the others have them first.
-    pub fn set_keys(&self, epoch: u64, keys: &[(String, Vec<u8>)]) {
-        let slot = (epoch % RING) as i32;
-        tracing::debug!("call keys for epoch {epoch} (slot {slot}): {:?}", keys.iter().map(|(u, _)| u).collect::<Vec<_>>());
-        for (user, key) in keys {
-            self.0.keys.set_key(user.clone(), slot, key.clone());
-        }
-        let first = {
-            let mut newest = self.0.epoch.lock().unwrap();
-            if newest.is_some_and(|n| n >= epoch) {
-                return;
-            }
-            newest.replace(epoch).is_none()
-        };
-        if first {
-            self.0.sending.set_key_index(slot);
-            self.0.video_sending.set_key_index(slot);
-            self.0.screen_sending.set_key_index(slot);
-            return;
-        }
-        let call = Arc::downgrade(&self.0);
-        tokio::spawn(async move {
-            tokio::time::sleep(SWITCH_AFTER).await;
-            if let Some(call) = call.upgrade()
-                && *call.epoch.lock().unwrap() == Some(epoch)
-            {
-                tracing::debug!("sending with epoch {epoch}'s key");
-                call.sending.set_key_index(slot);
-                call.video_sending.set_key_index(slot);
-                call.screen_sending.set_key_index(slot);
-            }
-        });
+    /// An epoch's keys, from the call's group: its SFrame base key, this
+    /// device's leaf index and everyone's. Receivers use them at once; this
+    /// device sends with them a moment later (at once for the first), so the
+    /// others have them first.
+    pub fn set_keys(&self, epoch: u64, base: &[u8], own: u32, members: &[u32]) {
+        tracing::debug!("call keys for epoch {epoch}: leaf {own} of {members:?}");
+        self.0.sframe.set_epoch(epoch, base, own, members);
     }
 
     /// Turns the camera (or test picture) on, or off with `None`.

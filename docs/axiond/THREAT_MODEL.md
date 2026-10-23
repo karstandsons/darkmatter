@@ -77,8 +77,9 @@ clients catch it. Each row is a test in
   constant bitrate without pauses in silences, and without the header that
   says how loud it is, so packet sizes and gaps don't give away speech.
 - **Within a call, who sent a frame.** Every device in a call can derive
-  every sender's key, so one could forge another's frames (as with SFrame;
-  RFC 9605 §7.2). Calls are beta until they move to SFrame.
+  every sender's key, so one could forge another's frames (RFC 9605
+  §7.2). Calls use SFrame, so frames can't be replayed or moved between
+  senders or streams, but not signed.
 - **Notifications.** Desktop notifications from encrypted conversations
   say only "🔒 New message" unless you turn previews on, since the
   desktop keeps their text.

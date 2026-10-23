@@ -66,8 +66,13 @@ async fn linked(s: &Server, name: &str, from: &E2ee<MemoryStore>) -> (Client, E2
     (api, *e2ee)
 }
 
+/// What everyone in the call has the same: all but their own leaf index.
+fn shared(k: &Keys) -> (u64, &[u8], &[(dm_crypto::device::DeviceName, u32)], &str) {
+    (k.epoch, &k.base, &k.members, &k.code)
+}
+
 fn senders(k: &Keys) -> Vec<String> {
-    let mut users: Vec<String> = k.senders.iter().map(|(d, _)| d.0.clone()).collect();
+    let mut users: Vec<String> = k.members.iter().map(|(d, _)| d.0.clone()).collect();
     users.sort();
     users
 }
@@ -83,19 +88,23 @@ async fn everyone_in_a_call_and_no_one_else_has_its_keys() {
 
     // Alice starts it: the group is hers alone.
     let (call, k) = join(&alice_api, &alice, &town).await;
-    assert_eq!((k.epoch, k.senders.len()), (0, 1));
+    assert_eq!((k.epoch, k.members.len()), (0, 1));
 
     // Bob and carol join by themselves; everyone ends up with the same keys.
     let (_, kb) = join(&bob_api, &bob, &town).await;
-    assert_eq!(alice.sync_call(&town, &call).await.unwrap().unwrap(), kb);
+    assert_eq!(shared(&alice.sync_call(&town, &call).await.unwrap().unwrap()), shared(&kb));
     let (_, kc) = join(&carol_api, &carol, &town).await;
-    assert_eq!(alice.sync_call(&town, &call).await.unwrap().unwrap(), kc);
-    assert_eq!(bob.sync_call(&town, &call).await.unwrap().unwrap(), kc);
+    assert_eq!(shared(&alice.sync_call(&town, &call).await.unwrap().unwrap()), shared(&kc));
+    assert_eq!(shared(&bob.sync_call(&town, &call).await.unwrap().unwrap()), shared(&kc));
+    // Each device sends under its own leaf index.
+    let mut own = vec![k.own, kb.own, kc.own];
+    own.dedup();
+    assert_eq!(own.len(), 3, "{own:?}");
     assert_eq!(senders(&kc).len(), 3);
 
     // Nobody can take out someone still in the call.
     let group = dm_crypto::call::group(&call);
-    let alice_device = kc.senders.iter().find(|(d, _)| d.0 == alice.user_id).unwrap().0.clone();
+    let alice_device = kc.members.iter().find(|(d, _)| d.0 == alice.user_id).unwrap().0.clone();
     let h = bob.device.remove(&group, &[alice_device]).unwrap();
     let body = NewHandshake { commit: b64(&h.commit), group_info: b64(&h.group_info), welcome: String::new() };
     let refused = bob_api.post_call_handshake(&town, &body).await.unwrap_err();
@@ -112,7 +121,7 @@ async fn everyone_in_a_call_and_no_one_else_has_its_keys() {
         (Some(a), Some(b)) => (a, b),
         (a, b) => (a.or(alice.sync_call(&town, &call).await.unwrap()).unwrap(), b.or(bob.sync_call(&town, &call).await.unwrap()).unwrap()),
     };
-    assert_eq!(a, b);
+    assert_eq!(shared(&a), shared(&b));
     assert_eq!(a.epoch, kc.epoch + 1);
     let mut both = vec![alice.user_id.clone(), bob.user_id.clone()];
     both.sort();
@@ -139,14 +148,14 @@ async fn moving_a_call_to_another_device_moves_its_keys() {
     // pending (nobody has committed it yet), and alice commits that after.
     let (_, k) = join(&phone_api, &phone, &town).await;
     let k2 = alice.sync_call(&town, &call).await.unwrap().unwrap();
-    let k2 = match k2.senders.len() {
+    let k2 = match k2.members.len() {
         2 => k2,
         _ => alice.sync_call(&town, &call).await.unwrap().unwrap(),
     };
-    assert_eq!(k2.senders.len(), 2, "{:?}", senders(&k2));
-    assert!(k2.senders.iter().any(|(d, _)| *d == (phone.user_id.clone(), phone.device.device_id.clone())));
+    assert_eq!(k2.members.len(), 2, "{:?}", senders(&k2));
+    assert!(k2.members.iter().any(|(d, _)| *d == (phone.user_id.clone(), phone.device.device_id.clone())));
     assert!(k2.epoch > k.epoch);
-    assert_eq!(phone.sync_call(&town, &call).await.unwrap().unwrap(), k2);
+    assert_eq!(shared(&phone.sync_call(&town, &call).await.unwrap().unwrap()), shared(&k2));
 }
 
 fn b64(b: &[u8]) -> String {

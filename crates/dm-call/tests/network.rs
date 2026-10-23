@@ -17,6 +17,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const PASSWORD: &str = "correct horse battery";
+/// The leaf indexes in a test's calls: alice 0, bob 1, carol 2.
+const MEMBERS: &[u32] = &[0, 1, 2];
 
 /// What the proxy does to packets, either way.
 #[derive(Default)]
@@ -124,11 +126,10 @@ async fn call(s: &Server) -> (Call, Call, String, String) {
     let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
     let team = alice.my_teams().await.unwrap()[0].id.clone();
     let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
-    let keys = vec![(alice_id.clone(), vec![1; 32]), (bob_id.clone(), vec![2; 32])];
     let (a, _) = Call::join(&Media::new(), &alice, &town, Mic::Tone(440.0)).await.unwrap();
     let (b, _) = Call::join(&Media::new(), &bob, &town, Mic::Tone(660.0)).await.unwrap();
-    a.set_keys(0, &keys);
-    b.set_keys(0, &keys);
+    a.set_keys(0, &[1; 16], 0, MEMBERS);
+    b.set_keys(0, &[1; 16], 1, MEMBERS);
     a.set_camera(Some(dm_call::Cam::Pattern)).unwrap();
     (a, b, alice_id, bob_id)
 }

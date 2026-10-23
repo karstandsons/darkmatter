@@ -20,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+sframe = "2.1.0"
 
 # Screen sharing on Linux goes through the portal, over D-Bus with GLib.
 [target.'cfg(target_os = "linux")'.dependencies]

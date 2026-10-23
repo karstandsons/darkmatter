@@ -6,6 +6,12 @@ use common::*;
 use dm_crypto::Incoming;
 use dm_crypto::call::{self, KEY_LEN};
 
+fn devices(k: &call::Keys) -> Vec<String> {
+    let mut d: Vec<String> = k.members.iter().map(|(d, _)| d.0.clone()).collect();
+    d.sort();
+    d
+}
+
 #[test]
 fn everyone_in_a_call_derives_the_same_keys_and_no_one_else_does() {
     let mut w = World::new();
@@ -17,14 +23,15 @@ fn everyone_in_a_call_derives_the_same_keys_and_no_one_else_does() {
     w.add(&alice, &g, &[&bob, &carol], &[]);
 
     let (a, b, c) = (alice.call_keys(&g).unwrap(), bob.call_keys(&g).unwrap(), carol.call_keys(&g).unwrap());
-    assert_eq!(a, b);
-    assert_eq!(a, c);
-    assert_eq!(a.senders.len(), 3);
-    // One key per sender, each its own.
-    let mut keys: Vec<&Vec<u8>> = a.senders.iter().map(|(_, k)| k).collect();
-    keys.dedup();
-    assert_eq!(keys.len(), 3);
-    assert!(a.senders.iter().all(|(_, k)| k.len() == KEY_LEN));
+    // The same base key and members for all; each its own leaf index.
+    assert_eq!((&a.base, &a.members, &a.code), (&b.base, &b.members, &b.code));
+    assert_eq!((&a.base, &a.members), (&c.base, &c.members));
+    assert_eq!(a.base.len(), KEY_LEN);
+    assert_eq!(devices(&a), ["alice", "bob", "carol"]);
+    let mut own = vec![a.own, b.own, c.own];
+    own.dedup();
+    assert_eq!(own.len(), 3);
+    assert!(a.members.iter().any(|(d, i)| *d == name(&bob) && *i == b.own));
     assert_eq!(a.code.len(), 9, "{}", a.code);
 
     // Carol leaves: a new epoch, new keys and code, and she has none of them.
@@ -33,19 +40,18 @@ fn everyone_in_a_call_derives_the_same_keys_and_no_one_else_does() {
     assert!(matches!(bob.process(&g, &h.commit, &w.keys).unwrap(), Incoming::Commit { .. }));
     let _ = carol.process(&g, &h.commit, &w.keys);
     let (a2, b2) = (alice.call_keys(&g).unwrap(), bob.call_keys(&g).unwrap());
-    assert_eq!(a2, b2);
+    assert_eq!((&a2.base, &a2.members, a2.epoch), (&b2.base, &b2.members, b2.epoch));
     assert_eq!(a2.epoch, a.epoch + 1);
-    assert_eq!(a2.senders.len(), 2);
+    assert_eq!(devices(&a2), ["alice", "bob"]);
     assert_ne!(a2.code, a.code);
-    let alice_key = |k: &call::Keys| k.senders.iter().find(|(d, _)| *d == name(&alice)).unwrap().1.clone();
-    assert_ne!(alice_key(&a2), alice_key(&a));
+    assert_ne!(a2.base, a.base);
     assert!(carol.call_keys(&g).map_or(true, |k| k.epoch < a2.epoch), "carol can't reach the new epoch");
 
-    // Another call, even with the same people: other keys.
+    // Another call, even with the same people: another base key.
     let g2 = call::group("c2");
     w.create(&alice, &g2);
     w.add(&alice, &g2, &[&bob], &[]);
-    assert_ne!(alice_key(&alice.call_keys(&g2).unwrap()), alice_key(&a2));
+    assert_ne!(alice.call_keys(&g2).unwrap().base, a2.base);
 }
 
 #[test]

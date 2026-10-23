@@ -441,6 +441,14 @@ impl<S: StorageProvider<CURRENT_VERSION>> Device<S> {
 }
 
 impl<S: StorageProvider<CURRENT_VERSION>> Device<S> {
+    /// The group's members with their leaf indexes (SFrame key ids carry
+    /// them), and this device's.
+    pub fn leaf_indexes(&self, channel_id: &str) -> Result<(u32, Vec<(DeviceName, u32)>)> {
+        let group = self.load(channel_id)?;
+        let members = group.members().map(|m| Ok((identity::parse_credential(&m.credential)?, m.index.u32()))).collect::<Result<Vec<_>>>()?;
+        Ok((group.own_leaf_index().u32(), members))
+    }
+
     /// The group's epoch authenticator (RFC 9420 §8.7): the same for every
     /// member in an epoch, so comparing it shows nobody's view was split.
     pub fn epoch_authenticator(&self, channel_id: &str) -> Result<Vec<u8>> {

@@ -194,28 +194,29 @@ The server's search (FTS5) never sees encrypted content and skips encrypted chan
 
 ## 11. Calls
 
-As built in M3 Phase 2 ("Phase A" of [research/calls.md](research/calls.md) §4.5), beta:
+As built in M3 Phase 2, with SFrame since Phase 6 ("Phase B" of [research/calls.md](research/calls.md) §4), beta:
 - **Each call has its own MLS group** (`call:<call id>`), holding only the devices in the call, with the same device credentials as chat, so chat verification carries over and people in the channel but not the call derive nothing.
   - The first device in the call creates the group. Each later one **joins by itself with an external commit** from the group's latest GroupInfo, so nobody adds anyone.
   - axiond, as the group's external sender, **proposes the Remove** of a device that leaves the call, is signed out or drops; a member still in the call commits it (each waits a moment of its own first, so most find it done).
   - An external commit can't carry pending proposals (RFC 9420 §12.4.3.2), so for a call's group axiond lets a join through without them and proposes them again in the new epoch.
   - The server keeps each group's public state in memory with the call, and checks every commit with the same delivery service as channels. It refuses commits that add anyone, external joins by a device other than the sender or not in the call, and removals of a device still in the call.
   - Every join and leave is a new epoch.
-- **Per-sender media keys:** `MLS-Exporter("darkmatter call v1", user_id || 0x00 || device_id, 32)` for each device in the group, every epoch. Every member can derive every sender's key, and nobody outside the group can.
-- **Frame encryption (Phase A):** LiveKit's frame encryptor in libwebrtc (AES-GCM-128, the AES key derived from ours with HKDF). Keys sit in a ring of 16 by `epoch mod 16`, and a frame names its key's slot.
-  - Receivers install an epoch's keys as soon as they process its commit. A sender switches to its new key **one second later**, so the others have it first; a device just removed can read for that long.
-  - The sender's encryptor is on from the first frame: **nothing is sent before there's a key**, and a frame without the right key isn't played.
+- **Frame encryption: SFrame ([RFC 9605](https://www.rfc-editor.org/rfc/rfc9605)) in its MLS mode (§5.2),** through the `sframe` crate (ring's AES-GCM), cipher suite `AES_128_GCM_SHA256_128`.
+  - Every epoch, `base_key = MLS-Exporter("SFrame 1.0 Base Key", "", 16)`. A frame's key id is `context << 12 | leaf_index << 4 | (epoch mod 16)`, where the context is the stream (0 sound, 1 camera, 2 screen). SFrame derives each key and salt from the base key and the key id, so every sender and stream has its own key and its own counter, and no key and nonce repeat.
+  - Every member can derive every sender's key, and nobody outside the group can.
+  - Receivers install an epoch's keys as soon as they process its commit and keep the last 4 epochs (an old epoch with the same low 4 bits is evicted first, as §5.2 says). A sender switches to its new key **one second later**, so the others have it first; a device just removed can read for that long.
+  - **Nothing is sent before there's a key**, and a frame that doesn't authenticate under a key the device has, or that it has seen before (replay protection, with 256 frames of reordering allowed), is dropped.
+  - Frames go through our own frame transformer in libwebrtc (`vendor/webrtc-sys`, see [vendor/README.md](../../vendor/README.md)), on every sender and receiver.
 - **The call code:** eight digits from the epoch authenticator (RFC 9420 §8.7), the same for everyone in the call and new with every join or leave. Read out, it shows nobody's view of the call was split.
-- **Never reuse a key and nonce:** each call is a fresh group and each epoch fresh keys, so no key outlives its epoch. LiveKit derives the IV from the SSRC and RTP timestamp; a collision needs both repeated under one key.
-- Opus at a constant bitrate, no DTX, no audio-level header extension.
+- **Never reuse a key and nonce:** each call is a fresh group and each epoch fresh keys, so no key outlives its epoch; within one, SFrame's nonce is the salt XOR a counter that only goes up, per sender and stream.
+- Opus at a constant bitrate, no DTX, no audio-level header extension. Sound is encrypted whole.
+- Video is VP8 only (the SFU offers nothing else). Its first 3 bytes, or 10 on a keyframe (keyframe flag, size), stay readable for RTP packetization and the SFU; they're SFrame's authenticated "metadata", so they can't be changed.
 - The SFU forwards ciphertext it can't decode.
 
-**Known limits of Phase A:**
-- No per-sender authentication of frames: any member could forge frames as another (RFC 9605 §7.2 says the same of SFrame; signing frames costs too much).
-- Codec headers stay in the clear (the first byte of each Opus frame; for video, VP8's first 3–10 bytes).
-- LiveKit's key index byte isn't authenticated, and there's no replay protection.
-
-Phase B, before calls lose the beta label, moves to RFC 9605 SFrame in its MLS mode.
+**Known limits:**
+- No per-sender authentication of frames: any member could forge frames as another (RFC 9605 §7.2; signing frames costs too much).
+- VP8's frame header stays readable: the server sees video size and keyframes.
+- There's no standard RTP format for SFrame yet (`draft-ietf-avtcore-rtp-sframe` expired); ours is SFrame frames inside ordinary RTP payloads, which only Darkmatter needs to read.
 
 ## 12. New devices, verification and recovery
 
