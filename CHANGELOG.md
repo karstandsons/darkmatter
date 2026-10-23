@@ -27,7 +27,8 @@ The release workflow uses each version's section here as its release notes.
   encrypted (SFrame, RFC 9605) with keys only the devices in the call
   have; everyone sees the same code on the call bar. Pick your microphone, speaker and camera
   under Devices. A call that drops (a new network, a blip) comes back by
-  itself.
+  itself, and calls get through networks that block UDP (over the
+  server's HTTPS port).
 
 ## [0.5.0] - 2026-10-21
 

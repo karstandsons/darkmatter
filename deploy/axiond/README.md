@@ -77,7 +77,8 @@ systemctl enable --now dnf-automatic.timer
 
 Docker opens the ports it publishes past these firewalls. That's why
 `compose.yaml` publishes 443 only, TCP and UDP (and the Caddy variant
-binds to 127.0.0.1).
+binds to 127.0.0.1). Calls use 443/udp, and on networks that block UDP
+they go over 443/tcp alongside HTTPS: axiond tells the two apart.
 
 ## 3. Start axiond
 
@@ -181,4 +182,7 @@ chat.example.com {
 
 Calls still need their UDP port published to axiond itself (a proxy for
 HTTPS doesn't carry them): add `"443:443/udp"` under `ports`, with
-`AXIOND_CALLS_UDP=0.0.0.0:443` and `AXIOND_CALLS_PUBLIC_IP` as above.
+`AXIOND_CALLS_UDP=0.0.0.0:443` and `AXIOND_CALLS_PUBLIC_IP` as above. Set
+`AXIOND_CALLS_PUBLIC_TCP_PORT=0` too: calls over TCP need axiond on 443
+itself, so behind a proxy calls can't get through networks that block
+UDP.

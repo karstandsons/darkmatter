@@ -453,6 +453,9 @@ impl Call {
             e.max_bitrate = Some(video::SCREEN_MAX_BITRATE);
             e.max_framerate = Some(video::SCREEN_FPS as f64);
         }
+        // Text stays sharp: when there isn't enough, fewer frames, not
+        // smaller ones.
+        params.set_degradation_preference(libwebrtc::rtp_parameters::DegradationPreference::MaintainResolution);
         if let Err(e) = ssender.set_parameters(params) {
             tracing::warn!("couldn't cap the screen share's bitrate: {e}");
         }

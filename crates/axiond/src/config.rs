@@ -50,6 +50,10 @@ pub struct Config {
     /// The port devices send call media to, if it isn't the one bound
     /// (a forwarded port).
     pub calls_public_port: Option<u16>,
+    /// The port devices reach this server's HTTPS on, for call media over
+    /// TCP, if it isn't the one listened on (a proxy in front); 0 turns
+    /// media over TCP off.
+    pub calls_public_tcp_port: Option<u16>,
 }
 
 impl Default for Config {
@@ -72,6 +76,7 @@ impl Default for Config {
             calls_udp: None,
             calls_public_ip: None,
             calls_public_port: None,
+            calls_public_tcp_port: None,
         }
     }
 }
@@ -142,6 +147,9 @@ impl Config {
         }
         if let Some(v) = var("AXIOND_CALLS_PUBLIC_PORT") {
             self.calls_public_port = some(v).map(|v| v.parse().with_context(|| format!("AXIOND_CALLS_PUBLIC_PORT={v}"))).transpose()?;
+        }
+        if let Some(v) = var("AXIOND_CALLS_PUBLIC_TCP_PORT") {
+            self.calls_public_tcp_port = some(v).map(|v| v.parse().with_context(|| format!("AXIOND_CALLS_PUBLIC_TCP_PORT={v}"))).transpose()?;
         }
         if let Some(v) = var("AXIOND_MAX_FILE_MB") {
             self.max_file_mb = v.parse().with_context(|| format!("AXIOND_MAX_FILE_MB={v}"))?;

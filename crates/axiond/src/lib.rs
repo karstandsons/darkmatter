@@ -66,24 +66,26 @@ impl App {
         let tls = self.config.tls()?;
         self.schedule_backups();
         housekeeping::start(&self);
-        calls::start(&self).await?;
+        calls::start(&self, listener.local_addr()?).await?;
         let config = self.config.clone();
+        let app = self.clone();
         let service = api::router(self).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        // Each connection to the port is HTTP(S), or call media over TCP.
+        let server = axum_server::from_tcp(listener.into_std()?)?.handle(tls::shutdown_handle());
         match tls {
-            config::Tls::None => axum::serve(listener, service).with_graceful_shutdown(shutdown()).await?,
+            config::Tls::None => server.acceptor(calls::Split::new(axum_server::accept::DefaultAcceptor, &app)).serve(service).await?,
             config::Tls::Files(cert, key) => {
                 tls::install_provider();
                 let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
                     .await
                     .map_err(|e| anyhow::anyhow!("reading {} and {}: {e}", cert.display(), key.display()))?;
-                let server = axum_server::from_tcp_rustls(listener.into_std()?, rustls)?;
-                server.handle(tls::shutdown_handle()).serve(service).await?;
+                let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(rustls);
+                server.acceptor(calls::Split::new(acceptor, &app)).serve(service).await?;
             }
             config::Tls::Acme(domain) => {
                 tls::install_provider();
                 let acceptor = tls::acme(&domain, &config)?;
-                let server = axum_server::from_tcp(listener.into_std()?)?.acceptor(acceptor);
-                server.handle(tls::shutdown_handle()).serve(service).await?;
+                server.acceptor(calls::Split::new(acceptor, &app)).serve(service).await?;
             }
         }
         db.close().await;

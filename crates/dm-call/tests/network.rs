@@ -208,3 +208,19 @@ async fn a_weak_connection_shows_in_its_quality() {
     assert!(worst > 0.1, "20% lost, but the worst report was {worst}");
     drop(a);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_gets_through_where_no_udp_does() {
+    let s = server().await;
+    // Every UDP packet lost from the start: the call goes over TCP, to the
+    // server's HTTP port.
+    s.weather.dark.store(true, Ordering::Relaxed);
+    let (a, b, alice_id, _) = call(&s).await;
+    let mut updates = b.updates().unwrap();
+    let (n, other) = heard(&mut updates, &alice_id, Duration::from_secs(15)).await;
+    assert!(n > 10, "alice heard in {n} reports; {other:?}");
+    assert!(other.contains(&Update::Connected), "{other:?}");
+    let picture = b.pictures().get(&alice_id).cloned().expect("alice's picture");
+    assert!(picture.at.elapsed() < Duration::from_secs(1), "her picture keeps coming");
+    drop(a);
+}

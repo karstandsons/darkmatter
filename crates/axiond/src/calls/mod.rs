@@ -1,5 +1,6 @@
 //! Voice and video calls: who's in each channel's call, and the SFU that
-//! carries their media (`sfu`).
+//! carries their media (`sfu`), by UDP or, through the HTTPS port, TCP
+//! (`tcp`).
 //!
 //! A call lives in memory: one per channel, from the first person joining
 //! to the last leaving. Each person is in it from one device; joining from
@@ -9,6 +10,9 @@
 
 pub mod group;
 mod sfu;
+mod tcp;
+
+pub use tcp::Split;
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
@@ -18,6 +22,7 @@ use std::sync::{Mutex, OnceLock, mpsc};
 use mm_api::models::{Call as CallInfo, CallParticipant, CallUpdate, JoinedCall};
 use serde_json::json;
 use str0m::change::SdpOffer;
+use str0m::net::TcpType;
 use str0m::{Candidate, Rtc};
 
 use crate::App;
@@ -41,9 +46,11 @@ pub struct Calls {
 }
 
 struct Sfu {
-    tx: Mutex<mpsc::Sender<sfu::Cmd>>,
-    /// What devices are told to send media to.
+    tx: Mutex<mpsc::Sender<sfu::In>>,
+    /// What devices are told to send media to: UDP, and TCP on the HTTPS
+    /// port for networks without UDP.
     candidate: SocketAddr,
+    tcp_candidate: Option<SocketAddr>,
 }
 
 struct Call {
@@ -76,9 +83,10 @@ impl Call {
 }
 
 /// Starts the SFU on the configured UDP address. Devices are told to send
-/// to `calls_public_ip` (or the address it's bound to) and its port. Without
-/// an address to give them, calls stay off.
-pub async fn start(app: &App) -> anyhow::Result<()> {
+/// to `calls_public_ip` (or the address it's bound to) and its port, or over
+/// TCP to the same address and `http`'s port. Without an address to give
+/// them, calls stay off.
+pub async fn start(app: &App, http: SocketAddr) -> anyhow::Result<()> {
     let bind = app.config.calls_udp.unwrap_or_else(|| SocketAddr::new(app.config.listen.ip(), 0));
     let socket = UdpSocket::bind(bind).map_err(|e| anyhow::anyhow!("binding the calls UDP port {bind}: {e}"))?;
     let bound = socket.local_addr()?;
@@ -91,15 +99,23 @@ pub async fn start(app: &App) -> anyhow::Result<()> {
         None => bound.ip(),
     };
     let candidate = SocketAddr::new(ip, app.config.calls_public_port.unwrap_or(bound.port()));
+    let tcp_candidate = match app.config.calls_public_tcp_port.unwrap_or(http.port()) {
+        0 => None,
+        port => Some(SocketAddr::new(ip, port)),
+    };
     let _ = app.calls.rows.set(group::server_rows(app).await?);
     str0m::crypto::from_feature_flags().install_process_default();
     let (tx, rx) = mpsc::channel();
     let (gone_tx, mut gone_rx) = tokio::sync::mpsc::unbounded_channel();
-    std::thread::Builder::new().name("sfu".into()).spawn(move || sfu::run(socket, candidate, rx, gone_tx))?;
-    if app.calls.sfu.set(Sfu { tx: Mutex::new(tx), candidate }).is_err() {
+    let inbox = tx.clone();
+    std::thread::Builder::new().name("sfu".into()).spawn(move || sfu::run(socket, candidate, tcp_candidate, inbox, rx, gone_tx))?;
+    if app.calls.sfu.set(Sfu { tx: Mutex::new(tx), candidate, tcp_candidate }).is_err() {
         anyhow::bail!("calls started twice");
     }
-    tracing::info!("calls: media on udp {bound}, devices send to {candidate}");
+    match tcp_candidate {
+        Some(tcp) => tracing::info!("calls: media on udp {bound}, devices send to {candidate} (or tcp {tcp})"),
+        None => tracing::info!("calls: media on udp {bound}, devices send to {candidate}"),
+    }
     // A device whose connection dropped is out of its call.
     let app = app.clone();
     tokio::spawn(async move {
@@ -118,7 +134,7 @@ impl Calls {
 
     fn send(&self, cmd: sfu::Cmd) {
         if let Some(sfu) = self.sfu.get() {
-            let _ = sfu.tx.lock().unwrap().send(cmd);
+            let _ = sfu.tx.lock().unwrap().send(sfu::In::Cmd(cmd));
         }
     }
 
@@ -188,6 +204,11 @@ pub async fn join(app: &App, me: &Me, channel_id: &str, offer: &str) -> Result<J
     // packetizers, and every device has to decode every other's video.
     let mut rtc = Rtc::builder().set_ice_lite(true).clear_codecs().enable_opus(true, false).enable_vp8(true).build(std::time::Instant::now());
     rtc.add_local_candidate(Candidate::host(sfu.candidate, "udp").map_err(|_| Error::internal())?);
+    // Lower priority than UDP, so used only when UDP doesn't get through.
+    if let Some(addr) = sfu.tcp_candidate {
+        let tcp = Candidate::builder().tcp().host(addr).tcptype(TcpType::Passive).build().map_err(|_| Error::internal())?;
+        rtc.add_local_candidate(tcp);
+    }
     let answer = rtc.sdp_api().accept_offer(offer).map_err(|e| Error::bad_request(format!("Couldn't accept that offer: {e}")))?;
 
     let peer = app.calls.next_peer.fetch_add(1, Ordering::Relaxed);

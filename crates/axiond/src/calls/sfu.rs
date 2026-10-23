@@ -1,5 +1,6 @@
-//! The SFU: one UDP socket for every call, each device's media forwarded to
-//! the others in its call without being decoded. Built on str0m, from its
+//! The SFU: one UDP socket for every call (and, for networks that let no UDP
+//! through, ICE over TCP on the HTTPS port), each device's media forwarded
+//! to the others in its call without being decoded. Built on str0m, from its
 //! `chat` example (see spikes/calls for the measurements).
 //!
 //! It runs on a thread of its own. The registry (`super`) adds and removes
@@ -9,7 +10,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -29,23 +31,127 @@ pub enum Cmd {
     Remove { peer: u64 },
 }
 
+/// What reaches the SFU's thread: the registry's commands, and media from
+/// every device, by UDP or TCP.
+pub enum In {
+    Cmd(Cmd),
+    Packet { tcp: bool, source: SocketAddr, contents: Vec<u8> },
+    /// A device connected over TCP: what it's sent goes to `writer`.
+    TcpOpen { source: SocketAddr, writer: tokio::sync::mpsc::UnboundedSender<Vec<u8>> },
+    TcpClosed { source: SocketAddr },
+}
+
+/// Where packets go out: the UDP socket, or a device's TCP connection.
+struct Out {
+    udp: UdpSocket,
+    tcp: HashMap<SocketAddr, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+}
+
+impl Out {
+    fn send(&self, t: &str0m::net::Transmit) {
+        if t.proto == Protocol::Udp {
+            if let Err(e) = self.udp.send_to(&t.contents, t.destination) {
+                debug!("send to {}: {e}", t.destination);
+            }
+        } else if let Some(writer) = self.tcp.get(&t.destination) {
+            let _ = writer.send(t.contents.to_vec());
+        }
+    }
+}
+
+/// Reads the UDP socket into the SFU's inbox, until the SFU stops.
+fn read_udp(socket: UdpSocket, inbox: Sender<In>, stopped: Arc<AtomicBool>) {
+    let mut buf = vec![0; 2000];
+    let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
+    while !stopped.load(Ordering::Relaxed) {
+        match socket.recv_from(&mut buf) {
+            Ok((n, source)) => {
+                if inbox.send(In::Packet { tcp: false, source, contents: buf[..n].to_vec() }).is_err() {
+                    return;
+                }
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
+            // ICMP "port unreachable" from a device that went away, say.
+            Err(e) => debug!("reading the media socket: {e}"),
+        }
+    }
+}
+
 /// Runs until the registry goes away. `gone` hears of every device that
-/// left, however it left. `candidate` is the address devices send to: what
-/// each packet arrived at, as far as str0m is concerned, though the socket
-/// may be bound to another (0.0.0.0, or a port forwarded to this one).
-pub fn run(socket: UdpSocket, candidate: SocketAddr, rx: Receiver<Cmd>, gone: UnboundedSender<u64>) {
+/// left, however it left. `candidate` and `tcp_candidate` are the addresses
+/// devices send to: what each packet arrived at, as far as str0m is
+/// concerned, though the sockets may be bound to others (0.0.0.0, or a port
+/// forwarded to this one). `inbox` is `rx`'s sender, for the UDP reader.
+pub fn run(socket: UdpSocket, candidate: SocketAddr, tcp_candidate: Option<SocketAddr>, inbox: Sender<In>, rx: Receiver<In>, gone: UnboundedSender<u64>) {
     let mut clients: Vec<Client> = vec![];
     let mut queue: VecDeque<Propagated> = VecDeque::new();
     // Which device a source address belongs to, so a packet isn't offered
     // to every device in turn.
-    let mut by_addr: HashMap<SocketAddr, ClientId> = HashMap::new();
-    let mut buf = vec![0; 2000];
-    let local = candidate;
+    let mut by_addr: HashMap<(bool, SocketAddr), ClientId> = HashMap::new();
+    // The reader holds a sender too, so the registry going away is seen by
+    // `gone` closing; the reader stops with this thread.
+    let stopped = Arc::new(AtomicBool::new(false));
+    struct Stop(Arc<AtomicBool>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let _stop = Stop(stopped.clone());
+    let reader = match socket.try_clone() {
+        Ok(reader) => reader,
+        Err(e) => return tracing::error!("calls: can't read the media socket: {e}"),
+    };
+    if let Err(e) = std::thread::Builder::new().name("sfu-udp".into()).spawn(move || read_udp(reader, inbox, stopped)) {
+        return tracing::error!("calls: can't read the media socket: {e}");
+    }
+    let mut out = Out { udp: socket, tcp: HashMap::new() };
+    let mut wait = Duration::ZERO;
 
-    loop {
+    while !gone.is_closed() {
+        // What came in: the first wait as long as nothing needs polling,
+        // then whatever else is there.
+        let mut first = match rx.recv_timeout(wait) {
+            Ok(m) => Some(m),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
         loop {
-            match rx.try_recv() {
-                Ok(Cmd::Add { peer, user, room, rtc }) => {
+            let m = match first.take() {
+                Some(m) => m,
+                None => match rx.try_recv() {
+                    Ok(m) => m,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
+                },
+            };
+            match m {
+                In::Packet { tcp, source, contents } => {
+                    let Ok(contents) = contents.as_slice().try_into() else { continue };
+                    let (proto, destination) = match tcp_candidate {
+                        Some(tcp_candidate) if tcp => (Protocol::Tcp, tcp_candidate),
+                        _ if tcp => continue,
+                        _ => (Protocol::Udp, candidate),
+                    };
+                    let input = Input::Receive(Instant::now(), Receive { proto, source, destination, contents });
+                    let known = by_addr.get(&(tcp, source)).and_then(|id| clients.iter().position(|c| c.id == *id)).filter(|&i| clients[i].rtc.accepts(&input));
+                    match known.or_else(|| clients.iter().position(|c| c.rtc.accepts(&input))) {
+                        Some(i) => {
+                            by_addr.insert((tcp, source), clients[i].id);
+                            clients[i].handle_input(input);
+                            clients[i].dirty = true;
+                        }
+                        None => debug!("no call device for a packet from {source}"),
+                    }
+                }
+                In::TcpOpen { source, writer } => {
+                    out.tcp.insert(source, writer);
+                }
+                In::TcpClosed { source } => {
+                    out.tcp.remove(&source);
+                    by_addr.remove(&(true, source));
+                }
+                In::Cmd(Cmd::Add { peer, user, room, rtc }) => {
                     let mut client = Client::new(peer, user, room, *rtc);
                     let open: Vec<_> = clients.iter().filter(|c| c.room == client.room).flat_map(|c| c.tracks_in.iter()).map(|t| Arc::downgrade(&t.id)).collect();
                     for track in open {
@@ -53,13 +159,11 @@ pub fn run(socket: UdpSocket, candidate: SocketAddr, rx: Receiver<Cmd>, gone: Un
                     }
                     clients.push(client);
                 }
-                Ok(Cmd::Remove { peer }) => {
+                In::Cmd(Cmd::Remove { peer }) => {
                     if let Some(c) = clients.iter_mut().find(|c| c.id.0 == peer) {
                         c.rtc.disconnect();
                     }
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
             }
         }
 
@@ -68,7 +172,7 @@ pub fn run(socket: UdpSocket, candidate: SocketAddr, rx: Receiver<Cmd>, gone: Un
         loop {
             for client in clients.iter_mut().filter(|c| c.dirty) {
                 client.dirty = false;
-                client.timeout = poll_until_timeout(client, &mut queue, &socket);
+                client.timeout = poll_until_timeout(client, &mut queue, &out);
             }
             if queue.is_empty() {
                 break;
@@ -95,27 +199,7 @@ pub fn run(socket: UdpSocket, candidate: SocketAddr, rx: Receiver<Cmd>, gone: Un
         }
 
         let next = clients.iter().map(|c| c.timeout).min().unwrap_or_else(|| Instant::now() + Duration::from_millis(100));
-        let _ = socket.set_read_timeout(Some(next.saturating_duration_since(Instant::now()).clamp(Duration::from_millis(1), Duration::from_millis(100))));
-        buf.resize(2000, 0);
-        match socket.recv_from(&mut buf) {
-            Ok((n, source)) => {
-                if let Ok(contents) = buf[..n].try_into() {
-                    let input = Input::Receive(Instant::now(), Receive { proto: Protocol::Udp, source, destination: local, contents });
-                    let known = by_addr.get(&source).and_then(|id| clients.iter().position(|c| c.id == *id)).filter(|&i| clients[i].rtc.accepts(&input));
-                    match known.or_else(|| clients.iter().position(|c| c.rtc.accepts(&input))) {
-                        Some(i) => {
-                            by_addr.insert(source, clients[i].id);
-                            clients[i].handle_input(input);
-                            clients[i].dirty = true;
-                        }
-                        None => debug!("no call device for a packet from {source}"),
-                    }
-                }
-            }
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
-            // ICMP "port unreachable" from a device that went away, say.
-            Err(e) => debug!("reading the media socket: {e}"),
-        }
+        wait = next.saturating_duration_since(Instant::now()).min(Duration::from_millis(100));
 
         let now = Instant::now();
         for client in clients.iter_mut().filter(|c| c.timeout <= now) {
@@ -129,12 +213,12 @@ pub fn run(socket: UdpSocket, candidate: SocketAddr, rx: Receiver<Cmd>, gone: Un
     }
 }
 
-fn poll_until_timeout(client: &mut Client, queue: &mut VecDeque<Propagated>, socket: &UdpSocket) -> Instant {
+fn poll_until_timeout(client: &mut Client, queue: &mut VecDeque<Propagated>, out: &Out) -> Instant {
     loop {
         if !client.rtc.is_alive() {
             return Instant::now();
         }
-        match client.poll_output(socket) {
+        match client.poll_output(out) {
             Propagated::Timeout(t) => return t,
             p => queue.push_back(p),
         }
@@ -245,15 +329,13 @@ impl Client {
         }
     }
 
-    fn poll_output(&mut self, socket: &UdpSocket) -> Propagated {
+    fn poll_output(&mut self, out: &Out) -> Propagated {
         if !self.rtc.is_alive() || self.negotiate_if_needed() {
             return Propagated::Noop;
         }
         match self.rtc.poll_output() {
             Ok(Output::Transmit(t)) => {
-                if let Err(e) = socket.send_to(&t.contents, t.destination) {
-                    debug!("send to {}: {e}", t.destination);
-                }
+                out.send(&t);
                 Propagated::Noop
             }
             Ok(Output::Timeout(t)) => Propagated::Timeout(t),
