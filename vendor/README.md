@@ -12,7 +12,8 @@ RUSTSEC-2026-0330/-0331 (`libcrux-kem` 0.0.10, through `hpke-rs-libcrux`
 
 The only changes from the published crate: those version numbers in
 `Cargo.toml`, and `libcrux_hmac::hmac`'s new signature (it writes into a
-buffer) in `src/crypto.rs`. Our ciphersuite and the link HPKE are X25519
+buffer) in `src/crypto.rs`. The crate's `Cargo.toml.orig` and `Cargo.lock`
+are left out: they still named the old versions, and cargo uses neither. Our ciphersuite and the link HPKE are X25519
 ones, which #2261 leaves as they were.
 
 When openmls releases a newer `openmls_libcrux_crypto` (0.4.1 or 0.5),
