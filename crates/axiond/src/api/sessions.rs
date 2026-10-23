@@ -35,10 +35,11 @@ pub async fn list(State(app): State<App>, me: Me, Path(user_id): Path<String>) -
     let user_id = yours_or_admin(&me, &user_id)?;
     let mut sessions: Vec<Session> = sqlx::query_as(
         "SELECT id, user_id, device_id, create_at, last_activity_at, expires_at, user_agent FROM sessions \
-         WHERE user_id = ?1 AND expires_at > ?2 ORDER BY last_activity_at DESC",
+         WHERE user_id = ?1 AND expires_at > ?2 AND create_at > ?2 - ?3 ORDER BY last_activity_at DESC",
     )
     .bind(&user_id)
     .bind(crate::ids::now())
+    .bind(crate::auth::SESSION_MAX_DAYS * 86_400_000)
     .fetch_all(&app.db)
     .await?;
     for s in &mut sessions {
@@ -103,7 +104,11 @@ fn totp(secret: &str, account: &str, issuer: &str) -> Result<totp_rs::Totp> {
 /// Checks a code against an active secret, and uses it up: the same code
 /// (or an older one) never works twice.
 pub async fn check_code(app: &App, user_id: &str, code: &str) -> Result<bool> {
-    let (secret, last): (String, i64) = sqlx::query_as("SELECT mfa_secret, mfa_last_step FROM users WHERE id = ?").bind(user_id).fetch_one(&app.db).await?;
+    let (sealed, last): (String, i64) = sqlx::query_as("SELECT mfa_secret, mfa_last_step FROM users WHERE id = ?").bind(user_id).fetch_one(&app.db).await?;
+    let Some(secret) = app.secrets.open_totp(user_id, &sealed) else {
+        tracing::error!("can't decrypt user {user_id}'s two-factor secret: the secret key isn't the one it was encrypted with");
+        return Ok(false);
+    };
     let Some(step) = totp(&secret, "x", "x")?.check_current(code.trim()) else { return Ok(false) };
     let step = step as i64;
     if step <= last {
@@ -126,7 +131,8 @@ pub async fn generate(State(app): State<App>, me: Me, Path(user_id): Path<String
         return Err(Error::bad_request("Two-factor codes are already on. Turn them off first."));
     }
     let secret = totp_rs::Secret::from(rand::random::<[u8; 20]>()).to_base32();
-    sqlx::query("UPDATE users SET mfa_secret = ?, mfa_last_step = 0 WHERE id = ?").bind(&secret).bind(&user_id).execute(&app.db).await?;
+    // Stored encrypted; only this answer has it in the clear.
+    sqlx::query("UPDATE users SET mfa_secret = ?, mfa_last_step = 0 WHERE id = ?").bind(app.secrets.seal_totp(&user_id, &secret)).bind(&user_id).execute(&app.db).await?;
     let url = totp(&secret, &username, &app.config.site_name)?.to_url().map_err(|_| Error::internal())?;
     Ok(Json(json!({ "secret": secret, "url": url, "qr_code": "" })))
 }

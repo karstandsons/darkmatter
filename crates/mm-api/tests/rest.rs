@@ -265,3 +265,16 @@ async fn search_and_threads() {
     assert!(ro.search_posts("t1", "@alice").await.is_ok());
     assert!(matches!(ro.mark_thread_read("t1", "r1", 123).await, Err(Error::ReadOnly(_))));
 }
+
+#[tokio::test]
+async fn change_password_uses_mattermosts_shape() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/users/u1/password"))
+        .and(body_json(json!({ "current_password": "old one", "new_password": "a new one" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "OK" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Client::new(&server.uri()).unwrap().with_token("t").change_password("u1", "old one", "a new one").await.unwrap();
+}

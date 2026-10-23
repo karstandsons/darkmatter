@@ -38,6 +38,7 @@ pub fn router(app: App) -> Router {
         .route("/users/me", get(users::me).delete(accounts::delete_me))
         .route("/users/{id}", delete(accounts::delete))
         .route("/users/{id}/active", put(accounts::put_active))
+        .route("/users/{id}/password", put(accounts::change_password))
         .route("/users/me/blocked", get(safety::blocked))
         .route("/users/me/blocked/{user}", put(safety::block).delete(safety::unblock))
         .route("/reports", post(safety::report).get(safety::reports))

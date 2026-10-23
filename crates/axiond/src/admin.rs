@@ -146,7 +146,7 @@ pub async fn add_user(app: &App, user: NewUser, admin: bool) -> anyhow::Result<S
     if taken > 0 {
         bail!("someone already has that username or email");
     }
-    let hash = auth::hash_password(&user.password)?;
+    let hash = app.passwords.hash(&user.password).await?;
     let (id, now) = (ids::new_id(), ids::now());
     let roles = if admin { "system_admin system_user" } else { "system_user" };
     sqlx::query("INSERT INTO users (id, create_at, update_at, username, email, password_hash, roles) VALUES (?, ?, ?, ?, ?, ?, ?)")
@@ -183,7 +183,7 @@ pub async fn add_user(app: &App, user: NewUser, admin: bool) -> anyhow::Result<S
 /// Sets a new password and signs the person out everywhere.
 pub async fn set_password(app: &App, username: &str, password: &str) -> anyhow::Result<()> {
     auth::check_new_password(password).map_err(anyhow::Error::msg)?;
-    let hash = auth::hash_password(password)?;
+    let hash = app.passwords.hash(password).await?;
     let id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
         .bind(username.trim().to_lowercase())
         .fetch_optional(&app.db)

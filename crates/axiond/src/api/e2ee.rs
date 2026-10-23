@@ -240,16 +240,7 @@ pub struct Reset {
 /// yours is taken out, the old backups go, and the people you talk with are
 /// told your key changed.
 pub async fn reset_identity(State(app): State<App>, me: Me, Json(body): Json<Reset>) -> Result<Json<Value>> {
-    let (username, hash): (String, String) = sqlx::query_as("SELECT username, password_hash FROM users WHERE id = ?").bind(&me.user_id).fetch_one(&app.db).await?;
-    if let Some(wait) = app.guard.locked(&username) {
-        return Err(Error::too_many(format!("Too many wrong passwords. Try again in {} minutes.", wait.as_secs().div_ceil(60))));
-    }
-    let password = body.password;
-    let ok = tokio::task::spawn_blocking(move || auth::verify_password(Some(&hash), &password)).await.map_err(|_| Error::internal())?;
-    if !ok {
-        app.guard.failed(&username);
-        return Err(Error::bad_request("That isn't your password."));
-    }
+    auth::confirm_password(&app, &me.user_id, &body.password, "That isn't your password.").await?;
     let key = IdentityKey::from_slice(&decode("identity key", &body.identity_key)?).map_err(refused)?;
     e2ee::all_devices_gone(&app, &me.user_id).await?;
     sqlx::query("DELETE FROM e2ee_backups WHERE user_id = ?").bind(&me.user_id).execute(&app.db).await?;

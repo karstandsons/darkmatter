@@ -1,6 +1,7 @@
 //! Tidying that runs every hour: files of deleted messages and uploads
 //! never posted are removed from disk (so deleting a message really deletes
-//! its pictures), and expired sessions and used-up invites are forgotten.
+//! its pictures), and expired sessions, used-up invites and old counts of
+//! wrong passwords are forgotten.
 
 use std::time::Duration;
 
@@ -40,10 +41,15 @@ pub async fn run(app: &App) -> anyhow::Result<usize> {
         crate::api::files::remove_stored(app, id).await;
         sqlx::query("DELETE FROM files WHERE id = ?").bind(id).execute(&app.db).await?;
     }
-    let expired: Vec<(String, String)> = sqlx::query_as("DELETE FROM sessions WHERE expires_at < ? RETURNING user_id, device_id").bind(now).fetch_all(&app.db).await?;
+    let expired: Vec<(String, String)> = sqlx::query_as("DELETE FROM sessions WHERE expires_at < ?1 OR create_at < ?1 - ?2 RETURNING user_id, device_id")
+        .bind(now)
+        .bind(crate::auth::SESSION_MAX_DAYS * 86_400_000)
+        .fetch_all(&app.db)
+        .await?;
     for (user, device) in expired {
         crate::e2ee::device_gone(app, &user, &device).await?;
     }
     sqlx::query("DELETE FROM invites WHERE uses_left <= 0 OR expires_at < ?").bind(now).execute(&app.db).await?;
+    crate::auth::forget_old_failures(&app.db).await?;
     Ok(gone.len())
 }

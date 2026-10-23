@@ -25,28 +25,22 @@ pub struct Login {
 /// `POST users/login`: the user, with the session token in the `Token` header.
 pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body): Json<Login>) -> Result<(HeaderMap, Json<User>)> {
     let login = body.login_id.trim();
-    if let Some(wait) = app.guard.locked(login) {
-        let minutes = wait.as_secs().div_ceil(60);
-        return Err(Error::too_many(format!(
-            "Too many wrong passwords for this account. Try again in {minutes} minute{}.",
-            if minutes == 1 { "" } else { "s" }
-        )));
-    }
     let found: Option<(String, String, bool)> = sqlx::query_as(
         "SELECT id, password_hash, mfa_active FROM users WHERE (username = lower(?1) OR lower(email) = lower(?1)) AND delete_at = 0",
     )
     .bind(login)
     .fetch_optional(&app.db)
     .await?;
+    // One count per account, whether it's typed as a username or an email.
+    let key = auth::guard_key(found.as_ref().map(|f| f.0.as_str()), login);
+    if let Some(wait) = auth::locked(&app.db, &key).await? {
+        return Err(auth::locked_error(wait));
+    }
     let mfa = found.as_ref().is_some_and(|f| f.2);
     let (id, hash) = found.map(|(id, hash, _)| (id, hash)).unzip();
-    let password = body.password;
-    // argon2 is deliberately slow: keep it off the async threads.
-    let ok = tokio::task::spawn_blocking(move || auth::verify_password(hash.as_deref(), &password))
-        .await
-        .map_err(|_| Error::internal())?;
+    let ok = app.passwords.verify(hash.clone(), &body.password).await?;
     let Some(id) = id.filter(|_| ok) else {
-        app.guard.failed(login);
+        auth::failed(&app.db, &key).await?;
         return Err(Error {
             status: axum::http::StatusCode::UNAUTHORIZED,
             id: "api.user.login.invalid_credentials_email_username",
@@ -63,7 +57,7 @@ pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body
             });
         }
         if !super::sessions::check_code(&app, &id, &body.token).await? {
-            app.guard.failed(login);
+            auth::failed(&app.db, &key).await?;
             return Err(Error {
                 status: axum::http::StatusCode::UNAUTHORIZED,
                 id: "mfa.validate_token.authenticate.app_error",
@@ -71,7 +65,17 @@ pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body
             });
         }
     }
-    app.guard.succeeded(login);
+    auth::succeeded(&app.db, &key).await?;
+    // A hash from before the cost was tuned (or changed) is redone now that
+    // the password is known.
+    if let Some(old) = hash.filter(|h| app.passwords.outdated(h)) {
+        match app.passwords.hash(&body.password).await {
+            Ok(new) => {
+                sqlx::query("UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?").bind(new).bind(&id).bind(old).execute(&app.db).await?;
+            }
+            Err(e) => tracing::warn!("couldn't hash a password again: {e}"),
+        }
+    }
     let agent: String = request_headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or_default().chars().take(200).collect();
     let token = auth::create_session(&app, &id, body.device_id.trim(), &agent).await?;
     let mut headers = HeaderMap::new();

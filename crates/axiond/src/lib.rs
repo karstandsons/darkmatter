@@ -18,6 +18,7 @@ pub mod housekeeping;
 mod hub;
 mod ids;
 mod limits;
+mod secrets;
 mod tls;
 
 use std::ops::Deref;
@@ -39,7 +40,8 @@ pub struct State {
     hub: hub::Hub,
     e2ee: e2ee::State,
     calls: calls::Calls,
-    guard: auth::Guard,
+    passwords: auth::Passwords,
+    secrets: secrets::SecretKey,
     limiter: limits::Limiter,
 }
 
@@ -56,7 +58,33 @@ impl App {
     pub async fn open(config: Config) -> anyhow::Result<Self> {
         let db = db::open(&config.data_dir).await?;
         let e2ee = e2ee::init(&db).await?;
-        Ok(App(Arc::new(State { config, db, hub: Default::default(), e2ee, calls: Default::default(), guard: Default::default(), limiter: Default::default() })))
+        let secrets = secrets::SecretKey::load_or_create(&config.secret_key_path())?;
+        let sealed = secrets::seal_old_secrets(&db, &secrets).await?;
+        if sealed > 0 {
+            tracing::info!("encrypted {sealed} two-factor secret(s) that were stored in plaintext");
+        }
+        let passwords = auth::Passwords::load(&db).await?;
+        Ok(App(Arc::new(State { config, db, hub: Default::default(), e2ee, calls: Default::default(), passwords, secrets, limiter: Default::default() })))
+    }
+
+    /// Measures this machine and sets the password hashing cost (argon2id)
+    /// so one password takes about a quarter of a second, never below
+    /// OWASP's minimum. Returns the settings chosen. Passwords hashed before
+    /// are hashed again at the new cost the next time they're used.
+    pub async fn tune_passwords(&self) -> anyhow::Result<String> {
+        let params = self.passwords.tune(&self.db, std::time::Duration::from_millis(250)).await?;
+        Ok(auth::show_params(&params))
+    }
+
+    /// Whether `tune_passwords` has been run on this server.
+    pub async fn passwords_tuned(&self) -> anyhow::Result<bool> {
+        Ok(auth::Passwords::tuned(&self.db).await?)
+    }
+
+    /// People whose two-factor secrets the secret key can't open: it isn't
+    /// the key they were encrypted with (a restore without `secret.key`).
+    pub async fn unreadable_two_factor(&self) -> anyhow::Result<Vec<String>> {
+        Ok(secrets::unreadable(&self.db, &self.secrets).await?)
     }
 
     /// Serves the API on `listener` until Ctrl+C or SIGTERM: HTTPS if the

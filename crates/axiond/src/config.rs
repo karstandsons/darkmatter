@@ -14,6 +14,10 @@ pub struct Config {
     pub listen: SocketAddr,
     /// The database and uploaded files.
     pub data_dir: PathBuf,
+    /// The server's secret key, which encrypts two-factor secrets in the
+    /// database (default: `secret.key` in `data_dir`, made on first start).
+    /// Backups leave it out: keep a copy of it somewhere else.
+    pub secret_key_file: Option<PathBuf>,
     /// A TLS proxy (Caddy, Traefik, nginx) is in front.
     pub behind_proxy: bool,
     /// The name apps show for this server.
@@ -61,6 +65,7 @@ impl Default for Config {
         Config {
             listen: SocketAddr::from(([127, 0, 0, 1], 8065)),
             data_dir: PathBuf::from("data"),
+            secret_key_file: None,
             behind_proxy: false,
             site_name: "axiond".into(),
             max_file_mb: 100,
@@ -99,11 +104,15 @@ impl Config {
     }
 
     fn apply_env(&mut self, var: impl Fn(&str) -> Option<String>) -> anyhow::Result<()> {
+        let some = |v: String| (!v.trim().is_empty()).then(|| v.trim().to_string());
         if let Some(v) = var("AXIOND_LISTEN") {
             self.listen = v.parse().with_context(|| format!("AXIOND_LISTEN={v}"))?;
         }
         if let Some(v) = var("AXIOND_DATA_DIR") {
             self.data_dir = v.into();
+        }
+        if let Some(v) = var("AXIOND_SECRET_KEY_FILE") {
+            self.secret_key_file = some(v).map(Into::into);
         }
         if let Some(v) = var("AXIOND_BEHIND_PROXY") {
             self.behind_proxy = matches!(v.as_str(), "1" | "true" | "yes");
@@ -111,7 +120,6 @@ impl Config {
         if let Some(v) = var("AXIOND_SITE_NAME") {
             self.site_name = v;
         }
-        let some = |v: String| (!v.trim().is_empty()).then(|| v.trim().to_string());
         if let Some(v) = var("AXIOND_DOMAIN") {
             self.domain = some(v);
         }
@@ -155,6 +163,11 @@ impl Config {
             self.max_file_mb = v.parse().with_context(|| format!("AXIOND_MAX_FILE_MB={v}"))?;
         }
         Ok(())
+    }
+
+    /// Where the secret key is.
+    pub fn secret_key_path(&self) -> PathBuf {
+        self.secret_key_file.clone().unwrap_or_else(|| self.data_dir.join("secret.key"))
     }
 
     /// How connections are secured.
