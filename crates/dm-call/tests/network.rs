@@ -1,7 +1,8 @@
 //! Calls over a bad network: a proxy between the devices and axiond's SFU
 //! loses packets, delays them by different amounts, or goes dark for a
 //! while. The server tells devices to send to the proxy
-//! (`calls_public_port`), which forwards to the SFU.
+//! (`calls_public_port`), which forwards to the SFU; media over TCP goes
+//! through another (`calls_public_tcp_port`), which can go dark too.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -27,8 +28,10 @@ struct Weather {
     loss_per_mille: AtomicU32,
     /// Up to this many ms of delay, different for each packet.
     jitter_ms: AtomicU32,
-    /// Nothing gets through.
+    /// No UDP gets through.
     dark: AtomicBool,
+    /// No media over TCP gets through (the connections stay open).
+    tcp_dark: AtomicBool,
 }
 
 impl Weather {
@@ -87,6 +90,35 @@ async fn proxy(front: Arc<UdpSocket>, sfu: SocketAddr, weather: Arc<Weather>) {
     }
 }
 
+/// Forwards media over TCP between devices (on `front`) and the server's
+/// HTTP port (`server`), whole packets (RFC 4571 framing) at a time, so
+/// that while it's dark they're dropped, not cut.
+async fn tcp_proxy(front: tokio::net::TcpListener, server: SocketAddr, weather: Arc<Weather>) {
+    while let Ok((device, _)) = front.accept().await {
+        let Ok(up) = tokio::net::TcpStream::connect(server).await else { continue };
+        let ((dr, dw), (ur, uw)) = (device.into_split(), up.into_split());
+        tokio::spawn(frames(dr, uw, weather.clone()));
+        tokio::spawn(frames(ur, dw, weather.clone()));
+    }
+}
+
+async fn frames(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp::OwnedWriteHalf, weather: Arc<Weather>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 2 + u16::MAX as usize];
+    loop {
+        if from.read_exact(&mut buf[..2]).await.is_err() {
+            return;
+        }
+        let n = 2 + u16::from_be_bytes([buf[0], buf[1]]) as usize;
+        if from.read_exact(&mut buf[2..n]).await.is_err() {
+            return;
+        }
+        if !weather.tcp_dark.load(Ordering::Relaxed) && to.write_all(&buf[..n]).await.is_err() {
+            return;
+        }
+    }
+}
+
 struct Server {
     url: String,
     weather: Arc<Weather>,
@@ -100,16 +132,25 @@ async fn server() -> Server {
     // The SFU's port, and the proxy's in front of it.
     let sfu = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
     let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let config = Config { data_dir: dir.path().into(), calls_udp: Some(sfu), calls_public_port: Some(front.local_addr().unwrap().port()), ..Config::default() };
+    let tcp_front = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config {
+        data_dir: dir.path().into(),
+        calls_udp: Some(sfu),
+        calls_public_port: Some(front.local_addr().unwrap().port()),
+        calls_public_tcp_port: Some(tcp_front.local_addr().unwrap().port()),
+        ..Config::default()
+    };
     let app = App::open(config).await.unwrap();
     let user = |name: &str| NewUser { username: name.into(), email: format!("{name}@example.com"), password: PASSWORD.into() };
     admin::setup(&app, user("alice"), "home", "Home").await.unwrap();
     admin::add_user(&app, user("bob"), false).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
+    let http = listener.local_addr().unwrap();
+    let url = format!("http://{http}");
     tokio::spawn(app.clone().serve(listener));
     let weather = Arc::new(Weather::default());
     tokio::spawn(proxy(front, sfu, weather.clone()));
+    tokio::spawn(tcp_proxy(tcp_front, http, weather.clone()));
     Server { url, weather, _app: app, _dir: dir }
 }
 
@@ -134,6 +175,18 @@ async fn call(s: &Server) -> (Call, Call, String, String) {
     (a, b, alice_id, bob_id)
 }
 
+/// Waits until `user` is heard: the call is up, before the weather changes.
+/// Up to 15 s, for a busy machine.
+async fn clear_first(updates: &mut UnboundedReceiver<Update>, user: &str) {
+    let until = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < until {
+        if heard(updates, user, Duration::from_millis(500)).await.0 > 0 {
+            return;
+        }
+    }
+    panic!("{user} never heard while the network was clear");
+}
+
 /// Of the level reports in `wait`, how many have `user` audible, and the
 /// rest of what came.
 async fn heard(updates: &mut UnboundedReceiver<Update>, user: &str, wait: Duration) -> (u32, Vec<Update>) {
@@ -154,7 +207,7 @@ async fn sound_and_pictures_get_through_a_lossy_network() {
     let s = server().await;
     let (a, b, alice_id, _) = call(&s).await;
     let mut updates = b.updates().unwrap();
-    assert!(heard(&mut updates, &alice_id, Duration::from_secs(5)).await.0 > 0, "clear first");
+    clear_first(&mut updates, &alice_id).await;
 
     // 5% lost each way, up to 40 ms of jitter.
     s.weather.loss_per_mille.store(50, Ordering::Relaxed);
@@ -172,14 +225,22 @@ async fn a_call_comes_back_after_the_network_goes_dark() {
     let s = server().await;
     let (a, b, alice_id, _) = call(&s).await;
     let mut updates = b.updates().unwrap();
-    assert!(heard(&mut updates, &alice_id, Duration::from_secs(5)).await.0 > 0);
+    clear_first(&mut updates, &alice_id).await;
 
-    // 8 s of nothing, then back: the same call carries on, by itself.
+    // 8 s of nothing (UDP and TCP), then back: the same call carries on,
+    // by itself.
     s.weather.dark.store(true, Ordering::Relaxed);
-    let (n, during) = heard(&mut updates, &alice_id, Duration::from_secs(8)).await;
-    assert!(n <= 2, "heard alice {n} times in the dark");
+    s.weather.tcp_dark.store(true, Ordering::Relaxed);
+    // What had arrived plays out first (late, on a busy machine).
+    let (_, mut during) = heard(&mut updates, &alice_id, Duration::from_secs(2)).await;
+    let (n, rest) = heard(&mut updates, &alice_id, Duration::from_secs(6)).await;
+    during.extend(rest);
+    assert!(n == 0, "heard alice {n} times in the dark");
     assert!(during.contains(&Update::Reconnecting), "{during:?}");
+    // Nothing arriving is total loss, not none.
+    assert!(during.iter().any(|u| matches!(u, Update::Quality { loss, .. } if *loss == 1.0)), "{during:?}");
     s.weather.dark.store(false, Ordering::Relaxed);
+    s.weather.tcp_dark.store(false, Ordering::Relaxed);
     let back = Instant::now();
     let (n, after) = heard(&mut updates, &alice_id, Duration::from_secs(10)).await;
     assert!(n > 10, "alice heard in {n} reports after; {after:?}");
@@ -196,7 +257,7 @@ async fn a_weak_connection_shows_in_its_quality() {
     let mut updates = b.updates().unwrap();
     // Connected and carrying sound first: quality is measured on what
     // arrives, so a call still setting up has nothing to report.
-    assert!(heard(&mut updates, &alice_id, Duration::from_secs(5)).await.0 > 0, "clear first");
+    clear_first(&mut updates, &alice_id).await;
     s.weather.loss_per_mille.store(200, Ordering::Relaxed);
     let until = Instant::now() + Duration::from_secs(10);
     let mut worst = 0f32;
@@ -223,4 +284,94 @@ async fn a_call_gets_through_where_no_udp_does() {
     let picture = b.pictures().get(&alice_id).cloned().expect("alice's picture");
     assert!(picture.at.elapsed() < Duration::from_secs(1), "her picture keeps coming");
     drop(a);
+}
+
+/// One device in a call, as Darkmatter has it.
+struct Device {
+    client: Client,
+    pitch: f32,
+    leaf: u32,
+    call: Call,
+    updates: UnboundedReceiver<Update>,
+}
+
+impl Device {
+    /// Joins `channel`'s call, with the keys of `epoch`.
+    async fn join(client: Client, channel: &str, pitch: f32, leaf: u32, epoch: u64) -> Self {
+        let (call, _) = Call::join(&Media::new(), &client, channel, Mic::Tone(pitch)).await.unwrap();
+        call.set_keys(epoch, &[epoch as u8 + 1; 16], leaf, MEMBERS);
+        let updates = call.updates().unwrap();
+        Device { client, pitch, leaf, call, updates }
+    }
+
+    /// Joins again, as Darkmatter does when a call fails.
+    async fn rejoin(&mut self, channel: &str, epoch: u64) {
+        let client = self.client.clone();
+        *self = Device::join(client, channel, self.pitch, self.leaf, epoch).await;
+    }
+
+    /// Whether `user` is heard in the next second, and whether the call
+    /// failed meanwhile.
+    async fn hears(&mut self, user: &str) -> (bool, bool) {
+        let (n, other) = heard(&mut self.updates, user, Duration::from_secs(1)).await;
+        (n > 0, other.iter().any(|u| matches!(u, Update::Failed(_))))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_moves_to_tcp_when_udp_stops() {
+    let s = server().await;
+    let (alice, bob) = (login(&s, "alice").await, login(&s, "bob").await);
+    let (alice_id, bob_id) = (alice.me().await.unwrap().id, bob.me().await.unwrap().id);
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let mut a = Device::join(alice, &town, 440.0, 0, 0).await;
+    let mut b = Device::join(bob, &town, 660.0, 1, 0).await;
+    clear_first(&mut b.updates, &alice_id).await;
+
+    // UDP stops mid-call (a firewall change, a captive portal) while TCP to
+    // the server still works. libwebrtc moves to TCP by itself only if it
+    // kept its TCP path (it drops paths it doesn't need while UDP works);
+    // otherwise the call fails (libwebrtc, or the watchdog when it calls a
+    // dead connection up), and joining again, as Darkmatter does, goes
+    // over TCP. Either way both hear each other again.
+    s.weather.dark.store(true, Ordering::Relaxed);
+    let dark = Instant::now();
+    // What was already on its way plays out first.
+    let _ = heard(&mut b.updates, &alice_id, Duration::from_secs(2)).await;
+    let (mut epoch, mut both) = (0, 0);
+    while both < 3 {
+        assert!(dark.elapsed() < Duration::from_secs(45), "not back over TCP");
+        let ((b_hears, b_failed), (a_hears, a_failed)) = tokio::join!(b.hears(&alice_id), a.hears(&bob_id));
+        both = if a_hears && b_hears { both + 1 } else { 0 };
+        if a_failed || b_failed {
+            // A new epoch, as a call's group gives one when someone joins:
+            // a device joining again starts its frames' counters over.
+            epoch += 1;
+            println!("{:?}: joining again (alice {a_failed}, bob {b_failed})", dark.elapsed());
+            for (d, failed) in [(&mut a, a_failed), (&mut b, b_failed)] {
+                if failed {
+                    d.rejoin(&town, epoch).await;
+                } else {
+                    d.call.set_keys(epoch, &[epoch as u8 + 1; 16], d.leaf, MEMBERS);
+                }
+            }
+        }
+    }
+    println!("back over TCP after {:?}", dark.elapsed());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_alone_in_a_call_isnt_taken_for_a_dead_one() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    // Nobody else sends: only the server's reports on what she sends tell
+    // the watchdog the connection carries anything.
+    let mut a = Device::join(alice, &town, 440.0, 0, 0).await;
+    let (_, seen) = heard(&mut a.updates, "nobody", Duration::from_secs(12)).await;
+    assert!(seen.contains(&Update::Connected), "{seen:?}");
+    assert!(!seen.iter().any(|u| matches!(u, Update::Reconnecting | Update::Failed(_))), "{seen:?}");
+    assert!(seen.iter().all(|u| !matches!(u, Update::Quality { loss, .. } if *loss > 0.0)), "{seen:?}");
 }

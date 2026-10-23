@@ -28,7 +28,9 @@ The release workflow uses each version's section here as its release notes.
   have; everyone sees the same code on the call bar. Pick your microphone, speaker and camera
   under Devices. A call that drops (a new network, a blip) comes back by
   itself, and calls get through networks that block UDP (over the
-  server's HTTPS port).
+  server's HTTPS port), also when UDP stops in the middle of one. A call
+  that carries nothing for a few seconds shows as reconnecting, and joins
+  again if it stays that way; the weak-connection badge shows it too.
 
 ## [0.5.0] - 2026-10-21
 
