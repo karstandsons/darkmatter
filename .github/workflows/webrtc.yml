@@ -1,4 +1,4 @@
-# Builds libwebrtc without H.264, H.265 or FFmpeg (dev/build-webrtc.sh) and
+# Builds libwebrtc without H.264 or FFmpeg (dev/build-webrtc.sh) and
 # uploads it to the webrtc-89d790b-free release, where dev/fetch-webrtc.sh
 # finds it. Run by hand only: a macOS build takes an hour or two, and macOS
 # minutes count ten times on a private repository. Linux ones can be built

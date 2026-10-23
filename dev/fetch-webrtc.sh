@@ -5,7 +5,7 @@
 # an unchecked copy itself. Needed to build dm-call (calls).
 #
 # Our own builds (tag webrtc-89d790b-free, made by dev/build-webrtc.sh):
-# libwebrtc without H.264, H.265 or FFmpeg. Where there isn't one yet, LiveKit's
+# libwebrtc without H.264 or FFmpeg. Where there isn't one yet, LiveKit's
 # prebuilt, which links FFmpeg and OpenH264: fine for tests, never for a
 # release (dev/check-webrtc-licence.sh refuses it).
 set -euo pipefail
