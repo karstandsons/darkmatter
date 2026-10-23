@@ -36,6 +36,20 @@ the four added files back and redo the small edits to `build.rs`,
 tests check that nothing is sent without keys and that a device without an
 epoch's keys hears nothing.
 
+## A video sender's transformer, let go off its queue
+
+libwebrtc's `RTPSenderVideoFrameTransformerDelegate` (only there when a
+frame transformer is, as ours is) owns a task queue and posts each
+transformed frame to it holding a reference to itself. If the call closes
+while one is queued, that task holds the last reference, and the delegate
+is destroyed on its own queue: the queue's destructor joins its own
+thread, `pthread_join` fails with EDEADLK, and the process aborts ("Fatal
+error in: ../rtc_base/platform_thread.cc, line 181", "last system error:
+1", which is a stale EPERM: every libwebrtc thread fails to set a
+realtime priority as it starts). So `rust_frame_transformer.cpp` keeps the
+reference a video sender's delegate gives back when it unregisters, and a
+thread of its own lets go of it once nothing else holds it.
+
 ## str0m following a call's latest path
 
 axiond's SFU (str0m) is ICE-lite and controlled: the device's libwebrtc
