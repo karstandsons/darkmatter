@@ -3152,7 +3152,9 @@ impl Chat {
                 if mine == "offline" {
                     *mine = "online".into();
                 }
-                resend
+                // Calls may have ended or changed while we were away (the
+                // server may have restarted, forgetting them): ours too.
+                Task::batch([resend, self.load_calls()])
             }
             M::Disconnected => {
                 self.online = false;
