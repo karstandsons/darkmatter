@@ -102,10 +102,7 @@ pub fn save(server: &str, layout: &Saved) -> Result<(), String> {
     let mut file = read();
     file.servers.insert(server.to_string(), layout.clone());
     let text = toml::to_string(&file).map_err(|e| e.to_string())?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, text).map_err(|e| e.to_string())
+    crate::session::write_private(&path, text.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Forgets a server's layout (its account was removed).
@@ -115,7 +112,7 @@ pub fn forget(server: &str) {
     if file.servers.remove(server).is_some()
         && let Ok(text) = toml::to_string(&file)
     {
-        let _ = std::fs::write(path, text);
+        let _ = crate::session::write_private(&path, text.as_bytes());
     }
 }
 
