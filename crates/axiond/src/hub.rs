@@ -183,6 +183,14 @@ impl Hub {
         self.inner.lock().unwrap().conns.values().any(|c| c.user_id == user_id && c.live.is_some())
     }
 
+    /// The sessions with a connection, open or resumable.
+    pub fn session_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.inner.lock().unwrap().conns.values().map(|c| c.session_id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     /// A session ended: close its sockets and forget their events.
     pub fn end_session(&self, session_id: &str) {
         self.inner.lock().unwrap().conns.retain(|_, c| c.session_id != session_id);
