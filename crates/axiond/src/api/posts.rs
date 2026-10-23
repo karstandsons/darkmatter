@@ -57,7 +57,7 @@ pub const ENCRYPTED_PLACEHOLDER: &str = "🔒 Encrypted message";
 /// Checks an encrypted post's `dm_e2ee` and keeps only what's meant for the
 /// server (docs/axiond/E2EE.md §6): it must be MLS ciphertext for the
 /// group's current epoch (or one of the few before), with no plaintext
-/// beside it, and not while the server's removals have waited too long.
+/// beside it, and not for an epoch a removed device can still read.
 async fn encrypted_props(app: &App, channel_id: &str, message: &str, props: &Value) -> Result<Value> {
     if !message.trim().is_empty() {
         return Err(Error::bad_request("This conversation is end-to-end encrypted: send from an app that encrypts (Darkmatter)."));
@@ -73,8 +73,8 @@ async fn encrypted_props(app: &App, channel_id: &str, message: &str, props: &Val
 
 /// Checks MLS ciphertext (`{v, epoch, ct}`) for an encrypted channel: from
 /// the group's current epoch or one of the few before, not too long, and
-/// not while the server's removals have waited too long. Returns just those
-/// fields.
+/// not for an epoch the server proposed a removal in (or before). Returns
+/// just those fields.
 pub async fn ciphertext(app: &App, channel_id: &str, e2ee: &Value, max: usize) -> Result<Value> {
     let (Some(1), Some(epoch), Some(ct)) = (e2ee["v"].as_u64(), e2ee["epoch"].as_u64(), e2ee["ct"].as_str()) else {
         return Err(Error::bad_request("This conversation is end-to-end encrypted: the message must be too."));
@@ -87,15 +87,16 @@ pub async fn ciphertext(app: &App, channel_id: &str, e2ee: &Value, max: usize) -
     if epoch > current || epoch + (dm_crypto::PAST_EPOCHS as u64) <= current {
         return Err(Error::conflict("The conversation's keys changed: catch up and send again."));
     }
-    // The server's removals must be committed before anyone sends for long:
-    // after a short grace, a removed device mustn't keep receiving.
-    let last: Option<(String, i64)> = sqlx::query_as("SELECT kind, create_at FROM e2ee_handshakes WHERE channel_id = ? ORDER BY seq DESC LIMIT 1")
+    // The server's removals: nothing is taken for the epoch a removal was
+    // proposed in, or any before it, since the removed device has those
+    // keys. While one waits for its commit nobody can send; once committed,
+    // only the new epochs are taken.
+    let removed_in: Option<i64> = sqlx::query_scalar("SELECT MAX(epoch) FROM e2ee_handshakes WHERE channel_id = ? AND kind = 'proposal'")
         .bind(channel_id)
-        .fetch_optional(&app.db)
+        .fetch_one(&app.db)
         .await?;
-    if let Some((kind, at)) = last
-        && kind == "proposal"
-        && ids::now() - at > REMOVAL_GRACE_MS
+    if let Some(removed_in) = removed_in
+        && epoch <= removed_in as u64
     {
         return Err(Error::conflict("Someone left this conversation: catch up and send again."));
     }
@@ -137,9 +138,6 @@ const MAX_PREVIEW_IMAGE: usize = 96 * 1024;
 
 /// The largest ciphertext (base64) a post may carry.
 const MAX_CIPHERTEXT: usize = 128 * 1024;
-/// How long the server's removal proposals may wait for a commit before
-/// sending is refused.
-const REMOVAL_GRACE_MS: i64 = 30_000;
 
 pub async fn create(State(app): State<App>, me: Me, Json(body): Json<Create>) -> Result<(StatusCode, Json<Post>)> {
     if app.limiter.take(&format!("post {}", me.user_id), crate::limits::POSTS).is_err() {
