@@ -15,6 +15,8 @@ The release workflow uses each version's section here as its release notes.
 - **Recovery:** Account → Recovery makes a recovery key, or uses a
   passphrase, so losing every device doesn't mean starting over. A new
   device can recover from it, or start over with your password.
+- **Change your password** in Account → Password (Mattermost and axiond).
+  axiond signs your other apps out when you do.
 - Encryption is marked **beta** until it's been reviewed more.
 - **Link previews:** a message's first link shows a card (site, title, a
   few lines, a picture). Mattermost makes its own; with axiond your app

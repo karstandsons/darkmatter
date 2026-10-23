@@ -29,7 +29,7 @@ refreshes its own key weekly and after a day away.
 | Someone on the network | Sees TLS only. |
 | The server's operator, its host, or someone who took it over, reading | Gets ciphertext. They can't decrypt messages, files, edits or reactions. |
 | The same, *acting*: adding devices, swapping keys, moving or replaying messages | See [A malicious server](#a-malicious-server). |
-| A stolen copy of the server's database or backups | Ciphertext, argon2id password hashes, hashed session tokens, and the identity key backups, which need the recovery key or passphrase. |
+| A stolen copy of the server's database or backups | Ciphertext, argon2id password hashes (tuned to the machine at setup), hashed session tokens, two-factor secrets encrypted under `secret.key` (which backups leave out), and the identity key backups, which need the recovery key or passphrase. |
 | A stolen copy of a device's files | Darkmatter's local database (decrypted messages, MLS state, search index) is SQLCipher, under a key in the system keychain. A copy of the files alone is unreadable. |
 | Someone removed from a conversation | Reads nothing sent after: they're removed from the group before anything else is sent. |
 | Someone who left a call | Hears at most the next second: a new epoch begins as they leave, and senders switch to its keys a second later. |
