@@ -16,6 +16,18 @@ The release workflow uses each version's section here as its release notes.
   passphrase, so losing every device doesn't mean starting over. A new
   device can recover from it, or start over with your password.
 - Encryption is marked **beta** until it's been reviewed more.
+- **Link previews:** a message's first link shows a card (site, title, a
+  few lines, a picture). Mattermost makes its own; with axiond your app
+  makes it as you send, so nobody reading it fetches anything, and in an
+  encrypted conversation the preview is encrypted with the message.
+  `[privacy] link_previews = false` turns it off.
+- **Calls (axiond, beta):** 📞 in a channel's title bar (or `/call`)
+  starts a call or joins the one going on; direct and group messages ring.
+  Voice, video for up to 5 people, and screen sharing, end-to-end
+  encrypted with keys only the devices in the call have; everyone sees the
+  same code on the call bar. Pick your microphone, speaker and camera
+  under Devices. A call that drops (a new network, a blip) comes back by
+  itself.
 
 ## [0.5.0] - 2026-10-21
 
