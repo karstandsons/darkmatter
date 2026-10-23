@@ -98,6 +98,7 @@ Settings live in `axiond.toml` (in the working directory, or pass
 | `backup_keep` | `AXIOND_BACKUP_KEEP` | `7` | How many of those to keep |
 | `calls_udp` | `AXIOND_CALLS_UDP` | a free port on `listen`'s address | The one UDP port call media uses, e.g. `0.0.0.0:443` |
 | `calls_public_ip` | `AXIOND_CALLS_PUBLIC_IP` | | The address devices send call media to. Needed when `calls_udp` is `0.0.0.0` (calls are off without it) |
+| `calls_public_port` | `AXIOND_CALLS_PUBLIC_PORT` | the bound port | The port devices send call media to, when it's forwarded to another |
 
 ### HTTPS
 

@@ -30,15 +30,17 @@ pub enum Cmd {
 }
 
 /// Runs until the registry goes away. `gone` hears of every device that
-/// left, however it left.
-pub fn run(socket: UdpSocket, rx: Receiver<Cmd>, gone: UnboundedSender<u64>) {
+/// left, however it left. `candidate` is the address devices send to: what
+/// each packet arrived at, as far as str0m is concerned, though the socket
+/// may be bound to another (0.0.0.0, or a port forwarded to this one).
+pub fn run(socket: UdpSocket, candidate: SocketAddr, rx: Receiver<Cmd>, gone: UnboundedSender<u64>) {
     let mut clients: Vec<Client> = vec![];
     let mut queue: VecDeque<Propagated> = VecDeque::new();
     // Which device a source address belongs to, so a packet isn't offered
     // to every device in turn.
     let mut by_addr: HashMap<SocketAddr, ClientId> = HashMap::new();
     let mut buf = vec![0; 2000];
-    let local = socket.local_addr().expect("a bound socket");
+    let local = candidate;
 
     loop {
         loop {
@@ -119,6 +121,10 @@ pub fn run(socket: UdpSocket, rx: Receiver<Cmd>, gone: UnboundedSender<u64>) {
         for client in clients.iter_mut().filter(|c| c.timeout <= now) {
             client.handle_input(Input::Timeout(now));
             client.dirty = true;
+        }
+        for client in clients.iter_mut().filter(|c| c.quiet_since.is_some_and(|t| now - t > GRACE)) {
+            debug!("client {} quiet for {GRACE:?}: dropped", client.id.0);
+            client.rtc.disconnect();
         }
     }
 }
@@ -204,7 +210,13 @@ struct Client {
     dirty: bool,
     /// When it next needs `Input::Timeout`.
     timeout: Instant,
+    /// Its connection went quiet then; it's dropped after [`GRACE`].
+    quiet_since: Option<Instant>,
 }
+
+/// How long a device that went quiet is kept in its call, for it to come
+/// back, after str0m has waited ~15 s to call it gone.
+pub const GRACE: Duration = Duration::from_secs(10);
 
 impl Client {
     fn new(id: u64, user: String, room: String, rtc: Rtc) -> Client {
@@ -220,6 +232,7 @@ impl Client {
             chosen_rid: None,
             dirty: true,
             timeout: Instant::now(),
+            quiet_since: None,
         }
     }
 
@@ -245,8 +258,14 @@ impl Client {
             }
             Ok(Output::Timeout(t)) => Propagated::Timeout(t),
             Ok(Output::Event(e)) => match e {
+                // Gone quiet: kept a while, since a blip or a new network
+                // usually brings it back (from the same or a new address).
                 Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
-                    self.rtc.disconnect();
+                    self.quiet_since.get_or_insert_with(Instant::now);
+                    Propagated::Noop
+                }
+                Event::IceConnectionStateChange(IceConnectionState::Connected | IceConnectionState::Completed) => {
+                    self.quiet_since = None;
                     Propagated::Noop
                 }
                 Event::MediaAdded(e) => self.handle_media_added(e.mid, e.kind),

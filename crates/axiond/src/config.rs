@@ -47,6 +47,9 @@ pub struct Config {
     /// The address devices send call media to, when `calls_udp` is
     /// `0.0.0.0` or behind NAT: this server's public IP.
     pub calls_public_ip: Option<IpAddr>,
+    /// The port devices send call media to, if it isn't the one bound
+    /// (a forwarded port).
+    pub calls_public_port: Option<u16>,
 }
 
 impl Default for Config {
@@ -68,6 +71,7 @@ impl Default for Config {
             backup_keep: 7,
             calls_udp: None,
             calls_public_ip: None,
+            calls_public_port: None,
         }
     }
 }
@@ -135,6 +139,9 @@ impl Config {
         }
         if let Some(v) = var("AXIOND_CALLS_PUBLIC_IP") {
             self.calls_public_ip = some(v).map(|v| v.parse().with_context(|| format!("AXIOND_CALLS_PUBLIC_IP={v}"))).transpose()?;
+        }
+        if let Some(v) = var("AXIOND_CALLS_PUBLIC_PORT") {
+            self.calls_public_port = some(v).map(|v| v.parse().with_context(|| format!("AXIOND_CALLS_PUBLIC_PORT={v}"))).transpose()?;
         }
         if let Some(v) = var("AXIOND_MAX_FILE_MB") {
             self.max_file_mb = v.parse().with_context(|| format!("AXIOND_MAX_FILE_MB={v}"))?;

@@ -195,6 +195,9 @@ pub enum Update {
     /// This device's screen share ended by itself (stopped in the system,
     /// or the picker cancelled).
     ShareEnded,
+    /// How the connection is doing, every 2 s: the share of incoming sound
+    /// lost in that time (0.0–1.0), and the round trip to the server.
+    Quality { loss: f32, rtt_ms: u32 },
 }
 
 /// This device in a channel's call. Cheap to clone.
@@ -339,6 +342,33 @@ impl Call {
             loop {
                 tick.tick().await;
                 if fresh.fresh.swap(false, Ordering::Relaxed) && notify.send(Update::Video).is_err() {
+                    break;
+                }
+            }
+        }));
+        // The connection's quality, from libwebrtc's statistics.
+        let (stats_pc, quality) = (pc.clone(), tx.clone());
+        tasks.push(handle.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            let mut before = (0u64, 0i64);
+            loop {
+                tick.tick().await;
+                let Ok(stats) = stats_pc.get_stats().await else { continue };
+                let (mut received, mut lost, mut rtt) = (0u64, 0i64, 0f64);
+                for s in &stats {
+                    match s {
+                        libwebrtc::stats::RtcStats::InboundRtp(i) if i.stream.kind == "audio" => {
+                            received += i.received.packets_received;
+                            lost += i.received.packets_lost.max(0);
+                        }
+                        libwebrtc::stats::RtcStats::CandidatePair(p) if p.candidate_pair.nominated => rtt = rtt.max(p.candidate_pair.current_round_trip_time),
+                        _ => {}
+                    }
+                }
+                let (dr, dl) = (received.saturating_sub(before.0), (lost - before.1).max(0) as u64);
+                before = (received, lost);
+                let loss = if dr + dl == 0 { 0.0 } else { dl as f32 / (dr + dl) as f32 };
+                if quality.send(Update::Quality { loss, rtt_ms: (rtt * 1000.0) as u32 }).is_err() {
                     break;
                 }
             }

@@ -602,6 +602,8 @@ pub struct Call {
 #[serde(default)]
 pub struct CallParticipant {
     pub user_id: String,
+    /// Which of their devices: a call moves with them to another.
+    pub device_id: String,
     pub joined_at: i64,
 }
 

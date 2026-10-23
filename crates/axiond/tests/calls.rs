@@ -27,9 +27,15 @@ struct Server {
 }
 
 async fn server() -> Server {
+    server_with(|_| {}).await
+}
+
+async fn server_with(change: impl FnOnce(&mut Config)) -> Server {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let dir = tempfile::tempdir().unwrap();
-    let app = App::open(Config { data_dir: dir.path().into(), ..Config::default() }).await.unwrap();
+    let mut config = Config { data_dir: dir.path().into(), ..Config::default() };
+    change(&mut config);
+    let app = App::open(config).await.unwrap();
     let user = |name: &str| NewUser { username: name.into(), email: format!("{name}@example.com"), password: PASSWORD.into() };
     admin::setup(&app, user("alice"), "home", "Home").await.unwrap();
     admin::add_user(&app, user("bob"), false).await.unwrap();
@@ -289,4 +295,21 @@ async fn a_device_that_goes_quiet_is_dropped() {
     }
     assert_eq!(in_call(&alice, &town).await, vec![alice_id]);
     println!("dropped after {:?}", left.elapsed());
+}
+
+/// As on a server: the SFU bound to every address, telling devices its
+/// public one. (str0m must see packets as arriving at the public address.)
+#[tokio::test]
+async fn media_flows_when_bound_to_every_address() {
+    let s = server_with(|c| {
+        c.calls_udp = Some("0.0.0.0:0".parse().unwrap());
+        c.calls_public_ip = Some("127.0.0.1".parse().unwrap());
+    })
+    .await;
+    let alice = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let town = town_square(&alice).await;
+    let (a, _) = Phone::dial(&alice, &town, b'a').await.unwrap();
+    let (b, _) = Phone::dial(&bob, &town, b'b').await.unwrap();
+    assert!(a.hears(b'b').await && b.hears(b'a').await);
 }

@@ -45,6 +45,8 @@ pub enum Msg {
     Share,
     /// The call's group has a new handshake: catch up.
     Sync(String),
+    /// Join again after dropping: the channel, and which try this is.
+    Rejoin(String, u32),
     /// The call's keys, new or changed (`None`: unchanged).
     Keys(Result<Option<dm_crypto::call::Keys>, String>),
 }
@@ -56,9 +58,9 @@ pub struct Joined {
     call: dm_call::Call,
     channel_id: String,
     info: CallInfo,
-    /// Joined again after the connection failed.
+    /// How many times in a row it's been joined again after dropping.
     #[cfg_attr(not(feature = "calls"), allow(dead_code))]
-    rejoined: bool,
+    attempt: u32,
 }
 
 impl std::fmt::Debug for Joined {
@@ -92,9 +94,10 @@ pub struct Active {
     pub since: Instant,
     /// How loud each person is now (0.0–1.0).
     pub levels: HashMap<String, f32>,
-    /// Joined again once after the connection failed: the next failure ends it.
+    /// How many times in a row it's been joined again after dropping
+    /// (back to 0 once connected).
     #[cfg_attr(not(feature = "calls"), allow(dead_code))]
-    rejoined: bool,
+    attempt: u32,
     #[cfg_attr(not(feature = "calls"), allow(dead_code))]
     pub call_id: String,
     /// The code everyone in the call sees the same, once encrypted.
@@ -105,6 +108,8 @@ pub struct Active {
     pub camera: bool,
     /// This device is sharing a screen.
     pub sharing: bool,
+    /// The connection is weak (much lost, or a long round trip), lately.
+    pub weak: bool,
     /// Everyone's latest picture as an image, made once per picture (not
     /// on every redraw): when it came, and the image.
     pub pictures: HashMap<String, (Instant, iced::widget::image::Handle)>,
@@ -160,9 +165,14 @@ static CURRENT: std::sync::Mutex<Option<dm_call::Media>> = std::sync::Mutex::new
 
 pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
     match msg {
-        Msg::Join(channel_id) => join(chat, channel_id, false),
+        Msg::Join(channel_id) => join(chat, channel_id, 0),
+        Msg::Rejoin(channel_id, attempt) => match &chat.call {
+            // Still the call it was for (not left meanwhile).
+            Some(a) if a.channel_id == channel_id => join(chat, channel_id, attempt),
+            _ => Task::none(),
+        },
         Msg::Accept => match chat.ringing.take() {
-            Some(r) => join(chat, r.channel_id, false),
+            Some(r) => join(chat, r.channel_id, 0),
             None => Task::none(),
         },
         Msg::Decline => {
@@ -189,12 +199,13 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
                     muted: false,
                     since: Instant::now(),
                     levels: HashMap::new(),
-                    rejoined: joined.rejoined,
+                    attempt: joined.attempt,
                     devices: None,
                     call_id: joined.info.id.clone(),
                     code: None,
                     camera: false,
                     sharing: false,
+                    weak: false,
                     pictures: HashMap::new(),
                 });
                 match updates {
@@ -211,6 +222,14 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
                 Task::none()
             }
         }
+        // Joining again failed (the server down, say): another try, later.
+        Msg::Joined(Err(e)) if chat.call.is_some() => {
+            tracing::warn!("joining the call again: {e}");
+            if let Some(a) = &mut chat.call {
+                a.attempt += 1;
+            }
+            rejoin(chat)
+        }
         Msg::Joined(Err(e)) => {
             chat.error = Some(format!("Couldn't join the call: {e}"));
             Task::none()
@@ -219,19 +238,17 @@ pub fn update(chat: &mut Chat, msg: Msg) -> Task<Message> {
         Msg::Update(u) => {
             let Some(active) = &mut chat.call else { return Task::none() };
             match u {
-                dm_call::Update::Connected => active.link = Link::Connected,
-                dm_call::Update::Reconnecting => active.link = Link::Reconnecting,
-                // Once, join again from scratch; then give up.
-                dm_call::Update::Failed(e) if !active.rejoined => {
-                    tracing::warn!("the call dropped ({e}); joining again");
-                    let channel = active.channel_id.clone();
-                    return join(chat, channel, true);
+                dm_call::Update::Connected => {
+                    active.link = Link::Connected;
+                    active.attempt = 0;
                 }
+                dm_call::Update::Reconnecting => active.link = Link::Reconnecting,
                 dm_call::Update::Failed(e) => {
-                    chat.error = Some(format!("The call dropped: {e}"));
-                    return leave(chat);
+                    tracing::warn!("the call dropped: {e}");
+                    return rejoin(chat);
                 }
                 dm_call::Update::Levels(levels) => active.levels = levels.into_iter().collect(),
+                dm_call::Update::Quality { loss, rtt_ms } => active.weak = loss > 0.05 || rtt_ms > 400,
                 dm_call::Update::ShareEnded => {
                     active.sharing = false;
                     chat.notice = Some("Your screen share ended.".into());
@@ -358,7 +375,27 @@ fn devices() -> (Vec<String>, Vec<String>, Vec<String>) {
     (Vec::new(), Vec::new(), Vec::new())
 }
 
-fn join(chat: &mut Chat, channel_id: String, rejoined: bool) -> Task<Message> {
+/// How many times in a row a dropped call is joined again before giving up.
+const REJOINS: u32 = 5;
+
+/// The call dropped (its connection failed, or the server took this device
+/// out): join again after a while, longer each time, up to [`REJOINS`].
+fn rejoin(chat: &mut Chat) -> Task<Message> {
+    let Some(active) = &mut chat.call else { return Task::none() };
+    if active.attempt >= REJOINS {
+        chat.error = Some("The call dropped and couldn't be joined again.".into());
+        return leave(chat);
+    }
+    active.link = Link::Reconnecting;
+    let (channel, attempt) = (active.channel_id.clone(), active.attempt + 1);
+    let wait = Duration::from_secs(1 << (attempt - 1));
+    Task::perform(tokio::time::sleep(wait), move |_| Message::Call(Msg::Rejoin(channel.clone(), attempt)))
+}
+
+/// Joins `channel_id`'s call: `attempt` 0 is joining, more is joining again
+/// after dropping.
+fn join(chat: &mut Chat, channel_id: String, attempt: u32) -> Task<Message> {
+    let rejoined = attempt > 0;
     if !available(chat) {
         chat.error = Some("This build of Darkmatter can't make calls yet.".into());
         return Task::none();
@@ -395,7 +432,7 @@ fn join(chat: &mut Chat, channel_id: String, rejoined: bool) -> Task<Message> {
         let joining = Task::perform(
             async move {
                 let (call, info) = dm_call::Call::join(&media, &client, &channel_id, mic).await.map_err(|e| e.to_string())?;
-                Ok(Joined { call, channel_id, info, rejoined })
+                Ok(Joined { call, channel_id, info, attempt })
             },
             |r| Message::Call(Msg::Joined(r)),
         );
@@ -468,11 +505,23 @@ pub fn updated(chat: &mut Chat, u: CallUpdate) -> Task<Message> {
     if chat.ringing.as_ref().is_some_and(|r| r.channel_id == u.channel_id) && u.call.as_ref().is_none_or(mine) {
         chat.ringing = None;
     }
-    if chat.call.as_ref().is_some_and(|a| a.channel_id == u.channel_id) && !u.call.as_ref().is_some_and(mine) {
-        // Answered on another device, or the connection dropped: done here.
-        chat.notice = Some("You're out of the call here: it moved to another of your devices, or the connection dropped.".into());
-        let _ = end(chat);
-        return Task::none();
+    if chat.call.as_ref().is_some_and(|a| a.channel_id == u.channel_id) {
+        let device = chat.crypto.as_ref().map(|c| c.device.device_id.clone()).unwrap_or_default();
+        let here = |c: &CallInfo| c.participants.iter().any(|p| p.user_id == me && p.device_id == device);
+        let elsewhere = |c: &CallInfo| c.participants.iter().any(|p| p.user_id == me && p.device_id != device);
+        match &u.call {
+            Some(c) if here(c) => {}
+            // Answered on another device: done here.
+            Some(c) if elsewhere(c) => {
+                chat.notice = Some("The call moved to another of your devices.".into());
+                let _ = end(chat);
+                return Task::none();
+            }
+            // The server took this device out (its connection went quiet):
+            // join again, unless it's already doing so.
+            _ if chat.call.as_ref().is_some_and(|a| a.link == Link::Connected) => return rejoin(chat),
+            _ => {}
+        }
     }
     let personal = chat.store.channels.get(&u.channel_id).is_some_and(|c| matches!(c.kind, mm_api::models::ChannelType::Direct | mm_api::models::ChannelType::Group));
     let calling = u.call.as_ref().filter(|c| u.started && personal && c.owner_id != me && available(chat));
@@ -566,6 +615,7 @@ pub fn bar<'a>(chat: &'a Chat, c: Colors) -> Option<Element<'a, Message>> {
         Link::Connecting => ("connecting…".to_string(), c.yellow),
         Link::Reconnecting => ("reconnecting…".to_string(), c.yellow),
         Link::Connected if active.code.is_none() => ("securing…".to_string(), c.yellow),
+        Link::Connected if active.weak => (format!("{}:{:02} · weak connection", secs / 60, secs % 60), c.yellow),
         Link::Connected => (format!("{}:{:02}", secs / 60, secs % 60), c.green),
     };
     let title = row![text("🔊").size(13), text(channel).size(13).font(bold()).color(c.fg_bright), text(state).size(12).color(color)].spacing(6).align_y(iced::Center);
@@ -637,7 +687,7 @@ mod tests {
             id: "call1".into(),
             channel_id: "d1".into(),
             owner_id: owner.into(),
-            participants: who.iter().map(|u| CallParticipant { user_id: u.to_string(), joined_at: 1 }).collect(),
+            participants: who.iter().map(|u| CallParticipant { user_id: u.to_string(), device_id: String::new(), joined_at: 1 }).collect(),
             ..Default::default()
         }
     }

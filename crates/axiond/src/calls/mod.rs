@@ -70,7 +70,7 @@ impl Call {
             channel_id: self.channel_id.clone(),
             start_at: self.start_at,
             owner_id: self.owner_id.clone(),
-            participants: self.members.iter().map(|m| CallParticipant { user_id: m.user_id.clone(), joined_at: m.joined_at }).collect(),
+            participants: self.members.iter().map(|m| CallParticipant { user_id: m.user_id.clone(), device_id: m.device_id.clone(), joined_at: m.joined_at }).collect(),
         }
     }
 }
@@ -90,12 +90,12 @@ pub async fn start(app: &App) -> anyhow::Result<()> {
         }
         None => bound.ip(),
     };
-    let candidate = SocketAddr::new(ip, bound.port());
+    let candidate = SocketAddr::new(ip, app.config.calls_public_port.unwrap_or(bound.port()));
     let _ = app.calls.rows.set(group::server_rows(app).await?);
     str0m::crypto::from_feature_flags().install_process_default();
     let (tx, rx) = mpsc::channel();
     let (gone_tx, mut gone_rx) = tokio::sync::mpsc::unbounded_channel();
-    std::thread::Builder::new().name("sfu".into()).spawn(move || sfu::run(socket, rx, gone_tx))?;
+    std::thread::Builder::new().name("sfu".into()).spawn(move || sfu::run(socket, candidate, rx, gone_tx))?;
     if app.calls.sfu.set(Sfu { tx: Mutex::new(tx), candidate }).is_err() {
         anyhow::bail!("calls started twice");
     }
