@@ -1856,10 +1856,17 @@ pub(crate) fn bootstrap(session: Session, account: String) -> Task<Message> {
 /// throw away this device's encryption state.
 async fn open_vault(server: &str, user_id: &str, out: &mut iced::futures::channel::mpsc::Sender<Message>) -> Option<std::sync::Arc<crate::vault::Vault>> {
     let mut delay = Duration::from_secs(2);
+    let mut waited = false;
     loop {
         match crate::vault::Vault::open_account(server, user_id).await {
-            Ok(v) => return Some(std::sync::Arc::new(v)),
+            Ok(v) => {
+                if waited {
+                    tracing::info!("the keyring answered; opened the local database");
+                }
+                return Some(std::sync::Arc::new(v));
+            }
             Err(crate::vault::Unopened::Wait(why)) => {
+                waited = true;
                 tracing::warn!("can't open the local database yet: {why}");
                 let _ = out.send(Message::BootstrapWaiting(format!("Waiting for the system keyring, which holds this account's encryption key: {why}. Unlock it and Darkmatter carries on."))).await;
                 tokio::time::sleep(delay).await;

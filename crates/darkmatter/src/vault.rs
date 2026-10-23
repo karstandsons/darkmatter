@@ -176,17 +176,45 @@ pub(crate) trait KeyStore: Sync {
 /// The system keyring: Secret Service on Linux, Keychain on macOS.
 pub(crate) struct Keyring;
 
+impl Keyring {
+    fn entry(account: &str) -> Result<keyring_core::Entry, keyring::Error> {
+        // `keyring` starts the store once and keeps a failure for good, so a
+        // keyring that wasn't up yet (at login, say) is started again here.
+        if keyring::Entry::store_status().is_err() && keyring_core::get_default_store().is_none() {
+            restart_store()?;
+        }
+        keyring_core::Entry::new(KEYRING_SERVICE, account)
+    }
+}
+
+/// Connects to the system keyring afresh.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn restart_store() -> keyring::Result<()> {
+    keyring_core::set_default_store(zbus_secret_service_keyring_store::Store::new()?);
+    Ok(())
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn restart_store() -> keyring::Result<()> {
+    Err(keyring::Error::NoDefaultStore)
+}
+
 impl KeyStore for Keyring {
     fn get(&self, account: &str) -> Result<Option<String>, String> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(keyring_trouble)?;
-        match entry.get_password() {
+        match Keyring::entry(account).and_then(|e| e.get_password()) {
             Ok(key) => Ok(Some(key)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(keyring_trouble(e)),
+            Err(e) => {
+                // Its connection may be what's broken (the keyring restarted).
+                if matches!(e, keyring::Error::PlatformFailure(_)) {
+                    let _ = restart_store();
+                }
+                Err(keyring_trouble(e))
+            }
         }
     }
     fn set(&self, account: &str, key: &str) -> Result<(), String> {
-        keyring::Entry::new(KEYRING_SERVICE, account).map_err(keyring_trouble)?.set_password(key).map_err(keyring_trouble)
+        Keyring::entry(account).and_then(|e| e.set_password(key)).map_err(keyring_trouble)
     }
 }
 
