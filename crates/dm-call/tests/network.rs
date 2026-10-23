@@ -192,8 +192,11 @@ async fn a_call_comes_back_after_the_network_goes_dark() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_weak_connection_shows_in_its_quality() {
     let s = server().await;
-    let (a, b, _, _) = call(&s).await;
+    let (a, b, alice_id, _) = call(&s).await;
     let mut updates = b.updates().unwrap();
+    // Connected and carrying sound first: quality is measured on what
+    // arrives, so a call still setting up has nothing to report.
+    assert!(heard(&mut updates, &alice_id, Duration::from_secs(5)).await.0 > 0, "clear first");
     s.weather.loss_per_mille.store(200, Ordering::Relaxed);
     let until = Instant::now() + Duration::from_secs(10);
     let mut worst = 0f32;
