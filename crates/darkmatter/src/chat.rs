@@ -94,7 +94,8 @@ pub fn completing(input: &str) -> Option<(Completing, usize, &str)> {
     if input.starts_with('/') {
         return (slash(input) == Slash::Command).then_some((Completing::Command, 0, input));
     }
-    let from = input.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+    // After the last space, which may be more than a byte (a no-break space).
+    let from = input.char_indices().rfind(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
     let word = &input[from..];
     if word.starts_with('@') {
         return Some((Completing::Mention, from, word));
@@ -1293,29 +1294,30 @@ impl Chat {
         Task::perform(async move { crate::link_preview::fetch(&target).await.ok() }, move |p| Message::LinkPreview(url.clone(), p))
     }
 
-    /// `post` with its link's preview, if one's ready; if not, fetches it
-    /// first (as long as [`crate::link_preview::TIMEOUT`]) and sends after,
-    /// as `Err` of the task doing so.
-    fn with_preview(&mut self, mut post: NewPost) -> Result<NewPost, Task<Message>> {
-        if !self.makes_previews() {
-            return Ok(post);
-        }
-        let Some(url) = crate::link_preview::first_link(&post.message) else { return Ok(post) };
-        match self.previews.get(&url) {
-            Some(Some(p)) => {
-                attach_preview(&mut post, p.clone());
-                Ok(post)
+    /// Puts `post` in the outbox and sends it, with its link's preview if
+    /// one's ready. If not, it waits there (kept, like any other) while the
+    /// preview is fetched (as long as [`crate::link_preview::TIMEOUT`]).
+    fn queue(&mut self, mut post: NewPost) -> Task<Message> {
+        let url = self.makes_previews().then(|| crate::link_preview::first_link(&post.message)).flatten();
+        match url.as_ref().map(|url| self.previews.get(url)) {
+            Some(None) => {
+                let (url, id) = (url.unwrap_or_default(), post.pending_post_id.clone());
+                self.outbox.hold(post);
+                return Task::perform(
+                    async move {
+                        // Its own task: if fetching panics, the message still goes.
+                        let fetch = tokio::time::timeout(crate::link_preview::TIMEOUT, async move { crate::link_preview::fetch(&url).await });
+                        tokio::spawn(fetch).await.ok().and_then(Result::ok).and_then(Result::ok)
+                    },
+                    move |p| Message::Previewed(id.clone(), p),
+                );
             }
+            Some(Some(Some(p))) => attach_preview(&mut post, p.clone()),
             // Fetched (or fetching) and nothing to show: don't wait.
-            Some(None) => Ok(post),
-            None => Err(Task::perform(
-                async move {
-                    let p = tokio::time::timeout(crate::link_preview::TIMEOUT, crate::link_preview::fetch(&url)).await.ok().and_then(Result::ok);
-                    (Box::new(post), p)
-                },
-                |(post, p)| Message::Previewed(post, p),
-            )),
+            Some(Some(None)) | None => {}
         }
+        self.outbox.push(post);
+        self.flush()
     }
 
     /// The finished uploads for the composer with draft key `key`: the ids
@@ -2011,14 +2013,13 @@ impl Chat {
                 self.previews.insert(url, preview);
                 Task::none()
             }
-            Message::Previewed(post, preview) => {
-                let mut post = *post;
-                if let Some(p) = preview {
-                    attach_preview(&mut post, p);
-                }
-                let thread = !post.root_id.is_empty();
-                self.outbox.push(post);
-                Task::batch([self.flush(), if thread { to_latest(THREAD) } else { to_latest(self.pv().timeline()) }])
+            Message::Previewed(id, preview) => {
+                let released = self.outbox.release(&id, |post| {
+                    if let Some(p) = preview {
+                        attach_preview(post, p);
+                    }
+                });
+                if released { self.flush() } else { Task::none() }
             }
             Message::Send if self.editing.as_ref().is_some_and(|e| e.key == self.pv().channel) => self.save_edit(),
             Message::SendReply if self.editing.as_ref().is_some_and(|e| Some(&e.key) == self.pv().thread.as_ref().map(|r| thread_key(r)).as_ref()) => {
@@ -2067,13 +2068,7 @@ impl Chat {
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
                     ..Default::default()
                 };
-                match self.with_preview(post) {
-                    Ok(post) => {
-                        self.outbox.push(post);
-                        Task::batch([self.flush(), to_latest(self.pv().timeline())])
-                    }
-                    Err(waiting) => waiting,
-                }
+                Task::batch([self.queue(post), to_latest(self.pv().timeline())])
             }
             Message::Delivered(id, Ok(post)) => {
                 self.outbox.remove(&id);
@@ -2443,13 +2438,7 @@ impl Chat {
                     root_id: root,
                     pending_post_id: format!("{}:{}", self.store.me.id, chrono::Utc::now().timestamp_millis()),
                 };
-                match self.with_preview(post) {
-                    Ok(post) => {
-                        self.outbox.push(post);
-                        Task::batch([self.flush(), to_latest(THREAD)])
-                    }
-                    Err(waiting) => waiting,
-                }
+                Task::batch([self.queue(post), to_latest(THREAD)])
             }
             Message::Media(key, result) => {
                 self.media.loaded(key, result);
@@ -4061,5 +4050,73 @@ pub(crate) mod tests {
         let _ = chat.update(key("j"));
         assert!(selected(&chat).is_none());
     }
-}
 
+    /// Every Unicode space, and other characters of more than one byte.
+    const WIDE: &[char] = &[
+        '\u{a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}',
+        '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}', '\u{85}', '\u{200b}', '\u{feff}', 'é', 'ß', '中', '😀', '👍', '\u{301}',
+    ];
+
+    #[test]
+    fn a_wide_space_before_a_word_is_still_a_space() {
+        for &w in WIDE.iter().filter(|c| c.is_whitespace()) {
+            let mention = format!("hi{w}@bo");
+            assert_eq!(completing(&mention), Some((Completing::Mention, 2 + w.len_utf8(), "@bo")), "{w:?}");
+            assert_eq!(completing(&format!("nice{w}:ro")).map(|(k, _, word)| (k, word)), Some((Completing::Emoji, ":ro")), "{w:?}");
+            assert_eq!(completing(&format!("hi @bob{w}")), None, "{w:?}");
+        }
+    }
+
+    /// Random drafts of spaces of every kind, multi-byte characters and the
+    /// characters the composer looks at, through everything that reads a
+    /// draft as it's typed and sent: none of it may panic.
+    #[test]
+    fn no_draft_breaks_the_composer() {
+        let pieces: Vec<String> = WIDE
+            .iter()
+            .map(char::to_string)
+            .chain(["@", ":", "/", "//", "`", "```", "\n", " ", "a", "bo", "ro", ":rocket:", "&#", ";", "<", ">", "\"", "(", "https://", "x.example/", "-", "_", "."].map(String::from))
+            .collect();
+        // xorshift: the same drafts every run.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut chat = chat();
+        chat.axiond = Some(Default::default());
+        for _ in 0..3000 {
+            let draft: String = (0..next(12)).map(|_| pieces[next(pieces.len())].as_str()).collect();
+            let _ = completing(&draft);
+            let _ = (slash(&draft), in_code(&draft), commands::parse_slash(&draft), commands::complete_slash(&draft));
+            let _ = (crate::text::prepare(&draft), crate::text::emojify(&draft), crate::text::emoji_only(&draft));
+            let _ = (dm_client::mention_names(&draft), crate::vault::fts_query(&draft), crate::link_preview::first_link(&draft));
+            let _ = crate::link_preview::from_html("https://x.example/", &format!("<head><meta{draft}><title>{draft}</title><{draft}</head>"));
+            // Typing it letter by letter, then sending it.
+            for (end, _) in draft.char_indices().skip(1) {
+                let _ = chat.handle(Message::Draft(draft[..end].to_string()));
+            }
+            let _ = chat.handle(Message::Draft(draft.clone()));
+            let _ = chat.handle(Message::Send);
+        }
+    }
+
+    #[test]
+    fn a_message_is_kept_while_its_link_preview_is_fetched() {
+        let mut chat = chat();
+        chat.axiond = Some(Default::default());
+        let _ = chat.handle(Message::Draft("look https://slow.example/page".into()));
+        let _ = chat.handle(Message::Send);
+        // In the outbox (and so in the vault) before the site answers.
+        assert_eq!(chat.outbox.items.len(), 1);
+        assert!(chat.outbox.due().is_empty(), "waits for its preview");
+        let id = chat.outbox.items[0].post.pending_post_id.clone();
+        let preview = dm_crypto::wire::LinkPreview { url: "https://slow.example/page".into(), title: "Slow".into(), ..Default::default() };
+        let _ = chat.handle(Message::Previewed(id, Some(preview)));
+        let q = &chat.outbox.items[0];
+        assert!(q.in_flight, "goes once it's there");
+        assert_eq!(q.post.props[dm_client::PREVIEW_PROP]["title"], "Slow");
+    }
+}
