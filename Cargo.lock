@@ -1953,6 +1953,7 @@ dependencies = [
  "iced_runtime",
  "image",
  "keyring",
+ "keyring-core",
  "libsqlite3-sys",
  "mm-api",
  "notify-rust",
@@ -1972,6 +1973,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+ "zbus-secret-service-keyring-store",
 ]
 
 [[package]]
