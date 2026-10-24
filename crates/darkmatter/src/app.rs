@@ -67,7 +67,8 @@ pub struct App {
 }
 
 enum Screen {
-    Loading,
+    /// Signing in; with why it's taking a while, if it's waiting on something.
+    Loading(Option<String>),
     Login(LoginForm),
     Chat(Box<Chat>),
 }
@@ -150,6 +151,8 @@ pub enum Message {
     /// Switch between signing in and making an account with an invite.
     LoginInvite(bool),
     LoggedIn(Result<(Session, User), (String, bool)>),
+    /// Signing in is waiting on something (a locked keyring): why.
+    BootstrapWaiting(String),
     Bootstrapped(Result<Box<Bootstrap>, String>),
     SessionFailed(String),
     SelectTeam(String),
@@ -416,7 +419,7 @@ impl App {
             let screen = match session {
                 Some(s) => {
                     tasks.push(bootstrap(s, a.id.clone()).map(move |m| m.to(key)));
-                    Screen::Loading
+                    Screen::Loading(None)
                 }
                 None => Screen::Login(LoginForm { server: a.server.clone(), ..Default::default() }),
             };
@@ -605,7 +608,7 @@ impl App {
                 Task::batch([seen, Task::done(Message::FocusComposer.to(key))])
             }
             Screen::Login(_) => operation::focus(LOGIN_FIRST),
-            Screen::Loading => Task::none(),
+            Screen::Loading(_) => Task::none(),
         }
     }
 
@@ -670,7 +673,7 @@ impl App {
         tasks.push(match &self.servers[self.active].screen {
             Screen::Chat(_) => Task::done(Message::FocusComposer.to(self.servers[self.active].key)),
             Screen::Login(_) => operation::focus(LOGIN_FIRST),
-            Screen::Loading => Task::none(),
+            Screen::Loading(_) => Task::none(),
         });
         Task::batch(tasks)
     }
@@ -867,7 +870,7 @@ impl App {
             .map(|(i, s)| {
                 let saved = self.accounts.get(&s.id);
                 let (state, mentions, unread, encrypted) = match &s.screen {
-                    Screen::Loading => (State::Connecting, 0, false, false),
+                    Screen::Loading(_) => (State::Connecting, 0, false, false),
                     Screen::Login(form) if form.back.is_some() => (State::New, 0, false, false),
                     Screen::Login(_) => (State::SignedOut, 0, false, false),
                     Screen::Chat(chat) => {
@@ -1461,6 +1464,15 @@ impl App {
                     }
                 }
             }
+            Message::BootstrapWaiting(why) => {
+                match self.screen() {
+                    Screen::Loading(waiting) => *waiting = Some(why),
+                    Screen::Login(form) => form.error = Some(why),
+                    // Already in (a resync): it carries on when it can.
+                    Screen::Chat(_) => {}
+                }
+                Task::none()
+            }
             Message::Bootstrapped(Err(e)) => self.handle(Message::SessionFailed(e)),
             Message::Bootstrapped(Ok(b)) if !self.ephemeral && self.accounts.get(&b.account).is_some_and(|a| a.user.is_empty()) => {
                 // Signed in for the first time: remember who (it finds the
@@ -1701,7 +1713,8 @@ impl App {
         let shown = &self.servers[self.active];
         let key = shown.key;
         let body: Element<'_, Message> = match &shown.screen {
-            Screen::Loading => center(text("Connecting…").color(c.muted)).into(),
+            Screen::Loading(None) => center(text("Connecting…").color(c.muted)).into(),
+            Screen::Loading(Some(why)) => center(column![text("Connecting…").color(c.muted), text(why.as_str())].spacing(8).align_x(iced::Center).max_width(480)).into(),
             Screen::Login(form) => form.view(c),
             Screen::Chat(chat) => chat.view(c, &self.iced_theme),
         };
@@ -1807,8 +1820,8 @@ fn ws_events((key, session): &(u64, Session)) -> impl iced::futures::Stream<Item
 
 /// Load everything the sidebar needs in one go.
 pub(crate) fn bootstrap(session: Session, account: String) -> Task<Message> {
-    Task::perform(
-        async move {
+    let stream = iced::stream::channel(1, async move |mut out: iced::futures::channel::mpsc::Sender<Message>| {
+        let loaded = async {
             let client = session.client().map_err(err)?;
             let me = client.me().await.map_err(err)?;
             let teams = client.my_teams().await.map_err(err)?;
@@ -1835,13 +1848,7 @@ pub(crate) fn bootstrap(session: Session, account: String) -> Task<Message> {
             let blocked = if axiond.is_some() { client.blocked().await.unwrap_or_default() } else { Vec::new() };
             // The encrypted local database. Without it Darkmatter still works,
             // but unsent messages live only in memory and encryption is off.
-            let vault = match crate::vault::Vault::open_account(&session.server, &me.id).await {
-                Ok(v) => Some(std::sync::Arc::new(v)),
-                Err(e) => {
-                    tracing::error!("couldn't open the local database: {e}");
-                    None
-                }
-            };
+            let vault = open_vault(&session.server, &me.id, &mut out).await;
             let (outbox, crypto_status, crypto, linking) = match &vault {
                 Some(v) => {
                     let mut outbox = v.outbox().await;
@@ -1873,9 +1880,40 @@ pub(crate) fn bootstrap(session: Session, account: String) -> Task<Message> {
                 }
             };
             Ok(Box::new(Bootstrap { session, account, me, teams, channels, members, users, server_config, axiond, blocked, vault, outbox, crypto_status, crypto, linking }))
-        },
-        Message::Bootstrapped,
-    )
+        };
+        let loaded = loaded.await;
+        let _ = out.send(Message::Bootstrapped(loaded)).await;
+    });
+    Task::run(stream, std::convert::identity)
+}
+
+/// The account's vault. While its key can't be read (a keyring locked at
+/// login, say), it waits and tries again, saying why: a new key would
+/// throw away this device's encryption state.
+async fn open_vault(server: &str, user_id: &str, out: &mut iced::futures::channel::mpsc::Sender<Message>) -> Option<std::sync::Arc<crate::vault::Vault>> {
+    let mut delay = Duration::from_secs(2);
+    let mut waited = false;
+    loop {
+        match crate::vault::Vault::open_account(server, user_id).await {
+            Ok(v) => {
+                if waited {
+                    tracing::info!("the keyring answered; opened the local database");
+                }
+                return Some(std::sync::Arc::new(v));
+            }
+            Err(crate::vault::Unopened::Wait(why)) => {
+                waited = true;
+                tracing::warn!("can't open the local database yet: {why}");
+                let _ = out.send(Message::BootstrapWaiting(format!("Waiting for the system keyring, which holds this account's encryption key: {why}. Unlock it and Darkmatter carries on."))).await;
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+            Err(e) => {
+                tracing::error!("couldn't open the local database: {e}");
+                return None;
+            }
+        }
+    }
 }
 
 impl LoginField {

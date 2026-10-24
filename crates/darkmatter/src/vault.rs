@@ -163,38 +163,134 @@ fn unhex(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// The account's database key: from the keyring, else the 0600 file beside
-/// the database; made the first time.
-fn key_for(account: &str, path: &Path) -> Result<[u8; 32], String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| tracing::warn!("keyring unavailable: {e}")).ok();
-    if let Some(key) = entry.as_ref().and_then(|e| e.get_password().ok()).and_then(|k| unhex(&k)) {
-        return Ok(key);
-    }
-    let file = path.with_extension("key");
-    if let Some(key) = std::fs::read_to_string(&file).ok().and_then(|k| unhex(&k)) {
-        return Ok(key);
-    }
-    let mut key = [0u8; 32];
-    getrandom::fill(&mut key).map_err(|e| format!("no randomness: {e}"))?;
-    match entry.map(|e| e.set_password(&hex(&key))) {
-        Some(Ok(())) => {}
-        other => {
-            tracing::warn!("no system keyring ({other:?}); keeping the database key in {} (mode 0600)", file.display());
-            write_private(&file, hex(&key).as_bytes()).map_err(|e| format!("saving the database key: {e}"))?;
-        }
-    }
-    Ok(key)
+/// Where the database keys are kept: the system keyring, or a stand-in in
+/// tests.
+pub(crate) trait KeyStore: Sync {
+    /// The account's saved key. `Ok(None)` only when the store says for sure
+    /// it has none; anything else it can't answer (locked, not responding)
+    /// is an error, as a key may well be in there.
+    fn get(&self, account: &str) -> Result<Option<String>, String>;
+    fn set(&self, account: &str, key: &str) -> Result<(), String>;
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+/// The system keyring: Secret Service on Linux, Keychain on macOS.
+pub(crate) struct Keyring;
+
+impl Keyring {
+    fn entry(account: &str) -> Result<keyring_core::Entry, keyring::Error> {
+        // `keyring` starts the store once and keeps a failure for good, so a
+        // keyring that wasn't up yet (at login, say) is started again here.
+        if keyring::Entry::store_status().is_err() && keyring_core::get_default_store().is_none() {
+            restart_store()?;
+        }
+        keyring_core::Entry::new(KEYRING_SERVICE, account)
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    std::io::Write::write_all(&mut options.open(path)?, bytes)
+}
+
+/// Connects to the system keyring afresh.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn restart_store() -> keyring::Result<()> {
+    keyring_core::set_default_store(zbus_secret_service_keyring_store::Store::new()?);
+    Ok(())
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn restart_store() -> keyring::Result<()> {
+    Err(keyring::Error::NoDefaultStore)
+}
+
+impl KeyStore for Keyring {
+    fn get(&self, account: &str) -> Result<Option<String>, String> {
+        match Keyring::entry(account).and_then(|e| e.get_password()) {
+            Ok(key) => Ok(Some(key)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => {
+                // Its connection may be what's broken (the keyring restarted).
+                if matches!(e, keyring::Error::PlatformFailure(_)) {
+                    let _ = restart_store();
+                }
+                Err(keyring_trouble(e))
+            }
+        }
+    }
+    fn set(&self, account: &str, key: &str) -> Result<(), String> {
+        Keyring::entry(account).and_then(|e| e.set_password(key)).map_err(keyring_trouble)
+    }
+}
+
+/// What's wrong with the keyring, for the person waiting on it.
+fn keyring_trouble(e: keyring::Error) -> String {
+    match e {
+        keyring::Error::NoStorageAccess(e) => format!("the system keyring is locked ({e})"),
+        keyring::Error::PlatformFailure(e) => format!("the system keyring isn't answering ({e})"),
+        keyring::Error::NoDefaultStore => "there's no system keyring".into(),
+        e => format!("the system keyring failed ({e})"),
+    }
+}
+
+/// Why a vault didn't open.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unopened {
+    /// Its key can't be read now (the keyring is locked, or not answering).
+    /// Nothing was changed: try again later.
+    Wait(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for Unopened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unopened::Wait(why) | Unopened::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+struct Key {
+    bytes: [u8; 32],
+    /// Why the keyring couldn't vouch for it: it came from the file beside
+    /// the database while the keyring couldn't be read.
+    unsure: Option<String>,
+}
+
+/// The account's database key: from the keyring, else the 0600 file beside
+/// the database; made the first time. A new key is made only when the
+/// keyring says for sure it has none, or there's no vault yet to lose.
+fn key_for(account: &str, path: &Path, store: &dyn KeyStore) -> Result<Key, Unopened> {
+    let file = path.with_extension("key");
+    let from_file = || std::fs::read_to_string(&file).ok().and_then(|k| unhex(&k));
+    match store.get(account) {
+        Ok(Some(key)) => {
+            let bytes = unhex(&key).ok_or_else(|| Unopened::Failed("the database key in the keyring is malformed".into()))?;
+            return Ok(Key { bytes, unsure: None });
+        }
+        Ok(None) => {
+            if let Some(bytes) = from_file() {
+                return Ok(Key { bytes, unsure: None });
+            }
+        }
+        Err(why) => {
+            if let Some(bytes) = from_file() {
+                return Ok(Key { bytes, unsure: Some(why) });
+            }
+            // Its key is most likely in the keyring: a new one would lose it.
+            if path.exists() {
+                return Err(Unopened::Wait(why));
+            }
+            tracing::warn!("{why}; making the key for a new database");
+        }
+    }
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| Unopened::Failed(format!("no randomness: {e}")))?;
+    if let Err(e) = store.set(account, &hex(&bytes)) {
+        tracing::warn!("{e}; keeping the database key in {} (mode 0600)", file.display());
+        crate::session::write_private(&file, hex(&bytes).as_bytes()).map_err(|e| Unopened::Failed(format!("saving the database key: {e}")))?;
+    }
+    Ok(Key { bytes, unsure: None })
+}
+
+/// The error SQLCipher gives for the wrong key ("file is not a database").
+fn wrong_key(e: &sqlx::Error) -> bool {
+    e.as_database_error().and_then(|e| e.code()).as_deref() == Some("26")
 }
 
 /// Deletes an account's vault and its key, for good (the account was
@@ -211,21 +307,32 @@ pub fn delete_account(server: &str, user_id: &str) {
 
 impl Vault {
     /// Opens (or makes) the vault for an account on a server.
-    pub async fn open_account(server: &str, user_id: &str) -> Result<Vault, String> {
-        let path = path_for(server, user_id).ok_or("no data directory")?;
-        let key = key_for(&format!("{server}|{user_id}"), &path)?;
-        match Vault::open(&path, &key).await {
+    pub async fn open_account(server: &str, user_id: &str) -> Result<Vault, Unopened> {
+        let path = path_for(server, user_id).ok_or_else(|| Unopened::Failed("no data directory".into()))?;
+        Vault::open_keyed(&path, &format!("{server}|{user_id}"), &Keyring).await
+    }
+
+    async fn open_keyed(path: &Path, account: &str, store: &dyn KeyStore) -> Result<Vault, Unopened> {
+        let key = key_for(account, path, store)?;
+        match Vault::open(path, &key.bytes).await {
             Ok(v) => Ok(v),
+            // The file beside it had the wrong key; the keyring may have the
+            // right one once it can be read.
+            Err(e) if wrong_key(&e) && key.unsure.is_some() => {
+                tracing::warn!("the database key in the file doesn't open {} ({e})", path.display());
+                Err(Unopened::Wait(key.unsure.unwrap_or_default()))
+            }
             // The key that opens it is gone (a new keyring, say). Keep the old
             // file aside and start again: this device's encryption state is
             // lost with it, and it signs in as a new device.
-            Err(e) if path.exists() => {
+            Err(e) if wrong_key(&e) => {
                 let aside = path.with_extension(format!("unreadable-{}", chrono::Utc::now().timestamp()));
                 tracing::warn!("can't open {} ({e}); moving it to {}", path.display(), aside.display());
-                std::fs::rename(&path, &aside).map_err(|e| e.to_string())?;
-                Vault::open(&path, &key).await.map_err(|e| e.to_string())
+                std::fs::rename(path, &aside).map_err(|e| Unopened::Failed(e.to_string()))?;
+                Vault::open(path, &key.bytes).await.map_err(|e| Unopened::Failed(e.to_string()))
             }
-            Err(e) => Err(e.to_string()),
+            // Anything else (a full disk, say) leaves it as it is.
+            Err(e) => Err(Unopened::Failed(e.to_string())),
         }
     }
 
@@ -447,6 +554,177 @@ mod tests {
             "queued_at": 1,
         }))
         .unwrap()
+    }
+
+    /// A stand-in keyring: its entries, and what's wrong with it, if anything.
+    #[derive(Default)]
+    struct Ring {
+        keys: std::sync::Mutex<HashMap<String, String>>,
+        trouble: std::sync::Mutex<Option<String>>,
+    }
+
+    impl Ring {
+        fn trouble(&self, why: Option<&str>) {
+            *self.trouble.lock().unwrap() = why.map(str::to_string);
+        }
+        fn key(&self) -> Option<String> {
+            self.keys.lock().unwrap().get("acct").cloned()
+        }
+    }
+
+    impl KeyStore for Ring {
+        fn get(&self, account: &str) -> Result<Option<String>, String> {
+            match self.trouble.lock().unwrap().clone() {
+                Some(why) => Err(why),
+                None => Ok(self.keys.lock().unwrap().get(account).cloned()),
+            }
+        }
+        fn set(&self, account: &str, key: &str) -> Result<(), String> {
+            match self.trouble.lock().unwrap().clone() {
+                Some(why) => Err(why),
+                None => {
+                    self.keys.lock().unwrap().insert(account.into(), key.into());
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    async fn open(path: &Path, ring: &Ring) -> Result<Vault, Unopened> {
+        Vault::open_keyed(path, "acct", ring).await
+    }
+
+    /// Opens, checks the device id kept in it, and closes.
+    async fn device_id(path: &Path, ring: &Ring) -> Result<Option<Vec<u8>>, Unopened> {
+        let v = open(path, ring).await?;
+        let id = v.get("device.id").await;
+        v.pool.close().await;
+        Ok(id)
+    }
+
+    async fn made_with_device(path: &Path, ring: &Ring) {
+        let v = open(path, ring).await.unwrap();
+        v.writer().set("device.id", "d1");
+        v.writer().flush().await;
+        v.pool.close().await;
+    }
+
+    /// Everything in the folder that holds data, by name. SQLite's shared
+    /// memory index and an empty log come and go with connections (a failed
+    /// open, one still closing), so they're left out.
+    fn files(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir).unwrap().filter_map(|e| {
+            let e = e.unwrap();
+            let name = e.file_name().into_string().unwrap();
+            let bytes = std::fs::read(e.path()).ok()?;
+            let scratch = name.ends_with("-shm") || (name.ends_with("-wal") && bytes.is_empty());
+            (!scratch).then_some((name, bytes))
+        }).collect()
+    }
+
+    #[tokio::test]
+    async fn the_first_open_makes_a_key_in_the_keyring() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.db");
+        let ring = Ring::default();
+        made_with_device(&path, &ring).await;
+        assert!(ring.key().is_some());
+        assert!(!path.with_extension("key").exists(), "no key file while there's a keyring");
+        assert_eq!(device_id(&path, &ring).await, Ok(Some(b"d1".to_vec())), "the same key opens it again");
+    }
+
+    #[tokio::test]
+    async fn a_locked_or_silent_keyring_is_waited_for() {
+        for why in ["the system keyring is locked", "the system keyring isn't answering (D-Bus timeout)"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("v.db");
+            let ring = Ring::default();
+            made_with_device(&path, &ring).await;
+            let key = ring.key();
+            let before = files(dir.path());
+            ring.trouble(Some(why));
+            for _ in 0..3 {
+                assert_eq!(open(&path, &ring).await.unwrap_err(), Unopened::Wait(why.into()));
+            }
+            assert_eq!(files(dir.path()), before, "{why}: nothing made, moved or changed");
+            ring.trouble(None);
+            assert_eq!(ring.key(), key);
+            assert_eq!(device_id(&path, &ring).await, Ok(Some(b"d1".to_vec())), "{why}: all there once it answers");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_keyring_sure_it_has_no_key_starts_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.db");
+        made_with_device(&path, &Ring::default()).await;
+        // A new keyring, without the key: the old vault is set aside, unread,
+        // and this is a new device.
+        let ring = Ring::default();
+        assert_eq!(device_id(&path, &ring).await, Ok(None));
+        let names: Vec<_> = files(dir.path()).into_keys().collect();
+        assert!(names.iter().any(|n| n.starts_with("v.unreadable-")), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn without_a_keyring_the_key_is_kept_in_a_private_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.db");
+        let ring = Ring::default();
+        ring.trouble(Some("there's no system keyring"));
+        // No vault yet, so nothing to lose: it's made, its key in a file.
+        made_with_device(&path, &ring).await;
+        let file = path.with_extension("key");
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&file).unwrap().permissions()) & 0o777, 0o600);
+        assert_eq!(device_id(&path, &ring).await, Ok(Some(b"d1".to_vec())), "the file opens it again");
+        // A keyring that turns up later has no key; the file still opens it.
+        ring.trouble(None);
+        assert_eq!(device_id(&path, &ring).await, Ok(Some(b"d1".to_vec())));
+        assert!(ring.key().is_none());
+        // But a key file that doesn't open it, while the keyring can't be
+        // read, isn't taken as the last word.
+        ring.trouble(Some("the system keyring is locked"));
+        std::fs::write(&file, hex(&[1u8; 32])).unwrap();
+        let before = files(dir.path());
+        assert_eq!(open(&path, &ring).await.unwrap_err(), Unopened::Wait("the system keyring is locked".into()));
+        assert_eq!(files(dir.path()), before);
+    }
+
+    #[tokio::test]
+    async fn other_failures_leave_the_vault_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.db");
+        std::fs::create_dir(&path).unwrap();
+        let ring = Ring::default();
+        assert!(matches!(open(&path, &ring).await, Err(Unopened::Failed(_))));
+        assert!(path.is_dir(), "not moved aside");
+        // Nor is a key in the keyring that isn't one replaced.
+        ring.keys.lock().unwrap().insert("acct".into(), "not a key".into());
+        assert!(matches!(open(&dir.path().join("w.db"), &ring).await, Err(Unopened::Failed(_))));
+        assert_eq!(ring.key().as_deref(), Some("not a key"));
+    }
+
+    #[test]
+    fn keyring_trouble_says_what_it_is() {
+        let boxed = |s: &str| -> Box<dyn std::error::Error + Send + Sync> { s.into() };
+        assert!(keyring_trouble(keyring::Error::NoStorageAccess(boxed("locked"))).contains("is locked"));
+        assert!(keyring_trouble(keyring::Error::PlatformFailure(boxed("timeout"))).contains("isn't answering (timeout)"));
+    }
+
+    /// Uses the real system keyring with one throwaway entry, removed again,
+    /// so it's opt-in: `cargo test -p darkmatter -- --ignored real_keyring`.
+    #[test]
+    #[ignore]
+    fn real_keyring_tells_no_entry_from_trouble() {
+        let account = "https://vault-key-test.invalid|tester";
+        let entry = keyring::Entry::new(KEYRING_SERVICE, account).expect("a keyring");
+        let _ = entry.delete_credential();
+        assert_eq!(Keyring.get(account), Ok(None), "a missing entry is a sure no");
+        Keyring.set(account, &hex(&[3u8; 32])).unwrap();
+        assert_eq!(Keyring.get(account), Ok(Some(hex(&[3u8; 32]))));
+        entry.delete_credential().unwrap();
+        assert_eq!(Keyring.get(account), Ok(None));
     }
 
     #[test]
