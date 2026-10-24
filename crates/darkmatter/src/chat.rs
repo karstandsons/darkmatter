@@ -753,8 +753,7 @@ impl Chat {
             if self.store.threads.remove(&id).is_some() {
                 tracing::debug!("forgot thread {id}");
             }
-            if self.store.timelines.contains_key(&id) {
-                self.store.forget_history(&id, PAGE);
+            if self.store.forget_history(&id, PAGE) {
                 tracing::debug!("forgot all but the newest page of {id}");
             }
         }
@@ -3245,9 +3244,12 @@ impl Chat {
                 .discard()
             }
             Message::Ws(msg) => self.on_ws(msg),
+            Message::Forget => {
+                self.forget_unseen(Instant::now());
+                Task::none()
+            }
             Message::Tick => {
                 crate::call::tick(self);
-                self.forget_unseen(Instant::now());
                 let resend = if self.outbox.is_empty() { Task::none() } else { self.flush() };
                 self.typing.retain(|_, at| at.elapsed() < TYPING_TTL);
                 for (_, p) in self.panes.iter_mut() {
@@ -4144,6 +4146,65 @@ pub(crate) mod tests {
         assert_eq!(chat.panes.len(), 1);
         // A late result for the closed pane is dropped.
         let _ = chat.update(Message::InPane(first, Box::new(Message::JumpLocated(Some(10.0)))));
+    }
+
+    /// Posts `range` of a channel, as a page of history (times are the numbers).
+    fn page(channel: &str, range: std::ops::Range<i64>, prev: &str, next: &str) -> mm_api::models::PostList {
+        let posts: Vec<Post> = range.map(|i| Post { id: format!("{channel}-{i}"), channel_id: channel.into(), user_id: "u".into(), create_at: i, ..Default::default() }).collect();
+        mm_api::models::PostList {
+            order: posts.iter().rev().map(|p| p.id.clone()).collect(),
+            posts: posts.into_iter().map(|p| (p.id.clone(), p)).collect(),
+            prev_post_id: prev.into(),
+            next_post_id: next.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reading_far_back_keeps_a_few_pages_and_leaves_a_gap_for_the_rest() {
+        let mut chat = chat();
+        let _ = chat.handle(Message::History("c1".into(), Ok(page("c1", 940..1000, "older", ""))));
+        // Fifteen pages back.
+        for n in 1..15 {
+            let top = 1000 - 60 * n;
+            chat.store.timelines.get_mut("c1").unwrap().loading_older = true;
+            let _ = chat.handle(Message::History("c1".into(), Ok(page("c1", top - 60..top, "older", ""))));
+        }
+        let t = &chat.store.timelines["c1"];
+        assert_eq!(t.entries.len(), KEEP_LOADED);
+        assert_eq!((t.entries[0].post.create_at, t.entries[KEEP_LOADED - 1].post.create_at), (100, 699));
+        assert!(t.has_newer, "the newest wait to page back in");
+        // The 300 dropped are a gap of their height (never drawn here: a guessed 60 px each).
+        assert_eq!(chat.pv().trimmed_below, 300.0 * 60.0);
+
+        // Reading forward: a page comes back into the gap, and the oldest go.
+        let _ = chat.handle(Message::Newer("c1".into(), Ok(page("c1", 700..760, "", "more"))));
+        let t = &chat.store.timelines["c1"];
+        assert_eq!((t.entries.len(), t.entries[0].post.create_at), (KEEP_LOADED, 160));
+        assert!(t.has_more && t.has_newer);
+        assert_eq!(chat.pv().trimmed_below, 240.0 * 60.0);
+        // The last page: no gap left.
+        let _ = chat.handle(Message::Newer("c1".into(), Ok(page("c1", 760..1000, "", ""))));
+        assert!(!chat.store.timelines["c1"].has_newer);
+        assert_eq!(chat.pv().trimmed_below, 0.0);
+    }
+
+    #[test]
+    fn what_is_out_of_sight_for_a_while_keeps_its_newest_page() {
+        let mut chat = chat();
+        chat.store.add_channels(vec![Channel { id: "c2".into(), ..Default::default() }], vec![ChannelMember { channel_id: "c2".into(), ..Default::default() }]);
+        chat.store.set_history("c1", page("c1", 0..200, "older", ""));
+        chat.store.set_history("c2", page("c2", 0..200, "older", ""));
+        chat.store.set_thread("c2-5", page("c2", 5..6, "", ""));
+        let t0 = Instant::now();
+        chat.forget_unseen(t0);
+        chat.forget_unseen(t0 + Duration::from_secs(60));
+        assert_eq!(chat.store.timelines["c2"].entries.len(), 200, "not yet");
+        chat.forget_unseen(t0 + FORGET_AFTER);
+        assert_eq!(chat.store.timelines["c1"].entries.len(), 200, "on screen");
+        let c2 = &chat.store.timelines["c2"];
+        assert_eq!((c2.entries.len(), c2.entries[0].post.create_at, c2.has_more), (PAGE, 140, true));
+        assert!(chat.store.threads.is_empty());
     }
 
     #[test]

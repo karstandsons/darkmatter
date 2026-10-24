@@ -338,6 +338,8 @@ pub enum Message {
     /// Esc, even when a text field captured it (they use it to drop focus).
     Escape,
     Tick,
+    /// Once a minute: let go of channels and threads not looked at for a while.
+    Forget,
     Logout,
 }
 
@@ -1200,7 +1202,7 @@ impl App {
             match &message {
                 // Login input carries the password; never log it.
                 Message::Login(..) => {}
-                Message::For(..) | Message::Ws(_) | Message::Tick | Message::Media(..) | Message::Animation(..) | Message::History(..) | Message::Thread(..) | Message::JumpWindow(..) | Message::Newer(..) => {}
+                Message::For(..) | Message::Ws(_) | Message::Tick | Message::Forget | Message::Media(..) | Message::Animation(..) | Message::History(..) | Message::Thread(..) | Message::JumpWindow(..) | Message::Newer(..) => {}
                 Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                     tracing::debug!("key {key:?} {modifiers:?}")
                 }
@@ -1653,6 +1655,7 @@ impl App {
             if !chat.typing.is_empty() || chat.panes.iter().any(|(_, p)| p.highlight.is_some()) || !chat.outbox.is_empty() {
                 subs.push(every_second().map(|(key, _)| Message::Tick.to(key)));
             }
+            subs.push(iced::time::every(Duration::from_secs(60)).with(server.key).map(|(key, _)| Message::Forget.to(key)));
         }
         Subscription::batch(subs)
     }

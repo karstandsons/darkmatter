@@ -119,8 +119,7 @@ impl Cache {
     }
 
     fn want(&self, key: &Key) {
-        // A link's inline picture comes with its post: nothing to fetch.
-        if !matches!(key, Key::LinkInline(_)) && !self.wanted.borrow().contains(key) {
+        if !self.wanted.borrow().contains(key) {
             self.wanted.borrow_mut().insert(key.clone());
         }
     }
@@ -212,7 +211,8 @@ impl Cache {
     }
 
     /// Fetch what was drawn but isn't here: dropped to stay in budget, or
-    /// failed and due another try.
+    /// failed and due another try. (A link's inline picture is put back by
+    /// the next `put_inline`.)
     pub fn fetch_wanted(&mut self, client: &Client, crypto: &Shared) -> Task<Message> {
         let wanted: Vec<Key> = self.wanted.get_mut().drain().collect();
         if wanted.is_empty() {
@@ -227,14 +227,21 @@ impl Cache {
     /// A picture already at hand (base64), such as a preview carried in its
     /// post: decoded here, nothing fetched.
     pub fn put_inline(&mut self, key: Key, base64: &str) {
-        if self.items.contains_key(&key) {
+        if self.items.contains_key(&key) || self.dropped.contains(&key) {
             return;
         }
         use base64::Engine;
         match base64::engine::general_purpose::STANDARD.decode(base64) {
             Ok(bytes) => self.ready(key, bytes),
-            Err(_) => self.put(key, Media::Failed(Instant::now()), 0),
+            Err(_) => {
+                // Trying again would fail the same way.
+                self.put(key.clone(), Media::Failed(Instant::now()), 0);
+                if let Some(item) = self.items.get_mut(&key) {
+                    item.tries = MAX_TRIES;
+                }
+            }
         }
+        self.trim(Instant::now());
     }
 
     /// Back online: what failed gets tried again when it's next drawn.
@@ -317,10 +324,7 @@ impl Cache {
                 break;
             }
             self.remove(&key);
-            // A link's inline picture is put back from its post; the rest wait to be drawn.
-            if !matches!(key, Key::LinkInline(_)) {
-                self.dropped.insert(key);
-            }
+            self.dropped.insert(key);
         }
     }
 }
@@ -646,6 +650,31 @@ mod tests {
         let _ = cache.fetch_wanted(&client(), &None);
         assert_eq!(state(&cache, &a), "loading");
         assert!(cache.wanted.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_dropped_inline_picture_comes_back_when_drawn() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode([7u8; 100]);
+        let mut cache = Cache::with_budget(150);
+        let (a, b) = (Key::LinkInline("a".into()), Key::LinkInline("b".into()));
+        cache.put_inline(a.clone(), &b64);
+        age(&cache, &a, Duration::from_secs(60));
+        cache.put_inline(b.clone(), &b64);
+        assert_eq!(state(&cache, &a), "gone");
+        // Its post is still loaded, so it's offered again: not taken until drawn.
+        cache.put_inline(a.clone(), &b64);
+        assert_eq!(state(&cache, &a), "gone");
+        assert!(cache.get(&a).is_none());
+        let _ = cache.fetch_wanted(&client(), &None);
+        cache.put_inline(a.clone(), &b64);
+        assert_eq!(state(&cache, &a), "ready");
+        // A malformed one isn't tried again.
+        let bad = Key::LinkInline("bad".into());
+        cache.put_inline(bad.clone(), "not base64!");
+        cache.items.get_mut(&bad).unwrap().media = Media::Failed(Instant::now() - Duration::from_secs(3600));
+        assert!(cache.get(&bad).is_none());
+        assert!(!cache.wanted.borrow().contains(&bad));
     }
 
     #[test]

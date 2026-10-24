@@ -339,11 +339,12 @@ impl Store {
 
     /// A channel not looked at for a while: keep its newest `keep` posts
     /// (an older stretch goes entirely; opening the channel shows the latest).
-    pub fn forget_history(&mut self, channel_id: &str, keep: usize) {
+    /// Returns whether anything went.
+    pub fn forget_history(&mut self, channel_id: &str, keep: usize) -> bool {
         if self.timelines.get(channel_id).is_some_and(|t| t.has_newer) {
-            self.timelines.remove(channel_id);
+            self.timelines.remove(channel_id).is_some()
         } else {
-            self.trim(channel_id, keep, false);
+            !self.trim(channel_id, keep, false).is_empty()
         }
     }
 
