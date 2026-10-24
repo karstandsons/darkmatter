@@ -54,6 +54,27 @@ pub struct Config {
     /// TCP, if it isn't the one listened on (a proxy in front); 0 turns
     /// media over TCP off.
     pub calls_public_tcp_port: Option<u16>,
+    /// How much each account's uploads may take on disk, in megabytes
+    /// (0 = no limit). Files of deleted messages count until they're
+    /// removed for good, a week later.
+    pub upload_quota_mb: u64,
+    /// How many files each account may upload an hour (0 = no limit).
+    pub uploads_per_hour: u32,
+    /// Only admins add custom emoji.
+    pub emoji_admins_only: bool,
+    /// How many custom emoji each person who isn't an admin may have added
+    /// (0 = no limit).
+    pub emoji_per_account: u32,
+    /// Connections open at once: HTTP(S), websockets and call media over
+    /// TCP.
+    pub max_connections: usize,
+    /// Connections open at once from one address (not counted behind a
+    /// proxy, where every connection comes from the proxy).
+    pub max_connections_per_ip: usize,
+    /// How long a request may take to answer, in seconds. Uploads have
+    /// longer, as long as data keeps coming; websockets and downloads
+    /// aren't limited.
+    pub request_timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -77,6 +98,13 @@ impl Default for Config {
             calls_public_ip: None,
             calls_public_port: None,
             calls_public_tcp_port: None,
+            upload_quota_mb: 2048,
+            uploads_per_hour: 120,
+            emoji_admins_only: false,
+            emoji_per_account: 50,
+            max_connections: 1024,
+            max_connections_per_ip: 128,
+            request_timeout_secs: 30,
         }
     }
 }
@@ -154,6 +182,27 @@ impl Config {
         if let Some(v) = var("AXIOND_MAX_FILE_MB") {
             self.max_file_mb = v.parse().with_context(|| format!("AXIOND_MAX_FILE_MB={v}"))?;
         }
+        if let Some(v) = var("AXIOND_UPLOAD_QUOTA_MB") {
+            self.upload_quota_mb = v.parse().with_context(|| format!("AXIOND_UPLOAD_QUOTA_MB={v}"))?;
+        }
+        if let Some(v) = var("AXIOND_UPLOADS_PER_HOUR") {
+            self.uploads_per_hour = v.parse().with_context(|| format!("AXIOND_UPLOADS_PER_HOUR={v}"))?;
+        }
+        if let Some(v) = var("AXIOND_EMOJI_ADMINS_ONLY") {
+            self.emoji_admins_only = matches!(v.as_str(), "1" | "true" | "yes");
+        }
+        if let Some(v) = var("AXIOND_EMOJI_PER_ACCOUNT") {
+            self.emoji_per_account = v.parse().with_context(|| format!("AXIOND_EMOJI_PER_ACCOUNT={v}"))?;
+        }
+        if let Some(v) = var("AXIOND_MAX_CONNECTIONS") {
+            self.max_connections = v.parse().with_context(|| format!("AXIOND_MAX_CONNECTIONS={v}"))?;
+        }
+        if let Some(v) = var("AXIOND_MAX_CONNECTIONS_PER_IP") {
+            self.max_connections_per_ip = v.parse().with_context(|| format!("AXIOND_MAX_CONNECTIONS_PER_IP={v}"))?;
+        }
+        if let Some(v) = var("AXIOND_REQUEST_TIMEOUT_SECS") {
+            self.request_timeout_secs = v.parse().with_context(|| format!("AXIOND_REQUEST_TIMEOUT_SECS={v}"))?;
+        }
         Ok(())
     }
 
@@ -223,6 +272,15 @@ mod tests {
         .unwrap();
         assert_eq!((c.calls_udp.unwrap().port(), c.calls_public_ip.unwrap().to_string()), (443, "203.0.113.7".into()));
         assert!(c.apply_env(|k| (k == "AXIOND_CALLS_UDP").then(|| "443".into())).is_err());
+        c.apply_env(|k| match k {
+            "AXIOND_UPLOAD_QUOTA_MB" => Some("10".into()),
+            "AXIOND_EMOJI_ADMINS_ONLY" => Some("true".into()),
+            "AXIOND_MAX_CONNECTIONS" => Some("20".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!((c.upload_quota_mb, c.emoji_admins_only, c.max_connections), (10, true, 20));
+        assert!(c.apply_env(|k| (k == "AXIOND_UPLOADS_PER_HOUR").then(|| "lots".into())).is_err());
     }
 
     #[test]

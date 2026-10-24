@@ -27,6 +27,12 @@ pub const MAX_PER_POST: usize = 10;
 /// In an encrypted channel each picture comes with its thumbnail, made by
 /// the sender's app, as a second upload.
 pub const MAX_PER_ENCRYPTED_POST: usize = 2 * MAX_PER_POST;
+/// The most a text part of a form (a channel id, a client id) may hold.
+pub const MAX_TEXT_PART: usize = 1024;
+/// How long an upload may go without sending anything before it's dropped.
+const UPLOAD_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Uploads one account may have under way at once.
+const UPLOADS_AT_ONCE: usize = 3;
 const THUMB: (u32, u32) = (120, 100);
 const PREVIEW_WIDTH: u32 = 1920;
 
@@ -126,6 +132,7 @@ pub struct UploadQuery {
 /// `POST files` (multipart): a `channel_id` field (or query parameter) first,
 /// then one or more `files`.
 pub async fn upload(State(app): State<App>, me: Me, Query(q): Query<UploadQuery>, mut form: Multipart) -> Result<(StatusCode, Json<UploadResult>)> {
+    let _turn = app.uploads.start(&me.user_id, UPLOADS_AT_ONCE).ok_or_else(|| Error::too_many("Too many uploads at once. Wait for the others to finish."))?;
     let mut channel = None;
     if let Some(id) = q.channel_id {
         channel = Some(upload_channel(&app, &me, &id).await?);
@@ -134,21 +141,32 @@ pub async fn upload(State(app): State<App>, me: Me, Query(q): Query<UploadQuery>
     while let Some(mut field) = form.next_field().await.map_err(|e| Error::bad_request(format!("Couldn't read the upload: {e}")))? {
         match field.name() {
             Some("channel_id") => {
-                let id = field.text().await.map_err(|_| Error::bad_request("Couldn't read the upload."))?;
+                let id = text_part(&mut field, MAX_TEXT_PART).await?;
                 channel = Some(upload_channel(&app, &me, id.trim()).await?);
             }
             Some("client_ids") => {
-                result.client_ids.push(field.text().await.map_err(|_| Error::bad_request("Couldn't read the upload."))?);
+                if result.client_ids.len() >= MAX_PER_POST {
+                    return Err(Error::bad_request(format!("At most {MAX_PER_POST} files at once.")));
+                }
+                result.client_ids.push(text_part(&mut field, MAX_TEXT_PART).await?);
             }
             Some("files") => {
                 let Some(channel) = &channel else { return Err(Error::bad_request("Say which channel before the files.")) };
                 if result.file_infos.len() >= MAX_PER_POST {
                     return Err(Error::bad_request(format!("At most {MAX_PER_POST} files at once.")));
                 }
+                if app.config.uploads_per_hour > 0 {
+                    let n = f64::from(app.config.uploads_per_hour);
+                    let rate = crate::limits::Rate { burst: n, per_second: n / 3600.0 };
+                    if let Err(wait) = app.limiter.take(&format!("upload {}", me.user_id), rate) {
+                        return Err(Error::too_many(format!("You've uploaded a lot this hour. Try again in {} minutes.", wait.as_secs() / 60 + 1)));
+                    }
+                }
+                let room = room_left(&app, &me.user_id).await?;
                 let name = clean_name(field.file_name().unwrap_or("file"));
                 let id = ids::new_id();
                 let path = file_path(&app, &id, Kind::Original);
-                let size = save(&app, &path, &mut field).await?;
+                let size = save(&app, &path, &mut field, room).await?;
                 let info = describe(&app, channel, &me.user_id, id, name, size, &path).await;
                 match info {
                     Ok(info) => result.file_infos.push(info),
@@ -175,21 +193,60 @@ async fn upload_channel(app: &App, me: &Me, id: &str) -> Result<db::ChannelRow> 
     Ok(channel)
 }
 
-/// Streams one part to disk, stopping at the size limit.
-async fn save(app: &App, path: &FsPath, field: &mut axum::extract::multipart::Field<'_>) -> Result<i64> {
+/// A text part of a form, refused if it's longer than `max` bytes.
+pub async fn text_part(field: &mut axum::extract::multipart::Field<'_>, max: usize) -> Result<String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(|_| Error::bad_request("Couldn't read the upload."))? {
+        if bytes.len() + chunk.len() > max {
+            return Err(Error::bad_request("Part of the upload is too long."));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| Error::bad_request("Couldn't read the upload."))
+}
+
+/// How many bytes this account may still upload (`upload_quota_mb`).
+async fn room_left(app: &App, user_id: &str) -> Result<Option<u64>> {
+    if app.config.upload_quota_mb == 0 {
+        return Ok(None);
+    }
+    let used: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM files WHERE user_id = ?").bind(user_id).fetch_one(&app.db).await?;
+    let quota = app.config.upload_quota_mb.saturating_mul(1024 * 1024);
+    match quota.checked_sub(used.max(0) as u64) {
+        Some(left) if left > 0 => Ok(Some(left)),
+        _ => Err(quota_full(app)),
+    }
+}
+
+fn quota_full(app: &App) -> Error {
+    Error {
+        status: StatusCode::PAYLOAD_TOO_LARGE,
+        id: "axiond.file.quota",
+        message: format!("Your uploads have reached this server's limit of {} MB. Delete some files to make room.", app.config.upload_quota_mb),
+    }
+}
+
+/// Streams one part to disk, stopping at the size limit or once it would
+/// take more than `room` (what's left of the account's quota).
+async fn save(app: &App, path: &FsPath, field: &mut axum::extract::multipart::Field<'_>, room: Option<u64>) -> Result<i64> {
     let limit = app.config.max_file_mb.saturating_mul(1024 * 1024);
     let dir = path.parent().ok_or_else(Error::internal)?;
     tokio::fs::create_dir_all(dir).await.map_err(io_error)?;
     let mut out = tokio::fs::File::create(path).await.map_err(io_error)?;
     let mut size: u64 = 0;
     loop {
-        let chunk = match field.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(_) => {
+        let chunk = match tokio::time::timeout(UPLOAD_IDLE, field.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => {
                 drop(out);
                 let _ = tokio::fs::remove_file(path).await;
                 return Err(too_big(app));
+            }
+            Err(_) => {
+                drop(out);
+                let _ = tokio::fs::remove_file(path).await;
+                return Err(Error::bad_request("The upload stopped."));
             }
         };
         size += chunk.len() as u64;
@@ -197,6 +254,11 @@ async fn save(app: &App, path: &FsPath, field: &mut axum::extract::multipart::Fi
             drop(out);
             let _ = tokio::fs::remove_file(path).await;
             return Err(too_big(app));
+        }
+        if room.is_some_and(|room| size > room) {
+            drop(out);
+            let _ = tokio::fs::remove_file(path).await;
+            return Err(quota_full(app));
         }
         out.write_all(&chunk).await.map_err(io_error)?;
     }
@@ -226,8 +288,11 @@ async fn describe(app: &App, channel: &db::ChannelRow, user_id: &str, id: String
     let (mut width, mut height, mut has_preview) = (0, 0, false);
     if !channel.encrypted && size > 0 {
         let (src, thumb, preview) = (path.to_owned(), file_path(app, &id, Kind::Thumbnail), file_path(app, &id, Kind::Preview));
-        let made = tokio::task::spawn_blocking(move || pictures(&src, &thumb, &preview)).await.map_err(|_| Error::internal())?;
-        if let Some((w, h, mime)) = made {
+        let probe = src.clone();
+        let found = tokio::task::spawn_blocking(move || picture_size(&probe)).await.map_err(|_| Error::internal())?;
+        if let Some((w, h, mime)) = found
+            && app.decoding.run(w, h, move || pictures(&src, &thumb, &preview)).await.is_some()
+        {
             (width, height, has_preview, mime_type) = (w as i64, h as i64, true, mime.to_string());
         }
     }
@@ -252,31 +317,31 @@ async fn describe(app: &App, channel: &db::ChannelRow, user_id: &str, id: String
     Ok(file_row(app, &id).await?.ok_or_else(Error::internal)?.into())
 }
 
-/// For a picture: its size and type, after writing a thumbnail and a preview.
-/// `None` for anything that isn't a picture we can read safely.
-fn pictures(src: &FsPath, thumb: &FsPath, preview: &FsPath) -> Option<(u32, u32, &'static str)> {
-    let mut reader = image::ImageReader::open(src).ok()?.with_guessed_format().ok()?;
-    let format = reader.format()?;
-    let mime = match format {
+/// For a picture we make previews of: its size and type, from its header.
+fn picture_size(src: &FsPath) -> Option<(u32, u32, &'static str)> {
+    let reader = image::ImageReader::open(src).ok()?.with_guessed_format().ok()?;
+    let mime = match reader.format()? {
         image::ImageFormat::Png => "image/png",
         image::ImageFormat::Jpeg => "image/jpeg",
         image::ImageFormat::Gif => "image/gif",
         image::ImageFormat::WebP => "image/webp",
         _ => return None,
     };
-    // Refuse decompression bombs: a small file claiming a huge picture.
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16_384);
-    limits.max_image_height = Some(16_384);
-    limits.max_alloc = Some(512 * 1024 * 1024);
-    reader.limits(limits);
+    let (w, h) = reader.into_dimensions().ok()?;
+    Some((w, h, mime))
+}
+
+/// Writes a picture's thumbnail and preview. `None` if it can't be read
+/// safely. Callers check its size first ([`picture_size`]); the limits also
+/// refuse decompression bombs, a small file that decodes to a huge picture.
+fn pictures(src: &FsPath, thumb: &FsPath, preview: &FsPath) -> Option<()> {
+    let mut reader = image::ImageReader::open(src).ok()?.with_guessed_format().ok()?;
+    reader.limits(crate::limits::image_limits());
     let img = reader.decode().ok()?;
-    let (w, h) = (img.width(), img.height());
     let write = |img: image::DynamicImage, to: &FsPath| img.to_rgb8().save_with_format(to, image::ImageFormat::Jpeg).ok();
     write(img.thumbnail(THUMB.0, THUMB.1), thumb)?;
-    let preview_img = if w > PREVIEW_WIDTH { img.resize(PREVIEW_WIDTH, u32::MAX, image::imageops::FilterType::Triangle) } else { img };
-    write(preview_img, preview)?;
-    Some((w, h, mime))
+    let preview_img = if img.width() > PREVIEW_WIDTH { img.resize(PREVIEW_WIDTH, u32::MAX, image::imageops::FilterType::Triangle) } else { img };
+    write(preview_img, preview)
 }
 
 /// A file name that's safe to show and to send back: no folders, no control

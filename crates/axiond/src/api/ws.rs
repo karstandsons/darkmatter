@@ -14,6 +14,11 @@ use crate::hub::Event;
 
 /// Pings keep proxies from closing quiet sockets; apps give up after 90 s of silence.
 const PING: Duration = Duration::from_secs(30);
+/// The largest message an app may send: its actions are a few hundred bytes.
+pub const MAX_MESSAGE: usize = 64 * 1024;
+/// Messages from one person's apps: 30, then 5 a second. Past that they're
+/// dropped (with a FAIL reply), not acted on.
+pub const MESSAGES: crate::limits::Rate = crate::limits::Rate { burst: 30.0, per_second: 5.0 };
 
 #[derive(Deserialize)]
 pub struct Resume {
@@ -24,7 +29,7 @@ pub struct Resume {
 }
 
 pub async fn websocket(State(app): State<App>, me: Me, Query(resume): Query<Resume>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| run(app, me, resume, socket))
+    upgrade.max_message_size(MAX_MESSAGE).max_frame_size(MAX_MESSAGE).on_upgrade(move |socket| run(app, me, resume, socket))
 }
 
 async fn run(app: App, me: Me, resume: Resume, socket: WebSocket) {
@@ -53,11 +58,18 @@ async fn run(app: App, me: Me, resume: Resume, socket: WebSocket) {
                 None => break,
             },
             msg = incoming.next() => match msg {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                Some(Ok(_)) if app.limiter.take(&format!("ws {}", me.user_id), MESSAGES).is_err() => match msg {
+                    Some(Ok(Message::Text(text))) => match refused(&text) {
+                        Some(reply) => out.send(Message::Text(reply.to_string().into())).await,
+                        None => Ok(()),
+                    },
+                    _ => Ok(()),
+                },
                 Some(Ok(Message::Text(text))) => match action(&app, &me, &text).await {
                     Some(reply) => out.send(Message::Text(reply.to_string().into())).await,
                     None => Ok(()),
                 },
-                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
                 Some(Ok(_)) => Ok(()),
             },
             _ = ping.tick() => out.send(Message::Ping(Default::default())).await,
@@ -89,6 +101,12 @@ async fn action(app: &App, me: &Me, text: &str) -> Option<Value> {
         _ => false,
     };
     Some(if ok { json!({ "status": "OK", "seq_reply": seq }) } else { json!({ "status": "FAIL", "seq_reply": seq }) })
+}
+
+/// The reply to an action that came too fast to act on.
+fn refused(text: &str) -> Option<Value> {
+    let seq = serde_json::from_str::<Value>(text).ok()?.get("seq").and_then(Value::as_i64)?;
+    Some(json!({ "status": "FAIL", "seq_reply": seq }))
 }
 
 /// Tells the channel's other members someone is typing.

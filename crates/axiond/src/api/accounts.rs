@@ -243,7 +243,7 @@ async fn delete_user(app: App, me: Me, user_id: String, body: Option<Json<Delete
     if user_id == me.user_id {
         let hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?").bind(&user_id).fetch_one(&app.db).await?;
         let password = body.password.clone();
-        let ok = tokio::task::spawn_blocking(move || auth::verify_password(Some(&hash), &password)).await.map_err(|_| Error::internal())?;
+        let ok = auth::check_password(Some(hash), password).await;
         if !ok {
             return Err(Error::bad_request("Enter your password to delete your account."));
         }

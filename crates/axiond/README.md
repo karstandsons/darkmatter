@@ -47,7 +47,8 @@ use it for anything secret yet.
   served as downloads.
 - The Threads list: you follow a thread when you start it, reply or are
   mentioned, with unread replies and mentions per thread.
-- Custom emoji (anyone can add one; `axiond emoji add name file.png` too)
+- Custom emoji (anyone can add one, up to `emoji_per_account`, or only
+  admins with `emoji_admins_only`; `axiond emoji add name file.png` too)
   and profile pictures, redrawn as a 256-pixel PNG so nothing hidden in the
   original (like where a photo was taken) is kept.
 - Search, with Mattermost's syntax: words, `"phrases"`, `prefix*`, `-word`,
@@ -105,6 +106,44 @@ Settings live in `axiond.toml` (in the working directory, or pass
 | `calls_udp` | `AXIOND_CALLS_UDP` | a free port on `listen`'s address | The one UDP port call media uses, e.g. `0.0.0.0:443` |
 | `calls_public_ip` | `AXIOND_CALLS_PUBLIC_IP` | | The address devices send call media to. Needed when `calls_udp` is `0.0.0.0` (calls are off without it) |
 | `calls_public_port` | `AXIOND_CALLS_PUBLIC_PORT` | the bound port | The port devices send call media to, when it's forwarded to another |
+| `upload_quota_mb` | `AXIOND_UPLOAD_QUOTA_MB` | `2048` | How much each person's uploads may take on disk, in MB (0 = no limit). Files of deleted messages count until they're removed for good, a week later |
+| `uploads_per_hour` | `AXIOND_UPLOADS_PER_HOUR` | `120` | Files each person may upload an hour (0 = no limit) |
+| `emoji_admins_only` | `AXIOND_EMOJI_ADMINS_ONLY` | `false` | Only admins add custom emoji |
+| `emoji_per_account` | `AXIOND_EMOJI_PER_ACCOUNT` | `50` | Custom emoji each person who isn't an admin may have added (0 = no limit) |
+| `max_connections` | `AXIOND_MAX_CONNECTIONS` | `1024` | HTTP(S) and websocket connections open at once |
+| `max_connections_per_ip` | `AXIOND_MAX_CONNECTIONS_PER_IP` | `128` | Of those, from one address (not counted with `behind_proxy`, where they all come from the proxy) |
+| `request_timeout_secs` | `AXIOND_REQUEST_TIMEOUT_SECS` | `30` | How long a request may take to answer (0 = no limit). Uploads get an hour, as long as data keeps coming; websockets and downloads aren't cut off |
+
+### Limits
+
+So that one person (or, for connections and call media, anyone) can't run
+a small server out of memory or disk, axiond also holds to these, which
+aren't settings:
+
+- **Uploads:** at most 3 at once per person; one that sends nothing for
+  30 s is dropped. A form's text parts (channel and client ids, an emoji's
+  name) are at most 1 KB each. Profile pictures are at most 10 MB.
+- **Pictures:** the server decodes a picture (for a thumbnail, or to redraw
+  a profile picture) only up to 40 megapixels, two at a time, and 48
+  megapixels in all at once; the rest wait. A bigger file is kept without
+  previews, and a bigger profile picture is refused.
+- **Logins:** two password checks at a time (each takes about 19 MiB).
+- **Websockets:** 10 per person (a new one closes their oldest), messages of
+  at most 64 KiB, and 30 messages, then 5 a second, per person; faster ones
+  get a `FAIL` reply and aren't acted on.
+- **Key packages:** claimed only of people you share a channel with (and
+  your own devices), 30 claims, then one every 2 s; past 20 one-time
+  packages of one person's devices (then one a minute), you get their
+  last-resort package instead, so no one can use up someone else's.
+- **Connections:** 15 s to finish the TLS handshake and send something,
+  20 s for a request's headers once they've started, and closed after 90 s
+  with nothing either way (websockets are pinged every 30 s).
+- **Call media:** at most 512 TCP media connections. Packets wait in a queue
+  of 4096 (256 per TCP connection on the way out), and what doesn't fit is
+  dropped, as on a congested network. If the media thread panics it starts
+  again; the devices in calls then join again.
+- **Upgrades:** the copies of the database kept from before upgrades
+  (`backups/before-upgrade-*.db`) are the newest three.
 
 ### HTTPS
 
@@ -137,7 +176,7 @@ never fall back to plain HTTP.
 `axiond backup` writes a `.tar.gz` of the database and every stored file
 (uploads, emoji, pictures, certificates), safe to take while the server runs.
 The server also does this by itself every `backup_hours`, and keeps a copy of
-the database before any upgrade changes it.
+the database before any upgrade changes it (the last three).
 
 Backups on the same disk don't survive losing the server. Copy them
 somewhere else too, encrypted (restic does both).

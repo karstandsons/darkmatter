@@ -1,9 +1,11 @@
 //! Rate limits: token buckets per IP address (every request, and a much
 //! tighter one for logging in and signing up) and per person (posting).
+//! And limits on what runs at once: uploads per person, and decoding
+//! pictures.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Request, State};
@@ -30,6 +32,12 @@ pub const POSTS: Rate = Rate { burst: 30.0, per_second: 5.0 };
 /// Joining calls, per person: 10, then one every 3 s. Each join is a
 /// connection the SFU sets up.
 pub const CALLS: Rate = Rate { burst: 10.0, per_second: 1.0 / 3.0 };
+/// Claiming key packages, per person: 30, then one every 2 s.
+pub const CLAIMS: Rate = Rate { burst: 30.0, per_second: 0.5 };
+/// One-time key packages one person may take of another's devices: 20,
+/// then one a minute. Past that they get the last-resort package, so no one
+/// can use up someone else's.
+pub const CLAIMS_OF_ONE: Rate = Rate { burst: 20.0, per_second: 1.0 / 60.0 };
 
 #[derive(Default)]
 pub struct Limiter {
@@ -55,6 +63,92 @@ impl Limiter {
             Err(Duration::from_secs_f64((1.0 - *tokens) / rate.per_second))
         }
     }
+}
+
+/// Things under way per key, at most `max` at once each.
+#[derive(Clone, Default)]
+pub struct Turns(Arc<Mutex<HashMap<String, usize>>>);
+
+/// One of them; ends when dropped.
+pub struct Turn {
+    turns: Turns,
+    key: String,
+}
+
+impl Turns {
+    pub fn start(&self, key: &str, max: usize) -> Option<Turn> {
+        let mut map = self.0.lock().unwrap();
+        let n = map.entry(key.to_string()).or_default();
+        if *n >= max {
+            return None;
+        }
+        *n += 1;
+        Some(Turn { turns: self.clone(), key: key.to_string() })
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        let mut map = self.turns.0.lock().unwrap();
+        if let Some(n) = map.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// The most pixels a picture may have for the server to decode it (for a
+/// thumbnail, or to redraw a profile picture): 40 megapixels.
+pub const MAX_PIXELS: u64 = 40_000_000;
+/// Megapixels being decoded at once, across every request. A decoded pixel
+/// takes 3 to 4 bytes, and a copy while it's redrawn about as much again.
+const PIXEL_BUDGET: u32 = 48;
+/// Pictures decoded at once.
+const DECODES_AT_ONCE: usize = 2;
+
+/// Decoding pictures, within [`MAX_PIXELS`] each and a total budget, so a
+/// burst of big pictures waits instead of using up the memory.
+pub struct Decoding {
+    slots: tokio::sync::Semaphore,
+    pixels: tokio::sync::Semaphore,
+}
+
+impl Default for Decoding {
+    fn default() -> Self {
+        Decoding { slots: tokio::sync::Semaphore::new(DECODES_AT_ONCE), pixels: tokio::sync::Semaphore::new(PIXEL_BUDGET as usize) }
+    }
+}
+
+impl Decoding {
+    /// Runs `decode` (on a blocking thread) for a `width` × `height`
+    /// picture once there's room. `None` if it's too big or failed.
+    pub async fn run<T: Send + 'static>(&self, width: u32, height: u32, decode: impl FnOnce() -> Option<T> + Send + 'static) -> Option<T> {
+        let pixels = u64::from(width) * u64::from(height);
+        if pixels == 0 || pixels > MAX_PIXELS {
+            return None;
+        }
+        let megapixels = pixels.div_ceil(1_000_000).min(u64::from(PIXEL_BUDGET)) as u32;
+        let _slot = self.slots.acquire().await.ok()?;
+        let _pixels = self.pixels.acquire_many(megapixels).await.ok()?;
+        tokio::task::spawn_blocking(decode).await.ok().flatten()
+    }
+
+    /// Megapixels free right now (for tests).
+    #[cfg(test)]
+    fn free(&self) -> usize {
+        self.pixels.available_permits()
+    }
+}
+
+/// What `image` may allocate decoding one picture of at most [`MAX_PIXELS`].
+pub fn image_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(4 * MAX_PIXELS);
+    limits
 }
 
 /// The address a request came from. Behind a proxy, the last address in
@@ -112,5 +206,49 @@ mod tests {
         l.take("c", slow).unwrap();
         let wait = l.take("c", slow).unwrap_err();
         assert!(wait > Duration::from_millis(1500) && wait <= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn turns_are_per_key_and_end_when_dropped() {
+        let turns = Turns::default();
+        let a = turns.start("a", 2).unwrap();
+        let _b = turns.start("a", 2).unwrap();
+        assert!(turns.start("a", 2).is_none());
+        assert!(turns.start("other", 2).is_some());
+        drop(a);
+        assert!(turns.start("a", 2).is_some());
+    }
+
+    #[tokio::test]
+    async fn decoding_waits_for_its_budget() {
+        let d = Arc::new(Decoding::default());
+        assert!(d.run(10_000, 5_000, || Some(())).await.is_none(), "50 megapixels is too many");
+        assert!(d.run(0, 10, || Some(())).await.is_none());
+        // Two decodes of 30 megapixels can't fit the budget together: the
+        // second waits until the first is done.
+        let (started, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(std::sync::Barrier::new(2)));
+        let first = {
+            let (d, started, release) = (d.clone(), started.clone(), release.clone());
+            tokio::spawn(async move {
+                d.run(6_000, 5_000, move || {
+                    started.notify_one();
+                    release.wait();
+                    Some(1)
+                })
+                .await
+            })
+        };
+        started.notified().await;
+        assert_eq!(d.free(), (PIXEL_BUDGET - 30) as usize);
+        let second = tokio::spawn({
+            let d = d.clone();
+            async move { d.run(6_000, 5_000, || Some(2)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!second.is_finished(), "waits for room");
+        release.wait();
+        assert_eq!(first.await.unwrap(), Some(1));
+        assert_eq!(second.await.unwrap(), Some(2));
+        assert_eq!(d.free(), PIXEL_BUDGET as usize);
     }
 }

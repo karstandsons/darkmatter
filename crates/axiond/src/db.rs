@@ -41,6 +41,9 @@ pub async fn open(data_dir: &Path) -> anyhow::Result<Db> {
         let copy = dir.join(format!("before-upgrade-{}.db", crate::ids::now()));
         crate::backup::snapshot_db(&db, &copy).await?;
         tracing::info!("upgrading the database; the old one is kept at {}", copy.display());
+        if let Err(e) = crate::backup::prune_upgrade_copies(&dir) {
+            tracing::warn!("couldn't remove old copies from before upgrades: {e}");
+        }
     }
     migrator.run(&db).await?;
     Ok(db)

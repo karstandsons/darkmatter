@@ -90,9 +90,22 @@ pub fn restore(archive: &Path, data_dir: &Path) -> anyhow::Result<()> {
 
 /// Removes all but the newest `keep` backups in `dir`.
 pub fn prune(dir: &Path, keep: usize) -> anyhow::Result<()> {
+    prune_named(dir, "axiond-", ".tar.gz", keep)
+}
+
+/// How many copies of the database from before an upgrade are kept.
+pub const UPGRADE_COPIES: usize = 3;
+
+/// Removes all but the newest [`UPGRADE_COPIES`] `before-upgrade-*.db` in `dir`.
+pub fn prune_upgrade_copies(dir: &Path) -> anyhow::Result<()> {
+    prune_named(dir, "before-upgrade-", ".db", UPGRADE_COPIES)
+}
+
+/// Keeps the newest `keep` files named `prefix…suffix` whose names sort by time.
+fn prune_named(dir: &Path, prefix: &str, suffix: &str, keep: usize) -> anyhow::Result<()> {
     let mut backups: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("axiond-") && n.to_string_lossy().ends_with(".tar.gz")))
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(prefix) && n.to_string_lossy().ends_with(suffix)))
         .collect();
     // The names sort by time.
     backups.sort();
@@ -164,5 +177,15 @@ mod tests {
         let mut left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         left.sort();
         assert_eq!(left, ["axiond-20260102-000000.tar.gz", "axiond-20260103-000000.tar.gz", "other.txt"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        for at in [1_700_000_000_000_i64, 1_700_000_000_001, 1_760_000_000_000, 1_800_000_000_000, 1_800_000_000_002] {
+            std::fs::write(dir.path().join(format!("before-upgrade-{at}.db")), b"x").unwrap();
+        }
+        std::fs::write(dir.path().join("axiond-20260101-000000.tar.gz"), b"x").unwrap();
+        prune_upgrade_copies(dir.path()).unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["axiond-20260101-000000.tar.gz", "before-upgrade-1760000000000.db", "before-upgrade-1800000000000.db", "before-upgrade-1800000000002.db"]);
     }
 }
