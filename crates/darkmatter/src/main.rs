@@ -34,6 +34,7 @@ mod update;
 mod vault;
 mod verify;
 mod viewer;
+mod virtual_list;
 mod zoom;
 
 use app::App;
