@@ -14,6 +14,7 @@ use crate::media;
 use crate::store::Entry;
 use crate::style::{Colors, bold, italic};
 use crate::text as fmt;
+use crate::virtual_list;
 
 /// Avatar size and the left gutter that aligns grouped messages with the first one.
 const AVATAR: f32 = 34.0;
@@ -27,6 +28,11 @@ pub const INLINE_REPLIES: usize = 5;
 const TIME_COLUMN: f32 = 40.0;
 const NAME_COLUMN: f32 = 90.0;
 
+/// Keys of the timeline's fixed rows (posts' keys are their ids, hashed).
+const TOP: u64 = 1;
+const TRIMMED: u64 = 2;
+const TAIL: u64 = 3;
+
 const PANE_FOOTER: iced::Padding = iced::Padding { top: 0.0, right: 20.0, bottom: 16.0, left: 20.0 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,6 +45,7 @@ enum Kind {
 
 impl Chat {
     pub fn view<'a>(&'a self, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
+        self.media.begin_view();
         let mut layout = row![];
         if self.store.teams.len() > 1 {
             layout = layout.push(self.team_rail(c));
@@ -720,27 +727,37 @@ impl Chat {
     ) -> Element<'a, Message> {
         let md_settings = c.markdown(theme);
         let now = chrono::Local::now();
-        let mut col = Column::new().spacing(2).padding(self.header_pad());
+        // A channel draws only the posts near the view (see `virtual_list`);
+        // a thread, short, draws them all.
+        let virtualized = kind == Kind::Channel;
+        // The newest posts, dropped while reading far back (see `trim_loaded`).
+        let trimmed = if virtualized && self.store.timelines.get(&pv.channel).is_some_and(|t| t.has_newer) { pv.trimmed_below } else { 0.0 };
+        let pad = self.header_pad();
+        let mut col = virtual_list::Rows::new().padding(pad);
         // Fixed height whether or not there's text, so toggling "Loading…" doesn't shift content.
         if let Some(top) = top {
-            col = col.push(container(text(top).size(12).color(c.muted)).center_x(Length::Fill).height(32).center_y(32));
+            col = col.push(TOP, container(text(top).size(12).color(c.muted)).center_x(Length::Fill).height(32).center_y(32));
         }
-        let mut prev: Option<&Post> = None;
         // "New messages" goes above the first post from someone else since the last visit.
         let new_since = (kind == Kind::Channel).then(|| self.viewed_before.get(&pv.channel)).flatten();
         let first_new = new_since.and_then(|since| {
-            entries
+            let from = entries.partition_point(|e| e.post.create_at <= *since);
+            entries[from..]
                 .iter()
                 .map(|e| &e.post)
-                .find(|p| p.create_at > *since && p.user_id != self.store.me.id && !p.is_system())
+                .find(|p| p.user_id != self.store.me.id && !p.is_system())
                 .map(|p| p.id.as_str())
         });
-        let mut prev_day: Option<i64> = None;
-        for entry in entries {
+        let threaded = |post: &Post| kind == Kind::Channel && pv.expanded.contains(&post.id) && self.is_inline_in(pv, &post.id);
+        // One row: a post, with the dividers above it and its thread below.
+        let row = |i: usize| -> Element<'a, Message> {
+            let entry = &entries[i];
             let post = &entry.post;
+            let before = i.checked_sub(1).map(|j| &entries[j].post);
+            let mut parts = Column::new().spacing(2).padding(iced::Padding { top: 2.0, ..iced::Padding::ZERO });
             let mut break_group = false;
             if first_new == Some(post.id.as_str()) {
-                col = col.push(
+                parts = parts.push(
                     row![rule::horizontal(1), text("New messages").size(12).color(c.red), rule::horizontal(1)]
                         .spacing(10)
                         .align_y(iced::Center)
@@ -748,8 +765,8 @@ impl Chat {
                 );
                 break_group = true;
             }
-            if prev_day.is_none_or(|d| !fmt::same_day(d, post.create_at)) {
-                col = col.push(
+            if before.is_none_or(|p| !fmt::same_day(p.create_at, post.create_at)) {
+                parts = parts.push(
                     row![rule::horizontal(1), text(fmt::day_label(post.create_at, now)).size(12).color(c.muted), rule::horizontal(1)]
                         .spacing(10)
                         .align_y(iced::Center)
@@ -757,7 +774,8 @@ impl Chat {
                 );
                 break_group = true;
             }
-            prev_day = Some(post.create_at);
+            // Whatever follows an open thread starts a fresh group.
+            let prev = before.filter(|p| !threaded(p));
             let continued = !break_group && prev.is_some_and(|p| {
                 p.user_id == post.user_id
                     && post.create_at - p.create_at < 5 * 60 * 1000
@@ -765,13 +783,41 @@ impl Chat {
                     // In a thread, keep the root post visually separate from its replies.
                     && p.is_reply() == post.is_reply()
             });
-            col = col.push(self.post_view(pv, entry, continued, kind, c, md_settings));
-            prev = Some(post);
-            if kind == Kind::Channel && pv.expanded.contains(&post.id) && self.is_inline_in(pv, &post.id) {
-                col = col.push(self.inline_thread(pv, &post.id, c, md_settings));
-                // Whatever follows the thread starts a fresh group.
-                prev = None;
+            parts = parts.push(self.post_view(pv, entry, continued, kind, c, md_settings));
+            if threaded(post) {
+                parts = parts.push(self.inline_thread(pv, &post.id, c, md_settings));
             }
+            if virtualized { virtual_list::measured(virtual_list::key(&post.id), &pv.heights, parts).into() } else { parts.into() }
+        };
+        let slots = if virtualized {
+            let heights = pv.heights.borrow();
+            let measured: Vec<Option<f32>> = entries.iter().map(|e| heights.get(&virtual_list::key(&e.post.id)).copied()).collect();
+            let below = f32::from(pad[0]) + heights.get(&TAIL).copied().unwrap_or(0.0) + trimmed;
+            drop(heights);
+            // Distances from the bottom (the list is anchored there).
+            let band = pv.viewport.map_or((0.0, 1_000.0), |v| (v.absolute_offset().y, v.absolute_offset().y + v.bounds().height));
+            let band = (band.0 - virtual_list::OVERSCAN, band.1 + virtual_list::OVERSCAN);
+            // Rows the view must find, to scroll to them.
+            let forced: Vec<usize> = [pv.jump_target.as_deref(), pv.selected.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter_map(|id| entries.iter().rposition(|e| e.post.id == id))
+                .collect();
+            virtual_list::plan(&measured, virtual_list::estimate(&pv.heights, 60.0), below, band, &forced)
+        } else {
+            (0..entries.len()).map(virtual_list::Slot::Row).collect()
+        };
+        for slot in slots {
+            col = match slot {
+                virtual_list::Slot::Row(i) => col.push(virtual_list::key(&entries[i].post.id), row(i)),
+                virtual_list::Slot::Gap { from, height } => {
+                    let key = entries.get(from).map_or(0, |e| virtual_list::gap_key(&e.post.id));
+                    col.push(key, space().height(height))
+                }
+            };
+        }
+        if trimmed > 0.0 {
+            col = col.push(TRIMMED, space().height(trimmed));
         }
         // Messages still on their way, below everything the server has.
         let (channel, root) = match kind {
@@ -780,11 +826,14 @@ impl Chat {
             Kind::Inbox => ("", "-"),
         };
         // They follow on from your own last message, like any other run.
-        let mut mine = prev.is_some_and(|p| p.user_id == self.store.me.id);
+        let last = entries.last().map(|e| &e.post);
+        let mut mine = last.is_some_and(|p| p.user_id == self.store.me.id && !threaded(p));
+        let mut tail = Column::new().spacing(2);
         for q in self.outbox.waiting(channel, root) {
-            col = col.push(self.queued_view(q, mine, c));
+            tail = tail.push(container(self.queued_view(q, mine, c)).padding(iced::Padding { top: 2.0, ..iced::Padding::ZERO }));
             mine = true;
         }
+        col = col.push(TAIL, if virtualized { virtual_list::measured(TAIL, &pv.heights, tail).into() } else { Element::from(tail) });
         let id = match kind {
             Kind::Channel | Kind::Inbox => pv.timeline(),
             Kind::Thread => iced::widget::Id::from(THREAD),

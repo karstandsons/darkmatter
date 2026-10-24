@@ -318,6 +318,36 @@ impl Store {
         t.loading_older = false;
     }
 
+    /// Keep `keep` of a channel's posts, dropping the newest (`newest`) or the
+    /// oldest: they page back in when you scroll that way. Returns the
+    /// dropped posts' ids.
+    pub fn trim(&mut self, channel_id: &str, keep: usize, newest: bool) -> Vec<Id> {
+        let Some(t) = self.timelines.get_mut(channel_id) else { return Vec::new() };
+        if t.entries.len() <= keep {
+            return Vec::new();
+        }
+        let dropped: Vec<Entry> = if newest {
+            t.has_newer = true;
+            t.entries.split_off(keep)
+        } else {
+            t.has_more = true;
+            let n = t.entries.len() - keep;
+            t.entries.drain(..n).collect()
+        };
+        dropped.into_iter().map(|e| e.post.id).collect()
+    }
+
+    /// A channel not looked at for a while: keep its newest `keep` posts
+    /// (an older stretch goes entirely; opening the channel shows the latest).
+    /// Returns whether anything went.
+    pub fn forget_history(&mut self, channel_id: &str, keep: usize) -> bool {
+        if self.timelines.get(channel_id).is_some_and(|t| t.has_newer) {
+            self.timelines.remove(channel_id).is_some()
+        } else {
+            !self.trim(channel_id, keep, false).is_empty()
+        }
+    }
+
     /// The oldest loaded post, for fetching the page before it.
     pub fn oldest(&self, channel_id: &str) -> Option<&Post> {
         self.timelines.get(channel_id)?.entries.iter().map(|e| &e.post).find(|p| !p.is_system()).or_else(|| {
@@ -626,6 +656,42 @@ mod tests {
         s.posted(post("next", "c1", "bob", 101), &[], true);
         let ids: Vec<&str> = s.timelines["c1"].entries.iter().map(|e| e.post.id.as_str()).collect();
         assert_eq!(ids, ["a", "b", "c", "d", "live", "next"]);
+    }
+
+    #[test]
+    fn trimming_keeps_one_end_and_pages_the_other_back_in() {
+        let mut s = store();
+        let list = |posts: Vec<Post>| PostList {
+            order: posts.iter().rev().map(|p| p.id.clone()).collect(),
+            posts: posts.into_iter().map(|p| (p.id.clone(), p)).collect(),
+            prev_post_id: "older".into(),
+            ..Default::default()
+        };
+        let ids = |s: &Store| s.timelines["c1"].entries.iter().map(|e| e.post.id.clone()).collect::<Vec<_>>();
+        s.set_history("c1", list((1..=6).map(|i| post(&format!("p{i}"), "c1", "bob", i)).collect()));
+        assert!(s.trim("c1", 10, true).is_empty(), "under the limit");
+
+        // Reading far back: the newest go, and wait to be paged in.
+        assert_eq!(s.trim("c1", 4, true), ["p5", "p6"]);
+        assert_eq!(ids(&s), ["p1", "p2", "p3", "p4"]);
+        assert!(s.timelines["c1"].has_newer);
+        s.posted(post("live", "c1", "bob", 100), &[], true);
+        assert!(s.post("live").is_none(), "past the end of what's loaded");
+        assert_eq!(s.newest("c1").unwrap().id, "p4");
+
+        // Reading forward again: the oldest go.
+        assert_eq!(s.trim("c1", 3, false), ["p1"]);
+        assert_eq!(s.oldest("c1").unwrap().id, "p2");
+        assert!(s.timelines["c1"].has_more);
+
+        // Out of sight for a while: an older stretch is forgotten entirely…
+        s.forget_history("c1", 2);
+        assert!(!s.timelines.contains_key("c1"));
+        // …and the latest keeps its newest page.
+        s.set_history("c1", list((1..=6).map(|i| post(&format!("p{i}"), "c1", "bob", i)).collect()));
+        s.forget_history("c1", 2);
+        assert_eq!(ids(&s), ["p5", "p6"]);
+        assert!(s.timelines["c1"].has_more && !s.timelines["c1"].has_newer);
     }
 
     #[test]

@@ -16,6 +16,19 @@ pub struct Jump {
     pub window_requested: bool,
 }
 
+/// Rows growing under the top of the view (a thread opening or closing,
+/// newer posts paging in) would push it up: the bottom anchor keeps the
+/// bottom still. While held, the view is shifted by what those rows grow.
+pub struct Hold {
+    /// The rows, by key (see `virtual_list`).
+    pub rows: Vec<u64>,
+    /// Their height already allowed for: as measured when held, or the gap
+    /// that newer posts paging in replace.
+    pub height: f32,
+    /// The offset from the bottom the view is held at.
+    pub offset: f32,
+}
+
 pub struct PaneView {
     /// Unique per pane, so each pane's widgets get their own ids.
     pub n: usize,
@@ -33,14 +46,19 @@ pub struct PaneView {
     /// The post whose position the jump scrolls to (the reply itself inline,
     /// or its root when threads open in the side pane).
     pub jump_target: Option<String>,
-    /// Latest timeline viewport, and while a thread expands or collapses above
-    /// the bottom, the (content height, offset from bottom) to keep the top still.
+    /// Latest timeline viewport.
     pub viewport: Option<Viewport>,
-    pub hold_top: Option<(f32, f32)>,
+    /// Keeping the view still while rows below its top grow (see `Hold`).
+    pub hold: Option<Hold>,
     /// The unified inbox (unread messages from every channel) instead of a channel.
     pub inbox: bool,
     /// The message picked with the vim keys (j/k), acted on by r, e, o, …
     pub selected: Option<String>,
+    /// The timeline's rows' heights, for drawing only the ones near the view.
+    pub heights: crate::virtual_list::Heights,
+    /// The height of the newest posts dropped to keep memory flat while you
+    /// read far back: kept as a gap under the posts, so nothing moves.
+    pub trimmed_below: f32,
 }
 
 impl PaneView {
@@ -55,9 +73,11 @@ impl PaneView {
             highlight: None,
             jump_target: None,
             viewport: None,
-            hold_top: None,
+            hold: None,
             inbox: false,
             selected: None,
+            heights: Default::default(),
+            trimmed_below: 0.0,
         }
     }
 

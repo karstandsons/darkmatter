@@ -24,6 +24,8 @@ pub struct Frames {
     pub frames: Vec<(Handle, Duration)>,
     size: (u32, u32),
     total: Duration,
+    /// What the decoded frames take in memory.
+    bytes: usize,
     /// When it started playing (all GIFs share the app's clock).
     start: Instant,
 }
@@ -72,7 +74,11 @@ impl Frames {
             return Err("no frames".into());
         }
         let total = frames.iter().map(|(_, d)| *d).sum();
-        Ok(Frames { frames, size, total, start: Instant::now() })
+        Ok(Frames { frames, size, total, bytes: used, start: Instant::now() })
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
     }
 
     pub fn first(&self) -> &Handle {

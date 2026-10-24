@@ -14,7 +14,7 @@ use crate::commands::{self, Command};
 use crate::session::Session;
 use crate::emoji_picker::{self, EmojiPicker};
 use crate::media;
-use crate::pane::{Jump, PaneView};
+use crate::pane::{Hold, Jump, PaneView};
 use crate::plugin_picker::{self, PluginPicker};
 use crate::plugins::{self, Plugins};
 use crate::store::Store;
@@ -156,6 +156,16 @@ const TYPING_TTL: Duration = Duration::from_secs(6);
 const HIGHLIGHT_FOR: Duration = Duration::from_secs(4);
 /// Posts loaded on each side of a jump target that isn't already loaded.
 const AROUND: u32 = 30;
+/// Posts per page of history.
+const PAGE: usize = 60;
+/// Posts a channel keeps while you read on: past this, the far end goes,
+/// and pages back in when you scroll there. (Only the ones near the view
+/// are drawn; this keeps what's held flat too.)
+const KEEP_LOADED: usize = 600;
+/// Rows' heights remembered per pane (a few hundred KB at most).
+const HEIGHTS_KEPT: usize = 10_000;
+/// Channels and threads not on screen for this long keep only their newest page.
+const FORGET_AFTER: Duration = Duration::from_secs(5 * 60);
 
 
 pub struct Chat {
@@ -278,6 +288,9 @@ pub struct Chat {
     /// Make link previews of what this account sends (axiond;
     /// `[privacy] link_previews`).
     pub link_previews: bool,
+    /// When each loaded channel and thread was last on screen, for forgetting
+    /// the ones not looked at for a while.
+    seen: HashMap<String, Instant>,
     /// Previews fetched for links in drafts, by link (`None`: none to be had).
     previews: HashMap<String, Option<dm_crypto::wire::LinkPreview>>,
     /// The calls going on in this account's channels, by channel (axiond).
@@ -487,7 +500,7 @@ impl Chat {
             );
         }
         let Some(Jump { root, post, .. }) = self.pv_mut().jump.take() else { return Task::none() };
-        self.pv_mut().hold_top = None;
+        self.pv_mut().hold = None;
         self.pv_mut().highlight = Some((post.clone(), Instant::now() + HIGHLIGHT_FOR));
         if root == post {
             self.pv_mut().jump_target = Some(post);
@@ -663,7 +676,7 @@ impl Chat {
         let (client, crypto) = (self.client.clone(), self.crypto.clone());
         Task::perform(
             async move {
-                let r = client.posts(&id, PostsQuery::After { post_id: newest, per_page: 60 }, true).await.map_err(err);
+                let r = client.posts(&id, PostsQuery::After { post_id: newest, per_page: PAGE as u32 }, true).await.map_err(err);
                 (id, crate::crypto::open_list(&crypto, r).await)
             },
             |(id, r)| Message::Newer(id, r),
@@ -674,9 +687,77 @@ impl Chat {
     fn reload_latest(&mut self) -> Task<Message> {
         let channel = self.pv().channel.clone();
         self.store.timelines.remove(&channel);
-        self.pv_mut().hold_top = None;
+        self.pv_mut().hold = None;
+        self.pv_mut().trimmed_below = 0.0;
         let id = self.pv().channel.clone();
         Task::batch([self.load_history(id), to_latest(self.pv().timeline())])
+    }
+
+    /// Keep the channel being read to `KEEP_LOADED` posts, dropping the end
+    /// away from where you're reading: the newest (`newest`) while you read
+    /// back, the oldest while you read forward. The newest leave a gap of
+    /// their height, so the view (anchored at the bottom) doesn't move.
+    /// Left alone when two panes show the channel: they may be reading at
+    /// both ends. Returns the height of what was dropped.
+    fn trim_loaded(&mut self, channel: &str, newest: bool) -> f32 {
+        if self.panes.iter().filter(|(_, p)| p.channel == channel && !p.inbox).count() != 1 {
+            return 0.0;
+        }
+        let dropped = self.store.trim(channel, KEEP_LOADED, newest);
+        let Some((_, pv)) = self.panes.iter_mut().find(|(_, p)| p.channel == channel && !p.inbox) else { return 0.0 };
+        let estimate = crate::virtual_list::estimate(&pv.heights, 60.0);
+        let heights = pv.heights.borrow();
+        let gone: f32 = dropped.iter().map(|id| heights.get(&crate::virtual_list::key(id)).copied().unwrap_or(estimate)).sum();
+        drop(heights);
+        if newest && !dropped.is_empty() {
+            pv.trimmed_below += gone;
+            tracing::debug!("dropped the newest {} posts of {channel} ({gone}px)", dropped.len());
+        } else if !dropped.is_empty() {
+            tracing::debug!("dropped the oldest {} posts of {channel} ({gone}px)", dropped.len());
+        }
+        // Dropped posts' heights stay, so they fill their gap exactly when
+        // they page back in; past a few thousand, keep only what's loaded.
+        let heights = pv.heights.get_mut();
+        if heights.len() > HEIGHTS_KEPT
+            && let Some(t) = self.store.timelines.get(channel)
+        {
+            let keep: HashSet<u64> = t.entries.iter().map(|e| crate::virtual_list::key(&e.post.id)).collect();
+            heights.retain(|k, _| keep.contains(k));
+        }
+        gone
+    }
+
+    /// Channels and threads not on screen for `FORGET_AFTER` keep only their
+    /// newest page (a thread goes entirely): opening them again shows the
+    /// latest, and older history pages in as before.
+    fn forget_unseen(&mut self, now: Instant) {
+        let inbox = self.panes.iter().any(|(_, p)| p.inbox);
+        let shown: HashSet<String> = self
+            .panes
+            .iter()
+            .flat_map(|(_, p)| std::iter::once(&p.channel).chain(&p.thread).chain(&p.expanded))
+            .cloned()
+            .collect();
+        let loaded: Vec<String> = self.store.timelines.keys().chain(self.store.threads.keys()).cloned().collect();
+        self.seen.retain(|id, _| loaded.contains(id));
+        for id in loaded {
+            let at = self.seen.entry(id.clone()).or_insert(now);
+            // The inbox draws every channel's unread posts.
+            if shown.contains(&id) || (inbox && self.store.timelines.contains_key(&id)) {
+                *at = now;
+                continue;
+            }
+            if now.duration_since(*at) < FORGET_AFTER {
+                continue;
+            }
+            self.seen.remove(&id);
+            if self.store.threads.remove(&id).is_some() {
+                tracing::debug!("forgot thread {id}");
+            }
+            if self.store.forget_history(&id, PAGE) {
+                tracing::debug!("forgot all but the newest page of {id}");
+            }
+        }
     }
 
     fn load_thread(&self, root: String) -> Task<Message> {
@@ -695,11 +776,21 @@ impl Chat {
     /// otherwise push it up and out of view). The newest message is the
     /// exception when you're at the bottom: staying there keeps its reply box in view.
     fn hold_view(&mut self, root: &str) {
-        let newest = self.store.timelines.get(&self.pv().channel).and_then(|t| t.entries.last()).is_some_and(|e| e.post.id == root);
-        let viewport = self.pv().viewport;
-        self.pv_mut().hold_top = viewport
-            .map(|v| (v.content_bounds().height, v.absolute_offset().y))
-            .filter(|(_, from_bottom)| !newest || *from_bottom > 4.0);
+        let entries = self.store.timelines.get(&self.pv().channel).map_or(&[][..], |t| &t.entries[..]);
+        let newest = entries.last().is_some_and(|e| e.post.id == root);
+        // The thread's row, and the next (after a thread, a new group starts).
+        let at = entries.iter().position(|e| e.post.id == root);
+        let rows: Vec<u64> = at.into_iter().flat_map(|i| &entries[i..entries.len().min(i + 2)]).map(|e| crate::virtual_list::key(&e.post.id)).collect();
+        let heights = self.pv().heights.borrow();
+        let height: Option<f32> = (!rows.is_empty()).then(|| rows.iter().map(|k| heights.get(k)).sum()).flatten();
+        drop(heights);
+        self.pv_mut().hold = self
+            .pv()
+            .viewport
+            .map(|v| v.absolute_offset().y)
+            .filter(|from_bottom| !newest || *from_bottom > 4.0)
+            .zip(height)
+            .map(|(offset, height)| Hold { rows, height, offset });
     }
 
     pub fn thread_draft(&self) -> &str {
@@ -799,6 +890,7 @@ impl Chat {
             pending_goto: None,
             confirm_leak: None,
             link_previews: true,
+            seen: HashMap::new(),
             previews: HashMap::new(),
             calls: HashMap::new(),
             call: None,
@@ -1576,7 +1668,9 @@ impl Chat {
             self.pv_mut().thread = None;
         }
         self.pv_mut().viewport = None;
-        self.pv_mut().hold_top = None;
+        self.pv_mut().hold = None;
+        self.pv_mut().trimmed_below = 0.0;
+        self.pv_mut().heights.get_mut().clear();
         let prev = std::mem::replace(&mut self.pv_mut().channel, id.clone());
         self.marked_unread.remove(&id);
         // An account not on screen opens its channels unread; they're read
@@ -1617,7 +1711,7 @@ impl Chat {
         let (client, crypto) = (self.client.clone(), self.crypto.clone());
         Task::perform(
             async move {
-                let r = client.posts(&id, PostsQuery::Page { page: 0, per_page: 60 }, true).await.map_err(err);
+                let r = client.posts(&id, PostsQuery::Page { page: 0, per_page: PAGE as u32 }, true).await.map_err(err);
                 (id, crate::crypto::open_list(&crypto, r).await)
             },
             |(id, r)| Message::History(id, r),
@@ -1635,11 +1729,11 @@ impl Chat {
         }
         tracing::debug!("loading posts before {oldest} in {id}");
         t.loading_older = true;
-        self.pv_mut().hold_top = None;
+        self.pv_mut().hold = None;
         let (client, crypto) = (self.client.clone(), self.crypto.clone());
         Task::perform(
             async move {
-                let query = PostsQuery::Before { post_id: oldest, per_page: 60 };
+                let query = PostsQuery::Before { post_id: oldest, per_page: PAGE as u32 };
                 let r = client.posts(&id, query, true).await.map_err(err);
                 (id, crate::crypto::open_list(&crypto, r).await)
             },
@@ -1849,7 +1943,8 @@ impl Chat {
         }
         // Results that belong to a pane find their way back to it.
         let task = task.map(move |m| m.for_pane(pane));
-        Task::batch([task, self.fetch_media()])
+        let wanted = self.media.fetch_wanted(&self.client, &self.crypto);
+        Task::batch([task, self.fetch_media(), wanted])
     }
 
     /// Avatars, image previews and custom emoji needed by what's on screen
@@ -1881,9 +1976,8 @@ impl Chat {
                     keys.push(media::Key::Avatar(u.id.clone(), u.last_picture_update));
                 }
                 for f in &post.metadata.files {
-                    if crate::lightbox::is_gif(f) {
-                        keys.push(media::Key::Gif(f.id.clone()));
-                    } else if f.mime_type.starts_with("image/") && f.has_preview_image {
+                    // A GIF decodes to tens of MB: it's fetched when it's drawn.
+                    if !crate::lightbox::is_gif(f) && f.mime_type.starts_with("image/") && f.has_preview_image {
                         keys.push(media::Key::Preview(f.id.clone()));
                     }
                 }
@@ -1912,8 +2006,12 @@ impl Chat {
             Message::SelectChannel(id) => self.select_channel(id),
             Message::History(id, Ok(list)) => {
                 let first = !self.store.timelines.get(&id).is_some_and(|t| t.loaded);
+                let older = self.store.timelines.get(&id).is_some_and(|t| t.loading_older);
                 tracing::debug!("history for {id}: {} posts, prev={:?}, first={first}", list.order.len(), list.prev_post_id);
                 self.store.set_history(&id, list);
+                if older {
+                    self.trim_loaded(&id, true);
+                }
                 let users = self.load_missing_users();
                 if !first {
                     return users;
@@ -1929,24 +2027,38 @@ impl Chat {
                 let from_top = height - viewport.bounds().height - from_bottom;
                 tracing::trace!("timeline scrolled: {from_top}px from top, {from_bottom}px from bottom");
                 self.pv_mut().viewport = Some(viewport);
-                if let Some((held_height, held_offset)) = self.pv().hold_top {
-                    let grew = height - held_height;
-                    if grew.abs() > 0.5 {
-                        // A thread opened or closed: shift by the change so the top stays put.
-                        self.pv_mut().hold_top = Some((height, held_offset + grew));
+                if let Some(hold) = &self.pv().hold {
+                    let heights = self.pv().heights.borrow();
+                    // None until they're all laid out.
+                    let now: Option<f32> = hold.rows.iter().map(|k| heights.get(k)).sum();
+                    drop(heights);
+                    let offset = hold.offset;
+                    if let Some(now) = now
+                        && let grew = now - hold.height
+                        && grew.abs() > 0.5
+                    {
+                        // A thread opened or closed, or newer posts came in:
+                        // shift by the change so the top stays put.
+                        if let Some(hold) = &mut self.pv_mut().hold {
+                            hold.height = now;
+                            hold.offset += grew;
+                        }
                         return operation::scroll_by(self.pv().timeline(), iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: grew });
                     }
-                    if (from_bottom - held_offset).abs() > 1.0 {
+                    if (from_bottom - offset).abs() > 1.0 {
                         // The user scrolled; stop holding.
-                        self.pv_mut().hold_top = None;
+                        self.pv_mut().hold = None;
                     } else {
                         return Task::none();
                     }
                 }
                 let has_newer = self.store.timelines.get(&self.pv().channel).is_some_and(|t| t.has_newer);
-                if has_newer && from_bottom < 400.0 {
+                // Page in well before the end shows; newer posts dropped
+                // earlier wait in a gap at the bottom, and before it shows.
+                let ahead = crate::virtual_list::OVERSCAN;
+                if has_newer && from_bottom < self.pv().trimmed_below + ahead {
                     self.load_newer()
-                } else if from_top < 400.0 {
+                } else if from_top < ahead {
                     self.load_older()
                 } else {
                     Task::none()
@@ -2116,7 +2228,8 @@ impl Chat {
                 if let Some(p) = thread.posts.get(&root) {
                     list.posts.insert(root.clone(), p.clone());
                 }
-                self.pv_mut().hold_top = None;
+                self.pv_mut().hold = None;
+                self.pv_mut().trimmed_below = 0.0;
                 self.store.set_window(&channel, list, has_more, has_newer);
                 self.store.set_thread(&root, thread);
                 Task::batch([self.load_missing_users(), self.continue_jump()])
@@ -2127,9 +2240,28 @@ impl Chat {
                 if self.store.timelines.get(&channel).is_some_and(|t| t.loaded) { Task::none() } else { self.load_history(channel) }
             }
             Message::Newer(id, Ok(list)) => {
-                // Posts appended below would push the view up: hold it still.
-                self.pv_mut().hold_top = self.pv().viewport.map(|v| (v.content_bounds().height, v.absolute_offset().y));
+                // Posts appended below would push the view up, less the gap
+                // they replace if they were dropped earlier: hold it still.
+                let new: Vec<&Post> = {
+                    let loaded = self.store.timelines.get(&id);
+                    list.posts.values().filter(|p| !p.is_reply() && loaded.is_some_and(|t| !t.entries.iter().any(|e| e.post.id == p.id))).collect()
+                };
+                let rows: Vec<u64> = new.iter().map(|p| crate::virtual_list::key(&p.id)).collect();
+                let back: f32 = {
+                    let pv = self.pv();
+                    let estimate = crate::virtual_list::estimate(&pv.heights, 60.0);
+                    let heights = pv.heights.borrow();
+                    rows.iter().map(|k| heights.get(k).copied().unwrap_or(estimate)).sum()
+                };
                 self.store.add_newer(&id, list);
+                let latest = !self.store.timelines.get(&id).is_some_and(|t| t.has_newer);
+                let pv = self.pv_mut();
+                let gap = pv.trimmed_below;
+                pv.trimmed_below = if latest { 0.0 } else { (gap - back).max(0.0) };
+                let height = gap - pv.trimmed_below;
+                pv.hold = pv.viewport.map(|v| Hold { rows, height, offset: v.absolute_offset().y });
+                // The oldest posts, dropped above, don't move the view.
+                self.trim_loaded(&id, false);
                 self.load_missing_users()
             }
             Message::Newer(id, Err(e)) => {
@@ -3100,6 +3232,10 @@ impl Chat {
                 .discard()
             }
             Message::Ws(msg) => self.on_ws(msg),
+            Message::Forget => {
+                self.forget_unseen(Instant::now());
+                Task::none()
+            }
             Message::Tick => {
                 crate::call::tick(self);
                 let resend = if self.outbox.is_empty() { Task::none() } else { self.flush() };
@@ -3135,6 +3271,7 @@ impl Chat {
                 self.online = true;
                 // Back online: anything waiting goes now.
                 self.outbox.retry_now();
+                self.media.retry_failed();
                 let resend = self.flush();
                 // Our own status may have been fetched before the socket was up.
                 let mine = self.store.statuses.entry(self.store.me.id.clone()).or_insert_with(|| "online".into());
@@ -3997,6 +4134,65 @@ pub(crate) mod tests {
         assert_eq!(chat.panes.len(), 1);
         // A late result for the closed pane is dropped.
         let _ = chat.update(Message::InPane(first, Box::new(Message::JumpLocated(Some(10.0)))));
+    }
+
+    /// Posts `range` of a channel, as a page of history (times are the numbers).
+    fn page(channel: &str, range: std::ops::Range<i64>, prev: &str, next: &str) -> mm_api::models::PostList {
+        let posts: Vec<Post> = range.map(|i| Post { id: format!("{channel}-{i}"), channel_id: channel.into(), user_id: "u".into(), create_at: i, ..Default::default() }).collect();
+        mm_api::models::PostList {
+            order: posts.iter().rev().map(|p| p.id.clone()).collect(),
+            posts: posts.into_iter().map(|p| (p.id.clone(), p)).collect(),
+            prev_post_id: prev.into(),
+            next_post_id: next.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reading_far_back_keeps_a_few_pages_and_leaves_a_gap_for_the_rest() {
+        let mut chat = chat();
+        let _ = chat.handle(Message::History("c1".into(), Ok(page("c1", 940..1000, "older", ""))));
+        // Fifteen pages back.
+        for n in 1..15 {
+            let top = 1000 - 60 * n;
+            chat.store.timelines.get_mut("c1").unwrap().loading_older = true;
+            let _ = chat.handle(Message::History("c1".into(), Ok(page("c1", top - 60..top, "older", ""))));
+        }
+        let t = &chat.store.timelines["c1"];
+        assert_eq!(t.entries.len(), KEEP_LOADED);
+        assert_eq!((t.entries[0].post.create_at, t.entries[KEEP_LOADED - 1].post.create_at), (100, 699));
+        assert!(t.has_newer, "the newest wait to page back in");
+        // The 300 dropped are a gap of their height (never drawn here: a guessed 60 px each).
+        assert_eq!(chat.pv().trimmed_below, 300.0 * 60.0);
+
+        // Reading forward: a page comes back into the gap, and the oldest go.
+        let _ = chat.handle(Message::Newer("c1".into(), Ok(page("c1", 700..760, "", "more"))));
+        let t = &chat.store.timelines["c1"];
+        assert_eq!((t.entries.len(), t.entries[0].post.create_at), (KEEP_LOADED, 160));
+        assert!(t.has_more && t.has_newer);
+        assert_eq!(chat.pv().trimmed_below, 240.0 * 60.0);
+        // The last page: no gap left.
+        let _ = chat.handle(Message::Newer("c1".into(), Ok(page("c1", 760..1000, "", ""))));
+        assert!(!chat.store.timelines["c1"].has_newer);
+        assert_eq!(chat.pv().trimmed_below, 0.0);
+    }
+
+    #[test]
+    fn what_is_out_of_sight_for_a_while_keeps_its_newest_page() {
+        let mut chat = chat();
+        chat.store.add_channels(vec![Channel { id: "c2".into(), ..Default::default() }], vec![ChannelMember { channel_id: "c2".into(), ..Default::default() }]);
+        chat.store.set_history("c1", page("c1", 0..200, "older", ""));
+        chat.store.set_history("c2", page("c2", 0..200, "older", ""));
+        chat.store.set_thread("c2-5", page("c2", 5..6, "", ""));
+        let t0 = Instant::now();
+        chat.forget_unseen(t0);
+        chat.forget_unseen(t0 + Duration::from_secs(60));
+        assert_eq!(chat.store.timelines["c2"].entries.len(), 200, "not yet");
+        chat.forget_unseen(t0 + FORGET_AFTER);
+        assert_eq!(chat.store.timelines["c1"].entries.len(), 200, "on screen");
+        let c2 = &chat.store.timelines["c2"];
+        assert_eq!((c2.entries.len(), c2.entries[0].post.create_at, c2.has_more), (PAGE, 140, true));
+        assert!(chat.store.threads.is_empty());
     }
 
     #[test]
