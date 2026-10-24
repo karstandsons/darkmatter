@@ -6,6 +6,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
+
 pub trait LocalStore: Send + Sync + 'static {
     /// Small values: this device's id and keys, the identity key's secret,
     /// each group's place in its handshake log.
@@ -45,6 +48,38 @@ struct Memory {
     mls: HashMap<Vec<u8>, Vec<u8>>,
     identities: HashMap<String, (String, bool)>,
     texts: HashMap<String, String>,
+}
+
+impl MemoryStore {
+    /// Everything kept, as JSON: a device's state carried from one run to
+    /// another (axiond's upgrade fixtures).
+    pub fn export(&self) -> serde_json::Value {
+        let m = self.0.lock().unwrap();
+        let b64 = |v: &[u8]| B64.encode(v);
+        serde_json::json!({
+            "kv": m.kv.iter().map(|(k, v)| (k.clone(), b64(v))).collect::<HashMap<_, _>>(),
+            "mls": m.mls.iter().map(|(k, v)| [b64(k), b64(v)]).collect::<Vec<_>>(),
+            "identities": m.identities,
+            "texts": m.texts,
+        })
+    }
+
+    /// A store holding what [`MemoryStore::export`] gave.
+    pub fn import(json: &serde_json::Value) -> Result<MemoryStore, String> {
+        fn err(e: impl std::fmt::Display) -> String {
+            e.to_string()
+        }
+        let de = |v: &str| B64.decode(v).map_err(err);
+        let kv: HashMap<String, String> = serde_json::from_value(json["kv"].clone()).map_err(err)?;
+        let mls: Vec<[String; 2]> = serde_json::from_value(json["mls"].clone()).map_err(err)?;
+        let memory = Memory {
+            kv: kv.iter().map(|(k, v)| Ok((k.clone(), de(v)?))).collect::<Result<_, String>>()?,
+            mls: mls.iter().map(|[k, v]| Ok((de(k)?, de(v)?))).collect::<Result<_, String>>()?,
+            identities: serde_json::from_value(json["identities"].clone()).map_err(err)?,
+            texts: serde_json::from_value(json["texts"].clone()).map_err(err)?,
+        };
+        Ok(MemoryStore(Arc::new(Mutex::new(memory))))
+    }
 }
 
 impl LocalStore for MemoryStore {
