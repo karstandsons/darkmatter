@@ -2,7 +2,9 @@
 # container registry, plus the static binaries and their checksums on a
 # GitHub release.
 #
-# - Push a tag like axiond-v0.2.0 (it must match crates/axiond/Cargo.toml).
+# - Push a tag like axiond-v0.2.0 (it must match crates/axiond/Cargo.toml),
+#   after the checklist in crates/axiond/README.md (Releasing): the release's
+#   upgrade fixture is made and committed first.
 # - Run it by hand (Actions → axiond release → Run workflow) for a dry run:
 #   the same builds, uploaded as workflow artifacts, nothing published.
 #

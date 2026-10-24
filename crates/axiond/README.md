@@ -160,6 +160,33 @@ docker run -d --name axiond -p 127.0.0.1:8065:8065 -v axiond:/data -e AXIOND_BEH
 docker exec -it axiond axiond setup --admin you --email you@example.com --team home
 ```
 
+## Releasing
+
+Releases are tagged `axiond-vX.Y.Z`; the `axiond release` workflow builds
+and publishes them. For each one:
+
+1. Set `version` in `crates/axiond/Cargo.toml` to `X.Y.Z`.
+2. Make its upgrade fixture, from that commit:
+
+   ```sh
+   AXIOND_FIXTURE=X.Y.Z cargo test -p axiond --test upgrade make_upgrade_fixture -- --ignored
+   ```
+
+   It runs a server with plain and encrypted conversations in it (a DM, a
+   private channel, a public channel turned encrypted, edits, reactions, a
+   linked device, a signed-out one, backups, a link request) and writes
+   `tests/fixtures/axiond-X.Y.Z.db` and `axiond-X.Y.Z.devices.json` (the
+   devices' sessions and saved state). Test passwords and keys only.
+3. Add `X.Y.Z` to the end of `UPGRADE_FIXTURES` in `tests/upgrade.rs`, and
+   check `cargo test -p axiond --test upgrade` passes.
+4. Commit the version and the fixture, then push the tag `axiond-vX.Y.Z`.
+
+From then on, every test run upgrades that release's database to the
+current code and checks the same devices still read what it held. If an
+upgrade test fails, fix the migration, never the fixture: real servers
+hold that data. Fixtures named `-dev.N` were made before the first
+release, at migration N.
+
 ## License
 
 AGPL-3.0-or-later (see [LICENSE](LICENSE)). If you run a modified axiond for
