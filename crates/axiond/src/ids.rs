@@ -10,6 +10,12 @@ pub fn new_id() -> String {
     encode(&rand::random::<[u8; 16]>())
 }
 
+/// Whether `s` has the shape of an id we made: 26 characters of the id
+/// alphabet. Anything else (such as `../`) must never reach a file path.
+pub fn is_id(s: &str) -> bool {
+    s.len() == 26 && s.bytes().all(|b| ALPHABET.contains(&b))
+}
+
 /// A session token: 128 random bits, same shape as an id.
 pub fn new_token() -> String {
     new_id()
@@ -54,6 +60,10 @@ mod tests {
         assert!(id.bytes().all(|b| ALPHABET.contains(&b)));
         assert_ne!(new_id(), id);
         assert_eq!(encode(&[0; 16]), "y".repeat(26));
+        assert!(is_id(&id));
+        for bad in ["", "../../probe", "..%2F..%2Fprobe", &format!("{id}x"), &id[1..], &id.to_uppercase(), &format!("../{}", &id[3..])] {
+            assert!(!is_id(bad), "{bad}");
+        }
     }
 
     #[test]

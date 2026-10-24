@@ -24,6 +24,10 @@ pub struct Queued {
     next_try: Option<Instant>,
     #[serde(skip)]
     pub in_flight: bool,
+    /// Waiting for its link's preview before it goes. Not kept: after a
+    /// restart it goes without.
+    #[serde(skip)]
+    held: bool,
 }
 
 /// One account's queue, kept in its encrypted database ([`crate::vault`]).
@@ -78,6 +82,17 @@ impl Outbox {
     }
 
     pub fn push(&mut self, post: NewPost) {
+        self.add(post, false);
+    }
+
+    /// Like [`Outbox::push`], but it waits for [`Outbox::release`] (its
+    /// link's preview) before it's due. It's kept meanwhile, so a crash or
+    /// a slow site can't lose it.
+    pub fn hold(&mut self, post: NewPost) {
+        self.add(post, true);
+    }
+
+    fn add(&mut self, post: NewPost, held: bool) {
         self.items.push(Queued {
             post,
             queued_at: chrono::Utc::now().timestamp_millis(),
@@ -85,8 +100,19 @@ impl Outbox {
             problem: None,
             next_try: None,
             in_flight: false,
+            held,
         });
         self.save();
+    }
+
+    /// A held message can go, after `change` (adding its preview). Whether
+    /// it's still here.
+    pub fn release(&mut self, pending_post_id: &str, change: impl FnOnce(&mut NewPost)) -> bool {
+        let Some(q) = self.items.iter_mut().find(|q| q.post.pending_post_id == pending_post_id) else { return false };
+        q.held = false;
+        change(&mut q.post);
+        self.save();
+        true
     }
 
     /// The ones to send now, marked as being sent.
@@ -94,7 +120,7 @@ impl Outbox {
         let now = Instant::now();
         self.items
             .iter_mut()
-            .filter(|q| !q.in_flight && q.next_try.is_none_or(|t| now >= t))
+            .filter(|q| !q.in_flight && !q.held && q.next_try.is_none_or(|t| now >= t))
             .map(|q| {
                 q.in_flight = true;
                 q.post.clone()
@@ -164,7 +190,7 @@ mod tests {
     use super::*;
 
     fn queued(id: &str) -> Queued {
-        Queued { post: post(id), queued_at: 0, attempts: 0, problem: None, next_try: None, in_flight: false }
+        Queued { post: post(id), queued_at: 0, attempts: 0, problem: None, next_try: None, in_flight: false, held: false }
     }
 
     fn post(id: &str) -> NewPost {
@@ -185,6 +211,22 @@ mod tests {
         assert!(o.is_empty());
         assert_eq!(backoff(1), Duration::from_secs(2));
         assert_eq!(backoff(10), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_held_message_waits_for_its_release_but_is_kept() {
+        let mut o = Outbox::default();
+        o.hold(post("a"));
+        assert!(o.due().is_empty(), "waits for its preview");
+        assert_eq!(o.items.len(), 1, "kept meanwhile");
+        assert!(o.release("a", |p| p.message.push('!')));
+        assert_eq!(o.due()[0].message, "a!");
+        assert!(!o.release("gone", |_| {}));
+        // After a restart (read back from the vault) it goes without.
+        o.hold(post("b"));
+        let saved: Vec<Queued> = serde_json::from_value(serde_json::to_value(&o.items).unwrap()).unwrap();
+        let mut o = Outbox::new(saved.into_iter().filter(|q| q.post.pending_post_id == "b").collect(), None);
+        assert_eq!(o.due().len(), 1);
     }
 
     #[tokio::test]
