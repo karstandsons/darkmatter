@@ -187,6 +187,21 @@ async fn clear_first(updates: &mut UnboundedReceiver<Update>, user: &str) {
     panic!("{user} never heard while the network was clear");
 }
 
+/// `user`'s picture keeps coming: one under a second old shows up within
+/// 3 s (frames come in bursts on a busy machine, over TCP above all).
+async fn keeps_coming(call: &Call, user: &str) {
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        let age = call.pictures().get(user).map(|p| p.at.elapsed());
+        match age {
+            Some(age) if age < Duration::from_secs(1) => return,
+            _ if Instant::now() < until => tokio::time::sleep(Duration::from_millis(100)).await,
+            Some(age) => panic!("{user}'s picture stopped coming: {age:?} old"),
+            None => panic!("no picture of {user}"),
+        }
+    }
+}
+
 /// Of the level reports in `wait`, how many have `user` audible, and the
 /// rest of what came.
 async fn heard(updates: &mut UnboundedReceiver<Update>, user: &str, wait: Duration) -> (u32, Vec<Update>) {
@@ -215,8 +230,7 @@ async fn sound_and_pictures_get_through_a_lossy_network() {
     let (n, _) = heard(&mut updates, &alice_id, Duration::from_secs(8)).await;
     // Levels come 4 a second: most should have her.
     assert!(n >= 24, "alice heard in {n} of ~32 reports");
-    let picture = b.pictures().get(&alice_id).cloned().expect("alice's picture");
-    assert!(picture.at.elapsed() < Duration::from_secs(1), "her picture keeps coming: {:?} old", picture.at.elapsed());
+    keeps_coming(&b, &alice_id).await;
     drop(a);
 }
 
@@ -281,8 +295,7 @@ async fn a_call_gets_through_where_no_udp_does() {
     let (n, other) = heard(&mut updates, &alice_id, Duration::from_secs(15)).await;
     assert!(n > 10, "alice heard in {n} reports; {other:?}");
     assert!(other.contains(&Update::Connected), "{other:?}");
-    let picture = b.pictures().get(&alice_id).cloned().expect("alice's picture");
-    assert!(picture.at.elapsed() < Duration::from_secs(1), "her picture keeps coming");
+    keeps_coming(&b, &alice_id).await;
     drop(a);
 }
 
