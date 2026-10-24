@@ -1,5 +1,28 @@
 # Vendored crates
 
+## openmls_libcrux_crypto
+
+openmls's libcrux provider, patched in from the root `Cargo.toml`
+(`[patch.crates-io]`). It's the 0.4.0 release from crates.io (MIT) with
+openmls main's [#2261](https://github.com/openmls/openmls/pull/2261) applied,
+which isn't released yet: the libcrux crates and `hpke-rs` moved to the
+releases that fix RUSTSEC-2026-0329 (`libcrux-hmac-drbg` 0.0.2) and
+RUSTSEC-2026-0330/-0331 (`libcrux-kem` 0.0.10, through `hpke-rs-libcrux`
+0.8). 0.4.0 pins the old ones exactly, so a `cargo update` can't reach them.
+
+The only changes from the published crate: those version numbers in
+`Cargo.toml`, and `libcrux_hmac::hmac`'s new signature (it writes into a
+buffer) in `src/crypto.rs`. The crate's `Cargo.toml.orig` and `Cargo.lock`
+are left out: they still named the old versions, and cargo uses neither. Our ciphersuite and the link HPKE are X25519
+ones, which #2261 leaves as they were.
+
+When openmls releases a newer `openmls_libcrux_crypto` (0.4.1 or 0.5),
+depend on it from `crates/dm-crypto`, delete this directory and its
+`[patch.crates-io]` line, and run `cargo test -p dm-crypto` and `cargo deny
+check advisories`.
+
+## webrtc-sys and libwebrtc
+
 LiveKit's `webrtc-sys` and `libwebrtc` crates, patched in from the root
 `Cargo.toml` (`[patch.crates-io]`). They're LiveKit's releases as published
 on crates.io (Apache-2.0), with one addition: **a frame transformer whose work
