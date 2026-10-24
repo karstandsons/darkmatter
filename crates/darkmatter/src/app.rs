@@ -154,6 +154,9 @@ pub enum Message {
     /// Signing in is waiting on something (a locked keyring): why.
     BootstrapWaiting(String),
     Bootstrapped(Result<Box<Bootstrap>, String>),
+    /// The channel list, reloaded after a resync; `Err` only if the server
+    /// won't have this session any more.
+    Resynced(Result<Box<Sidebar>, String>),
     SessionFailed(String),
     SelectTeam(String),
     SelectChannel(String),
@@ -359,6 +362,15 @@ pub enum LoginField {
     Mfa,
     Invite,
     Email,
+}
+
+/// What the sidebar shows: the teams, their channels and the people in DMs.
+#[derive(Debug, Clone, Default)]
+pub struct Sidebar {
+    pub teams: Vec<Team>,
+    pub channels: Vec<Channel>,
+    pub members: Vec<mm_api::models::ChannelMember>,
+    pub users: Vec<User>,
 }
 
 #[derive(Debug, Clone)]
@@ -1490,12 +1502,11 @@ impl App {
             }
             Message::Bootstrapped(Ok(b)) => match self.screen() {
                 // A resync after lost events: refresh in place, keep the selection.
+                // Signed in already: only its channel list is used. Its own
+                // vault and encryption stay; this second copy goes unused.
                 Screen::Chat(chat) => {
-                    chat.store.teams = b.teams;
-                    chat.store.add_channels(b.channels, b.members);
-                    chat.store.add_users(b.users);
                     chat.server_config = b.server_config;
-                    chat.goto_pending()
+                    chat.update(Message::Resynced(Ok(Box::new(Sidebar { teams: b.teams, channels: b.channels, members: b.members, users: b.users }))))
                 }
                 _ => self.start_chat(*b),
             },
@@ -1824,17 +1835,7 @@ pub(crate) fn bootstrap(session: Session, account: String) -> Task<Message> {
         let loaded = async {
             let client = session.client().map_err(err)?;
             let me = client.me().await.map_err(err)?;
-            let teams = client.my_teams().await.map_err(err)?;
-            let (mut channels, mut members) = (Vec::new(), Vec::new());
-            for t in &teams {
-                channels.extend(client.my_channels(&t.id).await.map_err(err)?);
-                members.extend(client.my_channel_members(&t.id).await.map_err(err)?);
-            }
-            let mut ids: Vec<String> =
-                channels.iter().filter_map(|c| c.dm_partner(&me.id)).map(str::to_string).collect();
-            ids.sort();
-            ids.dedup();
-            let users = if ids.is_empty() { Vec::new() } else { client.users_by_ids(&ids).await.map_err(err)? };
+            let Sidebar { teams, channels, members, users } = load_sidebar(&client, &me.id).await.map_err(err)?;
             // Not needed to chat, so a server that won't say isn't an error.
             let server_config = client.client_config().await.unwrap_or_else(|e| {
                 tracing::warn!("couldn't read the server's client config: {e}");
@@ -1885,6 +1886,69 @@ pub(crate) fn bootstrap(session: Session, account: String) -> Task<Message> {
         let _ = out.send(Message::Bootstrapped(loaded)).await;
     });
     Task::run(stream, std::convert::identity)
+}
+
+/// The sidebar's teams, channels and DM partners, from the server.
+async fn load_sidebar(client: &Client, me: &str) -> Result<Sidebar, mm_api::Error> {
+    let teams = client.my_teams().await?;
+    let (mut channels, mut members) = (Vec::new(), Vec::new());
+    for t in &teams {
+        channels.extend(client.my_channels(&t.id).await?);
+        members.extend(client.my_channel_members(&t.id).await?);
+    }
+    let mut ids: Vec<String> = channels.iter().filter_map(|c| c.dm_partner(me)).map(str::to_string).collect();
+    ids.sort();
+    ids.dedup();
+    let users = if ids.is_empty() { Vec::new() } else { client.users_by_ids(&ids).await? };
+    Ok(Sidebar { teams, channels, members, users })
+}
+
+/// The longest wait between tries of a resync.
+const RESYNC_MAX_WAIT: Duration = Duration::from_secs(30);
+
+/// Reloads the sidebar after the websocket lost events (the server
+/// restarted, say). Only the channel list: the vault and encryption are
+/// live and stay as they are, since a second copy of them would fall out
+/// of step. A server still coming up (refused, a 502 from its proxy) is
+/// tried again, waiting longer each time, while the chat stays on screen.
+pub(crate) fn resync(session: Session, me: String) -> Task<Message> {
+    Task::future(async move {
+        let reloaded = retrying(Duration::from_secs(1), || async { load_sidebar(&session.client()?, &me).await }).await;
+        Message::Resynced(reloaded.map(Box::new).map_err(err))
+    })
+}
+
+/// Tries `attempt` until it works or fails for good, waiting `first`, then
+/// twice as long each time (up to [`RESYNC_MAX_WAIT`]), give or take a
+/// quarter so many clients don't come back in step.
+async fn retrying<T, F: Future<Output = Result<T, mm_api::Error>>>(first: Duration, mut attempt: impl FnMut() -> F) -> Result<T, mm_api::Error> {
+    let mut wait = first;
+    loop {
+        match attempt().await {
+            Err(e) if transient(&e) => {
+                tracing::warn!("couldn't reload the channel list, trying again in {wait:?}: {e}");
+                tokio::time::sleep(jittered(wait)).await;
+                wait = (wait * 2).min(RESYNC_MAX_WAIT);
+            }
+            done => return done,
+        }
+    }
+}
+
+/// A failure that may pass: the server unreachable, restarting or busy.
+fn transient(e: &mm_api::Error) -> bool {
+    match e {
+        mm_api::Error::Http(_) | mm_api::Error::WebSocket(_) => true,
+        mm_api::Error::Api(e) => e.status_code >= 500 || e.status_code == 429 || e.status_code == 408,
+        _ => false,
+    }
+}
+
+/// `wait`, give or take up to a quarter of it.
+fn jittered(wait: Duration) -> Duration {
+    let mut b = [0u8; 2];
+    let r = if getrandom::fill(&mut b).is_ok() { u16::from_le_bytes(b) as f64 / u16::MAX as f64 } else { 0.5 };
+    wait.mul_f64(0.75 + r / 2.0)
 }
 
 /// The account's vault. While its key can't be read (a keyring locked at
@@ -2345,5 +2409,61 @@ mod tests {
         let _ = app.update(Message::Run(crate::commands::Command::AllInbox, String::new()));
         let _ = app.update(Message::Escape);
         assert_eq!((app.shared_inbox, app.active), (None, 1));
+    }
+
+    #[tokio::test]
+    async fn a_resync_waits_out_a_server_coming_back() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // Its proxy answers 502 while axiond starts, then it's back.
+        Mock::given(method("GET")).and(path("/api/v4/users/me/teams")).respond_with(ResponseTemplate::new(502)).up_to_n_times(2).with_priority(1).mount(&server).await;
+        Mock::given(method("GET")).and(path("/api/v4/users/me/teams")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "id": "t1" }]))).mount(&server).await;
+        let empty = ResponseTemplate::new(200).set_body_json(serde_json::json!([]));
+        Mock::given(method("GET")).and(path("/api/v4/users/me/teams/t1/channels")).respond_with(empty.clone()).mount(&server).await;
+        Mock::given(method("GET")).and(path("/api/v4/users/me/teams/t1/channels/members")).respond_with(empty).mount(&server).await;
+        let client = Client::new(&server.uri()).unwrap().with_token("t");
+        let mut tries = 0;
+        let sidebar = retrying(Duration::from_millis(10), || {
+            tries += 1;
+            load_sidebar(&client, "me")
+        })
+        .await
+        .unwrap();
+        assert_eq!((tries, sidebar.teams.len()), (3, 1));
+
+        // A session the server doesn't know any more isn't tried again.
+        let gone = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(401)).mount(&gone).await;
+        let client = Client::new(&gone.uri()).unwrap().with_token("t");
+        let mut tries = 0;
+        let e = retrying(Duration::from_millis(10), || {
+            tries += 1;
+            load_sidebar(&client, "me")
+        })
+        .await
+        .unwrap_err();
+        assert!(e.is_unauthorized() && tries == 1, "{e} after {tries}");
+    }
+
+    #[test]
+    fn a_resync_keeps_the_chat_on_screen() {
+        use mm_api::models::ChannelMember;
+        let mut app = app(vec![crate::chat::tests::chat()]);
+        let chat = |app: &App| match &app.servers[0].screen {
+            Screen::Chat(c) => c.store.channels.keys().cloned().collect::<std::collections::BTreeSet<_>>(),
+            _ => panic!("the login screen"),
+        };
+        // The websocket lost events: the channel list is reloaded in place,
+        // and failing for good says so without signing out.
+        let _ = app.update(Message::Ws(ws::Message::Resync).to(0));
+        let _ = app.update(Message::Resynced(Err("server error 401".into())).to(0));
+        assert_eq!(chat(&app), ["c1".to_string()].into());
+        let Screen::Chat(c) = &app.servers[0].screen else { unreachable!() };
+        assert!(c.error.as_deref().is_some_and(|e| e.contains("channel list")));
+
+        let sidebar = Sidebar { channels: vec![Channel { id: "c2".into(), ..Default::default() }], members: vec![ChannelMember { channel_id: "c2".into(), ..Default::default() }], ..Default::default() };
+        let _ = app.update(Message::Resynced(Ok(Box::new(sidebar))).to(0));
+        assert_eq!(chat(&app), ["c1".to_string(), "c2".to_string()].into());
     }
 }
