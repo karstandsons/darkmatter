@@ -1,0 +1,10 @@
+# cargo-audit (`cargo audit`), run in CI next to `cargo deny check`.
+
+[advisories]
+ignore = [
+    # rsa's Marvin attack (no fixed release exists). rsa is only in
+    # Cargo.lock: sqlx's macros list sqlx-mysql, which needs it, but axiond
+    # and Darkmatter build sqlx for SQLite alone, so it's never compiled.
+    # `cargo tree -i rsa --target all` prints nothing.
+    "RUSTSEC-2023-0071",
+]
