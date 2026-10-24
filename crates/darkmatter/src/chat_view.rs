@@ -45,6 +45,7 @@ enum Kind {
 
 impl Chat {
     pub fn view<'a>(&'a self, c: Colors, theme: &'a Theme) -> Element<'a, Message> {
+        self.media.begin_view();
         let mut layout = row![];
         if self.store.teams.len() > 1 {
             layout = layout.push(self.team_rail(c));

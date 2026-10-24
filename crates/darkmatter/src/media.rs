@@ -50,13 +50,16 @@ struct Item {
     bytes: usize,
     /// When it was last drawn (or asked for).
     used: Cell<Instant>,
+    /// The view it was last drawn in (see `begin_view`).
+    seen: Cell<u64>,
     /// Failed attempts in a row.
     tries: u32,
 }
 
 /// What the cache keeps before it drops the pictures drawn least recently.
 pub const BUDGET: usize = 64 * 1024 * 1024;
-/// Pictures drawn this recently are on screen: never dropped.
+/// Pictures loaded this recently are kept for the view to pick up, whatever
+/// the budget.
 const ON_SCREEN: Duration = Duration::from_secs(2);
 
 /// Failures after which a picture is left alone (one that isn't there, such
@@ -81,9 +84,12 @@ pub struct Cache {
     budget: usize,
     /// Dropped to stay in budget: fetched again only when drawn.
     dropped: HashSet<Key>,
-    /// Drawn but not here (dropped, failed a while ago, or never fetched),
-    /// for `fetch_wanted`.
+    /// Drawn but not here (see `touch`), for `fetch_wanted`.
     wanted: RefCell<HashSet<Key>>,
+    /// Counts the views built. What the latest one drew is on screen until
+    /// the next (an animated picture redraws without a new view), so it's
+    /// never dropped.
+    view: Cell<u64>,
 }
 
 impl Default for Cache {
@@ -94,16 +100,23 @@ impl Default for Cache {
 
 impl Cache {
     pub fn with_budget(budget: usize) -> Self {
-        Cache { items: HashMap::new(), bytes: 0, budget, dropped: HashSet::new(), wanted: RefCell::default() }
+        Cache { items: HashMap::new(), bytes: 0, budget, dropped: HashSet::new(), wanted: RefCell::default(), view: Cell::new(1) }
     }
 
-    /// An item, noting that it's drawn; one that isn't there, or failed long
-    /// enough ago, is wanted.
+    /// A new view is being built: what it draws is what's on screen.
+    pub fn begin_view(&self) {
+        self.view.set(self.view.get() + 1);
+    }
+
+    /// An item, noting that it's drawn. Wanted: one dropped to stay in
+    /// budget, a GIF not fetched yet (they're fetched when drawn), and one
+    /// that failed long enough ago.
     fn touch(&self, key: &Key) -> Option<&Media> {
         let now = Instant::now();
         match self.items.get(key) {
             Some(item) => {
                 item.used.set(now);
+                item.seen.set(self.view.get());
                 if let Media::Failed(at) = item.media
                     && due(at, item.tries, now)
                 {
@@ -112,7 +125,9 @@ impl Cache {
                 Some(&item.media)
             }
             None => {
-                self.want(key);
+                if matches!(key, Key::Gif(_)) || self.dropped.contains(key) {
+                    self.want(key);
+                }
                 None
             }
         }
@@ -170,6 +185,7 @@ impl Cache {
             if matches!(key, Key::LinkInline(_)) {
                 continue;
             }
+            tracing::debug!("fetching {key:?} (tries {tries})");
             self.put(key.clone(), Media::Loading, 0);
             if let Some(item) = self.items.get_mut(&key) {
                 item.tries = tries;
@@ -213,7 +229,9 @@ impl Cache {
     /// Fetch what was drawn but isn't here: dropped to stay in budget, or
     /// failed and due another try. (A link's inline picture is put back by
     /// the next `put_inline`.)
+    /// Also keeps to the budget, once what was just loaded is off screen.
     pub fn fetch_wanted(&mut self, client: &Client, crypto: &Shared) -> Task<Message> {
+        self.trim(Instant::now());
         let wanted: Vec<Key> = self.wanted.get_mut().drain().collect();
         if wanted.is_empty() {
             return Task::none();
@@ -292,9 +310,8 @@ impl Cache {
     }
 
     fn put(&mut self, key: Key, media: Media, bytes: usize) {
-        let used = Cell::new(Instant::now());
-        let tries = 0;
-        if let Some(old) = self.items.insert(key, Item { media, bytes, used, tries }) {
+        let (used, seen, tries) = (Cell::new(Instant::now()), Cell::new(0), 0);
+        if let Some(old) = self.items.insert(key, Item { media, bytes, used, seen, tries }) {
             self.bytes -= old.bytes;
         }
         self.bytes += bytes;
@@ -312,10 +329,11 @@ impl Cache {
         if self.bytes <= self.budget {
             return;
         }
+        let view = self.view.get();
         let mut old: Vec<(Instant, Key)> = self
             .items
             .iter()
-            .filter(|(_, i)| i.bytes > 0 && now.saturating_duration_since(i.used.get()) >= ON_SCREEN)
+            .filter(|(_, i)| i.bytes > 0 && i.seen.get() != view && now.saturating_duration_since(i.used.get()) >= ON_SCREEN)
             .map(|(k, i)| (i.used.get(), k.clone()))
             .collect();
         old.sort_by_key(|(used, _)| *used);
@@ -324,6 +342,7 @@ impl Cache {
                 break;
             }
             self.remove(&key);
+            tracing::debug!("over budget: dropped {key:?}, {} MB held", self.bytes >> 20);
             self.dropped.insert(key);
         }
     }
@@ -650,6 +669,25 @@ mod tests {
         let _ = cache.fetch_wanted(&client(), &None);
         assert_eq!(state(&cache, &a), "loading");
         assert!(cache.wanted.borrow().is_empty());
+        // What the latest view drew stays, however long ago that was…
+        cache.begin_view();
+        assert!(cache.get(&b).is_some());
+        age(&cache, &b, Duration::from_secs(600));
+        let d = Key::Preview("d".into());
+        cache.loaded(d.clone(), Ok(vec![0; 100]));
+        age(&cache, &c, Duration::from_secs(60));
+        age(&cache, &d, Duration::from_secs(60));
+        let _ = cache.fetch_wanted(&client(), &None);
+        assert_eq!((state(&cache, &b), state(&cache, &c)), ("ready", "gone"));
+        // …until a view no longer draws it.
+        cache.begin_view();
+        cache.loaded(Key::Preview("e".into()), Ok(vec![0; 100]));
+        assert_eq!((state(&cache, &b), state(&cache, &d)), ("gone", "ready"));
+
+        // Never fetched: a GIF is fetched once drawn, the rest when asked for.
+        assert!(cache.get(&Key::Preview("new".into())).is_none());
+        assert!(cache.frames(&Key::Gif("new".into())).is_none());
+        assert_eq!(cache.wanted.borrow().iter().collect::<Vec<_>>(), [&Key::Gif("new".into())]);
     }
 
     #[test]
