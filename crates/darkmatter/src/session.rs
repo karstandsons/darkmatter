@@ -2,7 +2,6 @@
 //! session token in the system keyring (or the 0600 file when there is none).
 
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -114,13 +113,22 @@ impl Session {
     }
 }
 
-/// Writes a file only you can read.
+/// Writes a file only you can read, whole: into a temporary file beside it
+/// (made 0600), then renamed over it, so a crash mid-write leaves the old
+/// file or the new one, never part of either.
 pub(crate) fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
-    std::fs::create_dir_all(path.parent().expect("has parent"))?;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    // An existing file keeps its mode through `open`.
-    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-    f.write_all(body)
+    let dir = path.parent().expect("has parent");
+    std::fs::create_dir_all(dir)?;
+    // Removed again if anything below fails.
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(body)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    // The rename itself, on disk.
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// How Darkmatter names itself to servers, e.g. `Darkmatter/0.4.0 (linux)`.
@@ -189,6 +197,34 @@ mod tests {
         let path = dir.path().join("a/f.toml");
         write_private(&path, b"x").unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        // A file that was readable by others is replaced by a private one.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, b"y").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn private_files_are_replaced_whole() {
+        use std::io::{Read, Seek};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("accounts.toml");
+        write_private(&path, b"the old list").unwrap();
+        // Whoever has the old file open still reads all of it: the new one
+        // was written beside it, not over it.
+        let mut old = std::fs::File::open(&path).unwrap();
+        write_private(&path, b"the new, longer list").unwrap();
+        let mut text = String::new();
+        old.rewind().unwrap();
+        old.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "the old list");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the new, longer list");
+        // A write that fails leaves the old file, and nothing beside it.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = write_private(&path, b"half");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the new, longer list");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temporary files left");
     }
 
     #[test]

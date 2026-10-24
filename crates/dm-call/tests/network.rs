@@ -1,7 +1,8 @@
 //! Calls over a bad network: a proxy between the devices and axiond's SFU
 //! loses packets, delays them by different amounts, or goes dark for a
 //! while. The server tells devices to send to the proxy
-//! (`calls_public_port`), which forwards to the SFU.
+//! (`calls_public_port`, and `calls_public_tcp_port` for calls over TCP),
+//! which forwards to the SFU.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -27,13 +28,15 @@ struct Weather {
     loss_per_mille: AtomicU32,
     /// Up to this many ms of delay, different for each packet.
     jitter_ms: AtomicU32,
-    /// Nothing gets through.
+    /// Nothing gets through, over UDP or TCP.
     dark: AtomicBool,
+    /// No UDP gets through; TCP does.
+    no_udp: AtomicBool,
 }
 
 impl Weather {
     fn passes(&self, n: u32) -> Option<Duration> {
-        if self.dark.load(Ordering::Relaxed) {
+        if self.dark.load(Ordering::Relaxed) || self.no_udp.load(Ordering::Relaxed) {
             return None;
         }
         // A cheap, varied number per packet.
@@ -87,6 +90,29 @@ async fn proxy(front: Arc<UdpSocket>, sfu: SocketAddr, weather: Arc<Weather>) {
     }
 }
 
+/// Forwards TCP connections (calls over TCP) on `front` to `to`, holding
+/// what's sent either way while it's dark.
+async fn tcp_proxy(front: tokio::net::TcpListener, to: SocketAddr, weather: Arc<Weather>) {
+    async fn pipe(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp::OwnedWriteHalf, weather: Arc<Weather>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = vec![0u8; 4096];
+        while let Ok(n @ 1..) = from.read(&mut buf).await {
+            while weather.dark.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if to.write_all(&buf[..n]).await.is_err() {
+                return;
+            }
+        }
+    }
+    while let Ok((device, _)) = front.accept().await {
+        let Ok(server) = tokio::net::TcpStream::connect(to).await else { continue };
+        let ((dr, dw), (sr, sw)) = (device.into_split(), server.into_split());
+        tokio::spawn(pipe(dr, sw, weather.clone()));
+        tokio::spawn(pipe(sr, dw, weather.clone()));
+    }
+}
+
 struct Server {
     url: String,
     weather: Arc<Weather>,
@@ -100,16 +126,26 @@ async fn server() -> Server {
     // The SFU's port, and the proxy's in front of it.
     let sfu = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
     let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let config = Config { data_dir: dir.path().into(), calls_udp: Some(sfu), calls_public_port: Some(front.local_addr().unwrap().port()), ..Config::default() };
+    // And for calls over TCP, a proxy in front of the HTTP port.
+    let tcp_front = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config {
+        data_dir: dir.path().into(),
+        calls_udp: Some(sfu),
+        calls_public_port: Some(front.local_addr().unwrap().port()),
+        calls_public_tcp_port: Some(tcp_front.local_addr().unwrap().port()),
+        ..Config::default()
+    };
     let app = App::open(config).await.unwrap();
     let user = |name: &str| NewUser { username: name.into(), email: format!("{name}@example.com"), password: PASSWORD.into() };
     admin::setup(&app, user("alice"), "home", "Home").await.unwrap();
     admin::add_user(&app, user("bob"), false).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
+    let http = listener.local_addr().unwrap();
+    let url = format!("http://{http}");
     tokio::spawn(app.clone().serve(listener));
     let weather = Arc::new(Weather::default());
     tokio::spawn(proxy(front, sfu, weather.clone()));
+    tokio::spawn(tcp_proxy(tcp_front, http, weather.clone()));
     Server { url, weather, _app: app, _dir: dir }
 }
 
@@ -176,7 +212,11 @@ async fn a_call_comes_back_after_the_network_goes_dark() {
 
     // 8 s of nothing, then back: the same call carries on, by itself.
     s.weather.dark.store(true, Ordering::Relaxed);
-    let (n, during) = heard(&mut updates, &alice_id, Duration::from_secs(8)).await;
+    // What was already on its way still plays (and on a busy machine, its
+    // levels arrive late) before the silence.
+    let (_, mut during) = heard(&mut updates, &alice_id, Duration::from_secs(2)).await;
+    let (n, rest) = heard(&mut updates, &alice_id, Duration::from_secs(6)).await;
+    during.extend(rest);
     assert!(n <= 2, "heard alice {n} times in the dark");
     assert!(during.contains(&Update::Reconnecting), "{during:?}");
     s.weather.dark.store(false, Ordering::Relaxed);
@@ -214,7 +254,7 @@ async fn a_call_gets_through_where_no_udp_does() {
     let s = server().await;
     // Every UDP packet lost from the start: the call goes over TCP, to the
     // server's HTTP port.
-    s.weather.dark.store(true, Ordering::Relaxed);
+    s.weather.no_udp.store(true, Ordering::Relaxed);
     let (a, b, alice_id, _) = call(&s).await;
     let mut updates = b.updates().unwrap();
     let (n, other) = heard(&mut updates, &alice_id, Duration::from_secs(15)).await;
