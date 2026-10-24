@@ -29,6 +29,11 @@ The release workflow uses each version's section here as its release notes.
   under Devices. A call that drops (a new network, a blip) comes back by
   itself, and calls get through networks that block UDP (over the
   server's HTTPS port).
+- **Fixed:** a keyring that was locked or not answering yet (at login, say)
+  could make Darkmatter start this device over, losing its encryption
+  keys and unsent messages. Now it waits for the keyring, says so, and
+  carries on when it answers. The account list and pane layout are saved
+  whole, so a crash while saving can't leave them half written.
 
 ## [0.5.0] - 2026-10-21
 

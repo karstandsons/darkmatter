@@ -127,7 +127,7 @@ fn oembed(url: &str) -> Option<String> {
 pub fn from_html(url: &str, html: &str) -> (LinkPreview, Option<String>) {
     let head = &html[..html.find("</head>").unwrap_or(html.len())];
     let mut meta = std::collections::HashMap::new();
-    for tag in head.split('<').skip(1).filter(|t| t.len() > 5 && t[..5].eq_ignore_ascii_case("meta ")) {
+    for tag in head.split('<').skip(1).filter(|t| t.get(..5).is_some_and(|start| start.eq_ignore_ascii_case("meta "))) {
         let tag = &tag[..tag.find('>').unwrap_or(tag.len())];
         let name = attr(tag, "property").or_else(|| attr(tag, "name")).map(|n| n.to_ascii_lowercase());
         if let (Some(name), Some(content)) = (name, attr(tag, "content")) {

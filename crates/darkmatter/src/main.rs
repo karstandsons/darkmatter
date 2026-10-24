@@ -7,6 +7,7 @@ mod chat;
 mod chat_view;
 mod commands;
 mod config;
+mod crash;
 mod crypto;
 mod emoji_picker;
 mod layout;
@@ -67,6 +68,7 @@ fn main() -> iced::Result {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
         .init();
+    crash::install();
     migrate_old_name();
     // Read-only: never change anything on the server (for trying it on a real one).
     let read_only = std::env::args().any(|a| a == "--read-only")

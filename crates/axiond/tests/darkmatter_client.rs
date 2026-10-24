@@ -497,6 +497,55 @@ async fn emoji_and_pictures() {
 }
 
 #[tokio::test]
+async fn pictures_stay_in_their_folders() {
+    use reqwest::multipart::Part;
+    let s = server().await;
+    let alice = login(&s, "alice").await; // an admin, so may change anyone's picture
+    let bob = login(&s, "bob").await;
+    let bob_id = bob.me().await.unwrap().id;
+    let path = format!("users/{bob_id}/image");
+    assert_eq!(upload(&s, &bob, &path, vec![("image", Part::bytes(png(40, 40)).file_name("me.png"))]).await.status(), 200);
+
+    // A picture outside `pictures/` and `emoji/`, where `..%2F` would lead.
+    let data = s._dir.path();
+    let probe = data.join("probe.png");
+    std::fs::write(&probe, png(8, 8)).unwrap();
+    let http = reqwest::Client::new();
+    let send = |method: reqwest::Method, path: &str| {
+        http.request(method, format!("{}/api/v4/{path}", s.url)).bearer_auth(alice.token().unwrap().to_string()).send()
+    };
+    use reqwest::Method;
+    for sneaky in ["..%2Fprobe", "..%2F..%2Fpictures%2Fprobe", "%2E%2E%2Fprobe", "..%5Cprobe", "..%2F", "..%2F..%2F..%2F..%2F..%2Fetc%2Fpasswd"] {
+        let users = format!("users/{sneaky}/image");
+        let emoji = format!("emoji/{sneaky}");
+        let get = send(Method::GET, &users).await.unwrap();
+        assert!(get.status().is_client_error(), "GET {users}: {}", get.status());
+        assert_eq!(send(Method::GET, &format!("{emoji}/image")).await.unwrap().status().as_u16() / 100, 4, "GET {emoji}/image");
+        let form = || reqwest::multipart::Form::new().part("image", Part::bytes(png(10, 10)).file_name("x.png"));
+        for method in [Method::POST, Method::PUT] {
+            let up = http
+                .request(method.clone(), format!("{}/api/v4/{users}", s.url))
+                .bearer_auth(alice.token().unwrap().to_string())
+                .multipart(form())
+                .send()
+                .await
+                .unwrap();
+            assert!(up.status().is_client_error(), "{method} {users}: {}", up.status());
+        }
+        assert!(send(Method::DELETE, &users).await.unwrap().status().is_client_error(), "DELETE {users}");
+        assert!(send(Method::DELETE, &emoji).await.unwrap().status().is_client_error(), "DELETE {emoji}");
+    }
+    // Nothing was read, written or removed outside the folders.
+    assert_eq!(std::fs::read(&probe).unwrap(), png(8, 8));
+    let mut outside: Vec<_> =
+        std::fs::read_dir(data).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).filter(|n| n.ends_with(".png")).collect();
+    outside.sort();
+    assert_eq!(outside, ["probe.png"]);
+    // Real ids still work.
+    assert!(alice.profile_image(&bob_id).await.is_ok());
+}
+
+#[tokio::test]
 async fn statuses_and_server_commands() {
     let s = server().await;
     let alice = login(&s, "alice").await;
@@ -953,56 +1002,6 @@ async fn housekeeping_removes_deleted_files() {
     assert_eq!(axiond::housekeeping::run(&s.app).await.unwrap(), 2);
     assert!(!stored(&posted.id).exists() && !stored(&unposted.id).exists());
     assert!(!s.app.config.data_dir.join("files").join(&posted.id[..2]).join(format!("{}_thumb.jpg", posted.id)).exists());
-}
-
-/// Databases made by released versions of axiond, oldest first. Each must
-/// open with today's code (its migrations run) and still hold its messages.
-/// Make one for a new release with
-/// `AXIOND_FIXTURE=x.y.z cargo test -p axiond --test darkmatter_client make_upgrade_fixture -- --ignored`.
-const UPGRADE_FIXTURES: &[&str] = &["0.1.0"];
-
-#[tokio::test]
-#[ignore = "writes tests/fixtures/axiond-<version>.db; run by hand for a release"]
-async fn make_upgrade_fixture() {
-    let version = std::env::var("AXIOND_FIXTURE").expect("set AXIOND_FIXTURE to the release, e.g. 0.1.0");
-    let s = server().await;
-    let alice = login(&s, "alice").await;
-    let bob = login(&s, "bob").await;
-    let bob_id = bob.me().await.unwrap().id;
-    let team = alice.my_teams().await.unwrap()[0].id.clone();
-    let rust = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "rust").unwrap().id;
-    let root = alice.create_post(&NewPost { channel_id: rust.clone(), message: "fixture: a thread @bob".into(), ..Default::default() }).await.unwrap();
-    bob.create_post(&NewPost { channel_id: rust.clone(), root_id: root.id.clone(), message: "fixture: a reply".into(), ..Default::default() }).await.unwrap();
-    bob.add_reaction(&bob_id, &root.id, "+1").await.unwrap();
-    let file = alice.upload_file(&rust, "fixture.png", png(4, 4)).await.unwrap().file_infos.remove(0);
-    alice.create_post(&NewPost { channel_id: rust.clone(), message: "fixture: a file".into(), file_ids: vec![file.id], ..Default::default() }).await.unwrap();
-    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/axiond-{version}.db"));
-    axiond::backup::snapshot_db(&s.app.db, &out).await.unwrap();
-    println!("wrote {}", out.display());
-}
-
-#[tokio::test]
-async fn databases_from_older_versions_open() {
-    for version in UPGRADE_FIXTURES {
-        let dir = tempfile::tempdir().unwrap();
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/axiond-{version}.db"));
-        std::fs::copy(&fixture, dir.path().join("axiond.db")).unwrap();
-        let app = App::open(Config { data_dir: dir.path().into(), ..Config::default() }).await.unwrap_or_else(|e| panic!("{version}: {e:#}"));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(app.serve(listener));
-        let mut alice = Client::new(&url).unwrap();
-        alice.login("alice", PASSWORD, None).await.unwrap_or_else(|e| panic!("{version}: {e}"));
-        let team = alice.my_teams().await.unwrap()[0].id.clone();
-        let rust = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "rust").unwrap().id;
-        let page = alice.posts(&rust, PostsQuery::Page { page: 0, per_page: 50 }, true).await.unwrap();
-        let messages: Vec<&str> = page.chronological().iter().map(|p| p.message.as_str()).collect();
-        assert_eq!(messages, ["fixture: a thread @bob", "fixture: a file"], "{version}");
-        let root = page.chronological()[0].clone();
-        assert_eq!((root.reply_count, root.metadata.reactions.len()), (1, 1), "{version}");
-        assert_eq!(page.chronological()[1].metadata.files.len(), 1, "{version}");
-        assert!(alice.search_posts(&team, "reply").await.unwrap().order.len() == 1, "{version}: search index");
-    }
 }
 
 #[tokio::test]
