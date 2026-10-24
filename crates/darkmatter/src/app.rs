@@ -62,6 +62,8 @@ pub struct App {
     account: Option<Account>,
     /// Reporting or blocking from a message.
     report: Option<Report>,
+    /// The last run crashed: its crash log, shown until dismissed.
+    crashed: Option<std::path::PathBuf>,
 }
 
 enum Screen {
@@ -159,8 +161,9 @@ pub enum Message {
     Draft(String),
     /// A draft's link preview, fetched (`None`: there's none).
     LinkPreview(String, Option<dm_crypto::wire::LinkPreview>),
-    /// A message whose link's preview was fetched as it was sent: it goes now.
-    Previewed(Box<mm_api::models::NewPost>, Option<dm_crypto::wire::LinkPreview>),
+    /// The link preview of a message waiting in the outbox (by its pending
+    /// id) was fetched as it was sent: it goes now.
+    Previewed(String, Option<dm_crypto::wire::LinkPreview>),
     Send,
     /// The server's answer to a message from the outbox: (its pending id,
     /// the post, or the problem and whether to try again).
@@ -198,6 +201,9 @@ pub enum Message {
     UpdateInstalled(Result<(), String>),
     /// Start the newly installed version and quit this one.
     RestartNow,
+    /// The crash notice's buttons: open the crash log's folder, or dismiss.
+    ShowCrash,
+    CrashSeen,
     /// The server's custom emoji.
     CustomEmoji(Result<Vec<mm_api::models::CustomEmoji>, String>),
     /// A message from a pane's widgets, or a result for that pane.
@@ -378,6 +384,19 @@ pub struct Bootstrap {
     pub linking: Option<dm_client::Linking>,
 }
 
+/// The bar along the top after a crash: where its log is.
+fn crash_notice(path: &std::path::Path, c: Colors) -> Element<'static, Message> {
+    let row = iced::widget::row![
+        text("⚠").color(c.red),
+        text(crate::crash::notice(path)).size(13).color(c.fg).width(Length::Fill),
+        button(text("Show file").size(12)).on_press(Message::ShowCrash).style(c.link_button()),
+        button(text("Dismiss").size(12)).on_press(Message::CrashSeen).style(c.link_button()),
+    ]
+    .spacing(10)
+    .align_y(iced::Alignment::Center);
+    container(row).width(Length::Fill).padding([6, 12]).style(c.panel(c.surface)).into()
+}
+
 pub(crate) fn err(e: mm_api::Error) -> String {
     e.to_string()
 }
@@ -441,6 +460,7 @@ impl App {
             plugin_manager: None,
             account: None,
             report: None,
+            crashed: crate::crash::take_last(),
         };
         app.apply_theme();
         let os_theme = iced::system::theme().map(Message::OsTheme);
@@ -1421,6 +1441,18 @@ impl App {
                 self.sync_updates();
                 Task::none()
             }
+            Message::ShowCrash => {
+                if let Some(dir) = self.crashed.as_ref().and_then(|p| p.parent())
+                    && let Err(e) = open::that_detached(dir)
+                {
+                    tracing::warn!("couldn't open {}: {e}", dir.display());
+                }
+                Task::none()
+            }
+            Message::CrashSeen => {
+                self.crashed = None;
+                Task::none()
+            }
             Message::RestartNow => {
                 let restarted = crate::update::exe_path().ok_or_else(|| "couldn't find Darkmatter's binary".to_string()).and_then(|exe| crate::update::relaunch(&exe));
                 match restarted {
@@ -1691,6 +1723,10 @@ impl App {
         });
         let body: Element<'_, Message> = match entries {
             Some(entries) => iced::widget::row![crate::rail::view(entries, (self.shared_inbox.is_some(), waiting), self.rail_menu.is_some(), c), body].into(),
+            None => body,
+        };
+        let body: Element<'_, Message> = match &self.crashed {
+            Some(path) => column![crash_notice(path, c), body].into(),
             None => body,
         };
         // Always a stack, so opening or closing the picker keeps the state
@@ -2077,6 +2113,7 @@ mod tests {
             plugin_manager: None,
             account: None,
             report: None,
+            crashed: None,
         }
     }
 
