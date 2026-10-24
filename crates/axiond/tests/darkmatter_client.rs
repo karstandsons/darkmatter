@@ -499,6 +499,55 @@ async fn emoji_and_pictures() {
 }
 
 #[tokio::test]
+async fn pictures_stay_in_their_folders() {
+    use reqwest::multipart::Part;
+    let s = server().await;
+    let alice = login(&s, "alice").await; // an admin, so may change anyone's picture
+    let bob = login(&s, "bob").await;
+    let bob_id = bob.me().await.unwrap().id;
+    let path = format!("users/{bob_id}/image");
+    assert_eq!(upload(&s, &bob, &path, vec![("image", Part::bytes(png(40, 40)).file_name("me.png"))]).await.status(), 200);
+
+    // A picture outside `pictures/` and `emoji/`, where `..%2F` would lead.
+    let data = s._dir.path();
+    let probe = data.join("probe.png");
+    std::fs::write(&probe, png(8, 8)).unwrap();
+    let http = reqwest::Client::new();
+    let send = |method: reqwest::Method, path: &str| {
+        http.request(method, format!("{}/api/v4/{path}", s.url)).bearer_auth(alice.token().unwrap().to_string()).send()
+    };
+    use reqwest::Method;
+    for sneaky in ["..%2Fprobe", "..%2F..%2Fpictures%2Fprobe", "%2E%2E%2Fprobe", "..%5Cprobe", "..%2F", "..%2F..%2F..%2F..%2F..%2Fetc%2Fpasswd"] {
+        let users = format!("users/{sneaky}/image");
+        let emoji = format!("emoji/{sneaky}");
+        let get = send(Method::GET, &users).await.unwrap();
+        assert!(get.status().is_client_error(), "GET {users}: {}", get.status());
+        assert_eq!(send(Method::GET, &format!("{emoji}/image")).await.unwrap().status().as_u16() / 100, 4, "GET {emoji}/image");
+        let form = || reqwest::multipart::Form::new().part("image", Part::bytes(png(10, 10)).file_name("x.png"));
+        for method in [Method::POST, Method::PUT] {
+            let up = http
+                .request(method.clone(), format!("{}/api/v4/{users}", s.url))
+                .bearer_auth(alice.token().unwrap().to_string())
+                .multipart(form())
+                .send()
+                .await
+                .unwrap();
+            assert!(up.status().is_client_error(), "{method} {users}: {}", up.status());
+        }
+        assert!(send(Method::DELETE, &users).await.unwrap().status().is_client_error(), "DELETE {users}");
+        assert!(send(Method::DELETE, &emoji).await.unwrap().status().is_client_error(), "DELETE {emoji}");
+    }
+    // Nothing was read, written or removed outside the folders.
+    assert_eq!(std::fs::read(&probe).unwrap(), png(8, 8));
+    let mut outside: Vec<_> =
+        std::fs::read_dir(data).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).filter(|n| n.ends_with(".png")).collect();
+    outside.sort();
+    assert_eq!(outside, ["probe.png"]);
+    // Real ids still work.
+    assert!(alice.profile_image(&bob_id).await.is_ok());
+}
+
+#[tokio::test]
 async fn statuses_and_server_commands() {
     let s = server().await;
     let alice = login(&s, "alice").await;
