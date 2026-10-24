@@ -609,11 +609,16 @@ mod tests {
         v.pool.close().await;
     }
 
-    /// Everything in the folder, by name.
+    /// Everything in the folder that holds data, by name. SQLite's shared
+    /// memory index and an empty log come and go with connections (a failed
+    /// open, one still closing), so they're left out.
     fn files(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
         std::fs::read_dir(dir).unwrap().filter_map(|e| {
             let e = e.unwrap();
-            Some((e.file_name().into_string().unwrap(), std::fs::read(e.path()).ok()?))
+            let name = e.file_name().into_string().unwrap();
+            let bytes = std::fs::read(e.path()).ok()?;
+            let scratch = name.ends_with("-shm") || (name.ends_with("-wal") && bytes.is_empty());
+            (!scratch).then_some((name, bytes))
         }).collect()
     }
 
