@@ -31,6 +31,17 @@ pub fn verify_password(hash: Option<&str>, password: &str) -> bool {
     Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok() && hash.is_some()
 }
 
+/// Password checks run at once, at most: each takes about 19 MiB.
+const CHECKS_AT_ONCE: usize = 2;
+
+/// [`verify_password`] off the async threads, a few at a time, so a burst
+/// of logins can't use up the memory.
+pub async fn check_password(hash: Option<String>, password: String) -> bool {
+    static TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CHECKS_AT_ONCE);
+    let Ok(_turn) = TURNS.acquire().await else { return false };
+    tokio::task::spawn_blocking(move || verify_password(hash.as_deref(), &password)).await.unwrap_or(false)
+}
+
 /// Rules for new passwords.
 pub fn check_new_password(password: &str) -> Result<(), String> {
     if password.chars().count() < 10 {

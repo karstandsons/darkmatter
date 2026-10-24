@@ -17,7 +17,7 @@ pub use tcp::Split;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Mutex, OnceLock};
 
 use mm_api::models::{Call as CallInfo, CallParticipant, CallUpdate, JoinedCall};
 use serde_json::json;
@@ -46,7 +46,7 @@ pub struct Calls {
 }
 
 struct Sfu {
-    tx: Mutex<mpsc::Sender<sfu::In>>,
+    inbox: sfu::Inbox,
     /// What devices are told to send media to: UDP, and TCP on the HTTPS
     /// port for networks without UDP.
     candidate: SocketAddr,
@@ -105,22 +105,26 @@ pub async fn start(app: &App, http: SocketAddr) -> anyhow::Result<()> {
     };
     let _ = app.calls.rows.set(group::server_rows(app).await?);
     str0m::crypto::from_feature_flags().install_process_default();
-    let (tx, rx) = mpsc::channel();
+    let (inbox, rx, ctl) = sfu::queues();
     let (gone_tx, mut gone_rx) = tokio::sync::mpsc::unbounded_channel();
-    let inbox = tx.clone();
-    std::thread::Builder::new().name("sfu".into()).spawn(move || sfu::run(socket, candidate, tcp_candidate, inbox, rx, gone_tx))?;
-    if app.calls.sfu.set(Sfu { tx: Mutex::new(tx), candidate, tcp_candidate }).is_err() {
+    let reader = inbox.clone();
+    std::thread::Builder::new().name("sfu".into()).spawn(move || sfu::supervise(socket, candidate, tcp_candidate, reader, rx, ctl, gone_tx))?;
+    if app.calls.sfu.set(Sfu { inbox, candidate, tcp_candidate }).is_err() {
         anyhow::bail!("calls started twice");
     }
     match tcp_candidate {
         Some(tcp) => tracing::info!("calls: media on udp {bound}, devices send to {candidate} (or tcp {tcp})"),
         None => tracing::info!("calls: media on udp {bound}, devices send to {candidate}"),
     }
-    // A device whose connection dropped is out of its call.
+    // A device whose connection dropped is out of its call; all of them,
+    // if the SFU started again.
     let app = app.clone();
     tokio::spawn(async move {
-        while let Some(peer) = gone_rx.recv().await {
-            let left = app.calls.remove(&app, None, |m| m.peer == peer);
+        while let Some(gone) = gone_rx.recv().await {
+            let left = match gone {
+                sfu::Gone::Peer(peer) => app.calls.remove(&app, None, |m| m.peer == peer),
+                sfu::Gone::All => app.calls.remove(&app, None, |_| true),
+            };
             announce_all(&app, left).await;
         }
     });
@@ -134,7 +138,7 @@ impl Calls {
 
     fn send(&self, cmd: sfu::Cmd) {
         if let Some(sfu) = self.sfu.get() {
-            let _ = sfu.tx.lock().unwrap().send(sfu::In::Cmd(cmd));
+            sfu.inbox.control(sfu::Ctl::Cmd(cmd));
         }
     }
 

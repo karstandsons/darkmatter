@@ -81,7 +81,10 @@ pub fn router(app: App) -> Router {
         .route("/users/status/ids", post(status::by_ids))
         .route("/users/{id}/status", get(status::get_one).put(status::put))
         .route("/users/autocomplete", get(users::autocomplete))
-        .route("/users/{id}/image", get(images::picture).post(images::upload_picture).delete(images::remove_picture))
+        .route(
+            "/users/{id}/image",
+            get(images::picture).post(images::upload_picture).delete(images::remove_picture).layer(axum::extract::DefaultBodyLimit::max(images::PICTURE_BODY)),
+        )
         .route("/users/me/teams", get(users::my_teams))
         .route("/users/me/teams/{team}/channels", get(channels::mine))
         .route("/users/me/teams/{team}/channels/members", get(channels::my_members))
@@ -120,7 +123,10 @@ pub fn router(app: App) -> Router {
         .route("/websocket", get(ws::websocket))
         .fallback(not_yet);
     let https = app.config.behind_proxy || !matches!(app.config.tls(), Ok(crate::config::Tls::None));
-    let router = Router::new().nest("/api/v4", api).layer(axum::middleware::from_fn_with_state(app.clone(), crate::limits::by_address));
+    let router = Router::new()
+        .nest("/api/v4", api)
+        .layer(axum::middleware::from_fn_with_state(app.clone(), deadline))
+        .layer(axum::middleware::from_fn_with_state(app.clone(), crate::limits::by_address));
     // Once a server is on HTTPS, browsers and apps should never try plain HTTP.
     let router = if https {
         router.layer(axum::middleware::map_response(|mut r: axum::response::Response| async move {
@@ -139,6 +145,32 @@ pub fn router(app: App) -> Router {
 fn upload_limit(app: &App) -> usize {
     let file = app.config.max_file_mb.saturating_mul(1024 * 1024) as usize;
     file.saturating_mul(files::MAX_PER_POST).saturating_add(1024 * 1024)
+}
+
+/// How long an upload (a multipart form) may take in all; it's dropped
+/// sooner if it stops sending.
+const UPLOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Middleware: answers 503 for a request that takes longer than
+/// `request_timeout_secs` (uploads get [`UPLOAD_DEADLINE`]). A websocket
+/// or download is answered at once and streams after, so it isn't cut off.
+async fn deadline(State(app): State<App>, req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let multipart = req.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("multipart/"));
+    let limit = match app.config.request_timeout_secs {
+        0 => return next.run(req).await,
+        _ if multipart => UPLOAD_DEADLINE,
+        secs => std::time::Duration::from_secs(secs),
+    };
+    match tokio::time::timeout(limit, next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => Error {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            id: "axiond.timeout",
+            message: "The server took too long to answer. Try again in a moment.".into(),
+        }
+        .into_response(),
+    }
 }
 
 async fn ping() -> Json<Value> {
@@ -166,4 +198,39 @@ async fn not_yet() -> Error {
 /// `{"status":"OK"}`, what Mattermost answers when there's nothing else to say.
 fn ok() -> Result<Json<Value>> {
     Ok(Json(json!({ "status": "OK" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use axum::routing::{get, post};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn slow_requests_time_out_but_uploads_have_longer() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::Config { data_dir: dir.path().into(), request_timeout_secs: 1, ..Default::default() };
+        let app = App::open(config).await.unwrap();
+        let slow = || async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            "done"
+        };
+        let router = Router::new()
+            .route("/slow", get(slow))
+            .route("/upload", post(slow))
+            .layer(axum::middleware::from_fn_with_state(app.clone(), deadline))
+            .with_state(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+
+        let http = reqwest::Client::new();
+        let resp = http.get(format!("{url}/slow")).send().await.unwrap();
+        assert_eq!(resp.status(), 503);
+        let form = reqwest::multipart::Form::new().text("a", "b");
+        let resp = http.post(format!("{url}/upload")).multipart(form).send().await.unwrap();
+        assert_eq!((resp.status().as_u16(), resp.text().await.unwrap().as_str()), (200, "done"));
+    }
 }

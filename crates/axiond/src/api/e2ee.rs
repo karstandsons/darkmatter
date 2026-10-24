@@ -245,7 +245,7 @@ pub async fn reset_identity(State(app): State<App>, me: Me, Json(body): Json<Res
         return Err(Error::too_many(format!("Too many wrong passwords. Try again in {} minutes.", wait.as_secs().div_ceil(60))));
     }
     let password = body.password;
-    let ok = tokio::task::spawn_blocking(move || auth::verify_password(Some(&hash), &password)).await.map_err(|_| Error::internal())?;
+    let ok = auth::check_password(Some(hash), password).await;
     if !ok {
         app.guard.failed(&username);
         return Err(Error::bad_request("That isn't your password."));
@@ -434,21 +434,42 @@ pub struct Claim {
 }
 
 /// One key package for each device of each user (but this one): a one-time
-/// one while they last, then the last-resort one.
+/// one while they last, then the last-resort one. Only of people who share
+/// a channel with `me` (and `me`'s own devices); and past a few one-time
+/// packages of the same person in a while, the last-resort one, so no one
+/// can use up someone else's.
 pub async fn claim_key_packages(State(app): State<App>, me: Me, Json(body): Json<Claim>) -> Result<Json<Vec<ClaimedKeyPackage>>> {
     if body.user_ids.len() > 200 {
         return Err(Error::bad_request("Too many people at once."));
     }
+    if app.limiter.take(&format!("claim {}", me.user_id), crate::limits::CLAIMS).is_err() {
+        return Err(Error::too_many("Too many key package claims. Try again in a moment."));
+    }
+    let shared: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT them.user_id FROM channel_members mine JOIN channel_members them ON them.channel_id = mine.channel_id \
+         WHERE mine.user_id = ?1 AND them.user_id IN (SELECT value FROM json_each(?2))",
+    )
+    .bind(&me.user_id)
+    .bind(serde_json::to_string(&body.user_ids).unwrap_or_default())
+    .fetch_all(&app.db)
+    .await?;
     let mut out = Vec::new();
     let mut tx = crate::db::write(&app.db).await?;
+    let mut seen = std::collections::HashSet::new();
     for user in &body.user_ids {
+        if !seen.insert(user) || (user != &me.user_id && !shared.contains(user)) {
+            continue;
+        }
+        let one_time = user == &me.user_id || app.limiter.take(&format!("claim {} of {user}", me.user_id), crate::limits::CLAIMS_OF_ONE).is_ok();
         let devices: Vec<String> = sqlx::query_scalar("SELECT device_id FROM e2ee_devices WHERE user_id = ? AND revoked_at = 0").bind(user).fetch_all(&mut *tx).await?;
         for device in devices.into_iter().filter(|d| !(user == &me.user_id && d == &me.device_id)) {
             let row: Option<(i64, Vec<u8>, bool)> = sqlx::query_as(
-                "SELECT id, data, last_resort FROM e2ee_key_packages WHERE user_id = ? AND device_id = ? ORDER BY last_resort, id LIMIT 1",
+                "SELECT id, data, last_resort FROM e2ee_key_packages WHERE user_id = ?1 AND device_id = ?2 AND (?3 OR last_resort) \
+                 ORDER BY last_resort, id LIMIT 1",
             )
             .bind(user)
             .bind(&device)
+            .bind(one_time)
             .fetch_optional(&mut *tx)
             .await?;
             let Some((id, data, last_resort)) = row else { continue };

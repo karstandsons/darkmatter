@@ -12,6 +12,7 @@ pub mod backup;
 mod calls;
 pub mod config;
 pub mod control;
+mod conns;
 mod db;
 pub mod e2ee;
 mod error;
@@ -42,6 +43,9 @@ pub struct State {
     calls: calls::Calls,
     guard: auth::Guard,
     limiter: limits::Limiter,
+    uploads: limits::Turns,
+    uploading: limits::InFlight,
+    decoding: limits::Decoding,
 }
 
 impl Deref for App {
@@ -57,7 +61,7 @@ impl App {
     pub async fn open(config: Config) -> anyhow::Result<Self> {
         let db = db::open(&config.data_dir).await?;
         let e2ee = e2ee::init(&db).await?;
-        Ok(App(Arc::new(State { config, db, hub: Default::default(), e2ee, calls: Default::default(), guard: Default::default(), limiter: Default::default() })))
+        Ok(App(Arc::new(State { config, db, hub: Default::default(), e2ee, calls: Default::default(), guard: Default::default(), limiter: Default::default(), uploads: Default::default(), uploading: Default::default(), decoding: Default::default() })))
     }
 
     /// Serves the API on `listener` until Ctrl+C or SIGTERM: HTTPS if the
@@ -73,22 +77,27 @@ impl App {
         let config = self.config.clone();
         let app = self.clone();
         let service = api::router(self).into_make_service_with_connect_info::<std::net::SocketAddr>();
-        // Each connection to the port is HTTP(S), or call media over TCP.
-        let server = axum_server::from_tcp(listener.into_std()?)?.handle(tls::shutdown_handle());
+        // Each connection to the port is HTTP(S), or call media over TCP;
+        // only so many at once, and none that take long to start.
+        let mut server = axum_server::from_tcp(listener.into_std()?)?.handle(tls::shutdown_handle());
+        conns::tune(server.http_builder());
         match tls {
-            config::Tls::None => server.acceptor(calls::Split::new(axum_server::accept::DefaultAcceptor, &app)).serve(service).await?,
+            config::Tls::None => {
+                let acceptor = axum_server::accept::DefaultAcceptor;
+                server.acceptor(conns::Limited::new(calls::Split::new(acceptor, &app), &app)).serve(service).await?;
+            }
             config::Tls::Files(cert, key) => {
                 tls::install_provider();
                 let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
                     .await
                     .map_err(|e| anyhow::anyhow!("reading {} and {}: {e}", cert.display(), key.display()))?;
                 let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(rustls);
-                server.acceptor(calls::Split::new(acceptor, &app)).serve(service).await?;
+                server.acceptor(conns::Limited::new(calls::Split::new(acceptor, &app), &app)).serve(service).await?;
             }
             config::Tls::Acme(domain) => {
                 tls::install_provider();
                 let acceptor = tls::acme(&domain, &config)?;
-                server.acceptor(calls::Split::new(acceptor, &app)).serve(service).await?;
+                server.acceptor(conns::Limited::new(calls::Split::new(acceptor, &app), &app)).serve(service).await?;
             }
         }
         db.close().await;

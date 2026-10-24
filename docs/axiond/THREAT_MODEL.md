@@ -34,6 +34,8 @@ refreshes its own key weekly and after a day away.
 | Someone removed from a conversation | Reads nothing sent after: they're removed from the group before anything else is sent. The server refuses messages for the epoch their removal was proposed in, or any before it, so one encrypted a moment before they left (or sent late) is refused, and the sender's app commits the removal and sends it again. |
 | Someone who left a call | Hears at most the next second: a new epoch begins as they leave, and senders switch to its keys a second later. |
 | A plugin in Darkmatter | Gets no encrypted text unless you tick "May read encrypted conversations" for it. |
+| Someone signed in (or, for connections and call media, anyone) trying to run the server out of memory or disk | Held to limits: upload quotas and rates, a budget for decoding pictures, caps on websockets, connections and slow clients, bounded call-media queues. See [Limits](../../crates/axiond/README.md#limits). A determined flood can still slow the server for everyone. |
+| Someone using up another's one-time key packages | Can't: only people who share a channel can claim them, and past a few, they get the last-resort package. |
 
 ## A malicious server
 
