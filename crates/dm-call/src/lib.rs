@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use libwebrtc::audio_source::native::NativeAudioSource;
@@ -40,6 +40,11 @@ pub use mm_api::models::Call as CallInfo;
 const RATE: u32 = 48_000;
 /// How often [`Update::Levels`] comes.
 const LEVELS_EVERY: Duration = Duration::from_millis(250);
+/// With nothing coming from the server for this long while libwebrtc still
+/// calls the connection up, the call is [`Update::Reconnecting`]...
+const STALLED: Duration = Duration::from_secs(3);
+/// ...and for this long, [`Update::Failed`]: joining again is the way back.
+const DEAD: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -260,8 +265,11 @@ impl Call {
         let mut tasks = Vec::new();
         let handle = tokio::runtime::Handle::current();
 
-        let state = tx.clone();
+        // Since when libwebrtc calls the connection up, for the watchdog.
+        let up: Arc<Mutex<Option<Instant>>> = Arc::default();
+        let (state, up_since) = (tx.clone(), up.clone());
         pc.on_connection_state_change(Some(Box::new(move |s| {
+            *up_since.lock().unwrap() = matches!(s, PeerConnectionState::Connected).then(Instant::now);
             let update = match s {
                 PeerConnectionState::Connected => Update::Connected,
                 PeerConnectionState::Disconnected => Update::Reconnecting,
@@ -335,30 +343,45 @@ impl Call {
                 }
             }
         }));
-        // The connection's quality, from libwebrtc's statistics.
+        // The connection's quality, from libwebrtc's statistics, and a
+        // watchdog: libwebrtc can call a connection up that carries nothing
+        // (it keeps a path whose checks are answered, the media going
+        // elsewhere), and then nothing would bring the call back.
         let (stats_pc, quality) = (pc.clone(), tx.clone());
         tasks.push(handle.spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
             let mut before = (0u64, 0i64);
-            loop {
+            let mut watchdog = Watchdog::default();
+            for n in 0u64.. {
                 tick.tick().await;
                 let Ok(stats) = stats_pc.get_stats().await else { continue };
-                let (mut received, mut lost, mut rtt) = (0u64, 0i64, 0f64);
+                let (mut received, mut lost, mut rtt, mut reports) = (0u64, 0i64, 0f64, 0u64);
                 for s in &stats {
                     match s {
                         libwebrtc::stats::RtcStats::InboundRtp(i) if i.stream.kind == "audio" => {
                             received += i.received.packets_received;
                             lost += i.received.packets_lost.max(0);
                         }
+                        // The server's reports on what this device sends:
+                        // they come when nobody else is sending too.
+                        libwebrtc::stats::RtcStats::RemoteInboundRtp(r) => reports += r.remote_inbound.round_trip_time_measurements,
                         libwebrtc::stats::RtcStats::CandidatePair(p) if p.candidate_pair.nominated => rtt = rtt.max(p.candidate_pair.current_round_trip_time),
                         _ => {}
                     }
                 }
-                let (dr, dl) = (received.saturating_sub(before.0), (lost - before.1).max(0) as u64);
-                before = (received, lost);
-                let loss = if dr + dl == 0 { 0.0 } else { dl as f32 / (dr + dl) as f32 };
-                if quality.send(Update::Quality { loss, rtt_ms: (rtt * 1000.0) as u32 }).is_err() {
+                let up = *up.lock().unwrap();
+                let update = watchdog.check(Instant::now(), up, received + reports);
+                if update.as_ref().is_some_and(|u| quality.send(u.clone()).is_err()) {
                     break;
+                }
+                if n % 2 == 1 {
+                    let (dr, dl) = (received.saturating_sub(before.0), (lost - before.1).max(0) as u64);
+                    before = (received, lost);
+                    // Nothing at all arriving is the worst loss there is.
+                    let loss = if watchdog.stalled { 1.0 } else if dr + dl == 0 { 0.0 } else { dl as f32 / (dr + dl) as f32 };
+                    if quality.send(Update::Quality { loss, rtt_ms: (rtt * 1000.0) as u32 }).is_err() {
+                        break;
+                    }
                 }
             }
         }));
@@ -655,6 +678,50 @@ fn settings(sdp: &str) -> String {
 }
 
 /// Feeds a steady tone, 10 ms at a time.
+/// Whether media still comes from the server, judged on a count that goes
+/// up while it does (sound received, and the server's reports on what this
+/// device sends).
+#[derive(Default)]
+struct Watchdog {
+    count: u64,
+    /// When the count last went up (or the connection came up).
+    moved: Option<Instant>,
+    /// It's been said that the call is reconnecting.
+    stalled: bool,
+    failed: bool,
+}
+
+impl Watchdog {
+    /// `up`: since when libwebrtc has called the connection up (it reports
+    /// its own losses). What to tell, if anything.
+    fn check(&mut self, now: Instant, up: Option<Instant>, count: u64) -> Option<Update> {
+        let Some(up) = up else {
+            // libwebrtc's own state rules; once back, media gets time again.
+            self.stalled = false;
+            return None;
+        };
+        if count != self.count {
+            self.count = count;
+            self.moved = Some(now);
+            return std::mem::take(&mut self.stalled).then_some(Update::Connected);
+        }
+        // Not until media has come at all: before that there's nothing to miss.
+        let since = self.moved?.max(up);
+        let quiet = now.saturating_duration_since(since);
+        if quiet >= DEAD && !self.failed {
+            self.failed = true;
+            tracing::warn!("nothing from the call for {quiet:?}");
+            return Some(Update::Failed("nothing comes through from the call".into()));
+        }
+        if quiet >= STALLED && !self.stalled && !self.failed {
+            self.stalled = true;
+            tracing::info!("nothing from the call for {quiet:?}");
+            return Some(Update::Reconnecting);
+        }
+        None
+    }
+}
+
 async fn tone(source: NativeAudioSource, pitch: f32) {
     let samples = RATE / 100;
     let step = TAU * pitch / RATE as f32;
@@ -675,7 +742,33 @@ async fn tone(source: NativeAudioSource, pitch: f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::settings;
+    use super::*;
+
+    #[test]
+    fn the_watchdog_tells_a_call_that_carries_nothing() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut w = Watchdog::default();
+        // Up, but nothing has come yet: nothing to miss.
+        assert_eq!(w.check(at(0), Some(t0), 0), None);
+        assert_eq!(w.check(at(10), Some(t0), 0), None);
+        // Media, then none: reconnecting after 3 s, back when it comes.
+        assert_eq!(w.check(at(11), Some(t0), 5), None);
+        assert_eq!(w.check(at(13), Some(t0), 5), None);
+        assert_eq!(w.check(at(14), Some(t0), 5), Some(Update::Reconnecting));
+        assert_eq!(w.check(at(15), Some(t0), 5), None);
+        assert_eq!(w.check(at(16), Some(t0), 9), Some(Update::Connected));
+        // libwebrtc's own losses are its to tell; up again, media gets its
+        // time again.
+        assert_eq!(w.check(at(30), None, 9), None);
+        assert_eq!(w.check(at(31), Some(at(31)), 9), None);
+        assert_eq!(w.check(at(33), Some(at(31)), 9), None);
+        assert_eq!(w.check(at(34), Some(at(31)), 9), Some(Update::Reconnecting));
+        // And for long: failed, once.
+        assert_eq!(w.check(at(45), Some(at(31)), 9), None);
+        assert!(matches!(w.check(at(46), Some(at(31)), 9), Some(Update::Failed(_))));
+        assert_eq!(w.check(at(50), Some(at(31)), 9), None);
+    }
 
     #[test]
     fn opus_is_pinned_and_audio_levels_dropped() {

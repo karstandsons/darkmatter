@@ -189,6 +189,12 @@ AudioTrackSource::InternalSource::InternalSource(
 }
 
 AudioTrackSource::InternalSource::~InternalSource() {
+  // Darkmatter: the 10 ms task works on this object's members, so its
+  // queue goes first, while they're all still here: deleting it lets a
+  // running task finish and drops the rest. Left to the members' order,
+  // the queue went last, its task running on a buffer already destroyed
+  // (a call closing hung, or worse).
+  audio_queue_ = nullptr;
 }
 
 bool AudioTrackSource::InternalSource::capture_frame(

@@ -17,10 +17,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"
 tracing = "0.1"
 
 # LiveKit's WebRTC bindings with a frame transformer of ours (SFrame for
-# calls): vendor/README.md says what changed.
+# calls), and str0m's ICE agent following a call's latest path:
+# vendor/README.md says what changed.
 [patch.crates-io]
 webrtc-sys = { path = "vendor/webrtc-sys" }
 libwebrtc = { path = "vendor/libwebrtc" }
+is = { path = "vendor/is" }
 # openmls_libcrux_crypto 0.4.0 with openmls main's bump to fixed libcrux
 # crates (RUSTSEC-2026-0329/-0330/-0331); vendor/README.md says more.
 openmls_libcrux_crypto = { path = "vendor/openmls_libcrux_crypto" }
