@@ -55,6 +55,19 @@ jobs:
           name: darkmatter-linux-x86_64
           path: target/release/darkmatter
 
+  # Security advisories against our dependencies (RustSec), from both tools:
+  # cargo-deny for what's built (deny.toml), cargo-audit for all of
+  # Cargo.lock (.cargo/audit.toml). Either one failing fails the build.
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+      - run: cargo deny --locked check advisories bans sources
+      - run: cargo audit
+
   # Darkmatter's client against real Mattermost releases: the one our
   # group's server runs, and the newest. A Mattermost change that would
   # break Darkmatter fails here first.
