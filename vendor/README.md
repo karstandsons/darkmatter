@@ -10,7 +10,7 @@ path changes: below.
 
 | Crate | From | What we added |
 | --- | --- | --- |
-| `webrtc-sys` | 0.3.50 | `include/livekit/rust_frame_transformer.h`, `src/rust_frame_transformer.cpp` and `src/rust_frame_transformer.rs` (the cxx bridge); both listed in `build.rs` and `src/lib.rs`. |
+| `webrtc-sys` | 0.3.50 | `include/livekit/rust_frame_transformer.h`, `src/rust_frame_transformer.cpp` and `src/rust_frame_transformer.rs` (the cxx bridge); both listed in `build.rs` and `src/lib.rs`. A fix in `src/audio_track.cpp`, marked "Darkmatter" (below). |
 | `libwebrtc` | 0.3.53 | `src/native/frame_transform.rs` (`FrameTransform::for_sender`, `for_receiver`); `pub mod frame_transform` in `src/native/mod.rs`, and its re-export in `src/lib.rs`. |
 | `is` (str0m's ICE agent) | 0.11.1 | In `src/agent.rs`, after a binding request: a controlled agent's latest USE-CANDIDATE wins (the other pairs' nominations are cleared); `CandidatePair::clear_nomination` in `src/pair.rs`. Marked "Darkmatter". |
 
@@ -49,6 +49,17 @@ error in: ../rtc_base/platform_thread.cc, line 181", "last system error:
 realtime priority as it starts). So `rust_frame_transformer.cpp` keeps the
 reference a video sender's delegate gives back when it unregisters, and a
 thread of its own lets go of it once nothing else holds it.
+
+## An audio source's queue, stopped before the source goes
+
+`AudioTrackSource::InternalSource` (a buffered `NativeAudioSource`, as the
+tests' tones) runs a task every 10 ms on its own queue, working on its
+members. Its destructor left the queue to be destroyed with the members,
+last, so the task could still run on a buffer already destroyed: seen as
+a test binary hanging as a call closed (the queue's thread spinning in
+`buffer_.erase`, the signaling thread joining it, everything else
+waiting on the signaling thread). The destructor now deletes the queue
+first.
 
 ## str0m following a call's latest path
 
