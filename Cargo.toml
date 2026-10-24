@@ -23,6 +23,9 @@ tracing = "0.1"
 webrtc-sys = { path = "vendor/webrtc-sys" }
 libwebrtc = { path = "vendor/libwebrtc" }
 is = { path = "vendor/is" }
+# openmls_libcrux_crypto 0.4.0 with openmls main's bump to fixed libcrux
+# crates (RUSTSEC-2026-0329/-0330/-0331); vendor/README.md says more.
+openmls_libcrux_crypto = { path = "vendor/openmls_libcrux_crypto" }
 
 # Smaller, faster release binary (`cargo build --release`): link-time
 # optimization across crates and no debug symbols.
