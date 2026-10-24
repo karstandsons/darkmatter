@@ -9,7 +9,7 @@ use iced::widget::{Id, operation, pane_grid, text_editor};
 use mm_api::models::{NewPost, Post};
 use mm_api::{Client, PostsQuery, ws};
 
-use crate::app::{Message, bootstrap, err};
+use crate::app::{Message, Sidebar, err};
 use crate::commands::{self, Command};
 use crate::session::Session;
 use crate::emoji_picker::{self, EmojiPicker};
@@ -286,6 +286,9 @@ pub struct Chat {
     pub call: Option<crate::call::Active>,
     /// A call ringing here.
     pub ringing: Option<crate::call::Ringing>,
+    /// The channel list being reloaded (after a resync or /join): a newer
+    /// reload drops it.
+    resyncing: Option<iced::task::Handle>,
 }
 
 /// Puts a link's preview on a post, for the server (plain) or for
@@ -803,6 +806,7 @@ impl Chat {
             calls: HashMap::new(),
             call: None,
             ringing: None,
+            resyncing: None,
         };
         let mut chat = chat;
         let statuses = chat.load_statuses();
@@ -1497,6 +1501,13 @@ impl Chat {
     }
 
     /// After the channel list is refreshed: open the channel a /join went to.
+    /// Reloads the channel list, in place of one still being reloaded.
+    fn resync(&mut self) -> Task<Message> {
+        let (task, handle) = crate::app::resync(self.session.clone(), self.store.me.id.clone()).abortable();
+        self.resyncing = Some(handle.abort_on_drop());
+        task
+    }
+
     pub fn goto_pending(&mut self) -> Task<Message> {
         let Some(name) = self.pending_goto.take() else { return Task::none() };
         match self.store.channels.values().find(|c| c.name == name && (c.team_id == self.team || c.team_id.is_empty())) {
@@ -2358,7 +2369,7 @@ impl Chat {
                         return self.goto_pending();
                     }
                     self.pending_goto = Some(name);
-                    return bootstrap(self.session.clone(), self.account.clone());
+                    return self.resync();
                 }
                 Task::none()
             }
@@ -2387,6 +2398,34 @@ impl Chat {
                     return self.open_verify(&name);
                 }
                 self.verify_update(m)
+            }
+            Message::Resynced(Ok(sidebar)) => {
+                self.resyncing = None;
+                let Sidebar { teams, channels, members, users } = *sidebar;
+                // Encrypted channels catch up with the live copy of this
+                // device's groups, as on start: one encrypted while we were
+                // away is joined.
+                let encrypted: Vec<String> = channels.iter().filter(|c| c.encrypted).map(|c| c.id.clone()).collect();
+                self.store.teams = teams;
+                self.store.add_channels(channels, members);
+                self.store.add_users(users);
+                let sync = match self.crypto.clone() {
+                    Some(c) if !encrypted.is_empty() => Task::future(async move {
+                        for id in encrypted {
+                            if let Err(e) = c.sync(&id).await {
+                                tracing::warn!("couldn't sync the encryption of {id}: {e}");
+                            }
+                        }
+                    })
+                    .discard(),
+                    _ => Task::none(),
+                };
+                Task::batch([sync, self.goto_pending()])
+            }
+            Message::Resynced(Err(e)) => {
+                self.resyncing = None;
+                self.error = Some(format!("Couldn't reload the channel list: {e}"));
+                Task::none()
             }
             Message::Standing(list) => {
                 self.standing.extend(list.into_iter().map(|s| (s.user_id.clone(), s)));
@@ -3155,12 +3194,12 @@ impl Chat {
             M::Resync => {
                 // Events were lost: drop cached history and reload the sidebar.
                 self.store.timelines.clear();
-                let session = self.session.clone();
                 let mut channels: Vec<String> = self.panes.iter().map(|(_, p)| p.channel.clone()).filter(|c| !c.is_empty()).collect();
                 channels.sort();
                 channels.dedup();
-                let loads = channels.into_iter().map(|c| self.load_history(c));
-                Task::batch([bootstrap(session, self.account.clone()), self.load_calls()].into_iter().chain(loads))
+                let reload = [self.resync(), self.load_calls()];
+                let loads: Vec<_> = channels.into_iter().map(|c| self.load_history(c)).collect();
+                Task::batch(reload.into_iter().chain(loads))
             }
             // The channel list changed: someone added this account to a
             // channel, opened a DM with it, or a channel changed (encryption
