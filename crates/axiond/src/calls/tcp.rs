@@ -9,14 +9,13 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use axum_server::accept::Accept;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use super::sfu::In;
+use super::sfu::{Ctl, Inbox, TCP_QUEUE};
 use crate::App;
 
 /// Media connections open at once, at most.
@@ -28,7 +27,7 @@ const IDLE: Duration = Duration::from_secs(60);
 /// How long a new connection may take to say enough to tell what it is.
 const FIRST_BYTES: Duration = Duration::from_secs(10);
 
-const STUN_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
+pub(super) const STUN_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
 
 /// Whether a connection that starts with `first` is ICE over TCP. `None`:
 /// not enough yet to tell.
@@ -52,14 +51,14 @@ pub struct Split<A> {
 
 #[derive(Clone)]
 struct Media {
-    inbox: Sender<In>,
+    inbox: Inbox,
     open: Arc<AtomicUsize>,
 }
 
 impl<A> Split<A> {
     /// Hands ICE connections to `app`'s SFU, if calls are on.
     pub fn new(inner: A, app: &App) -> Self {
-        let media = app.calls.sfu.get().filter(|sfu| sfu.tcp_candidate.is_some()).map(|sfu| Media { inbox: sfu.tx.lock().unwrap().clone(), open: Arc::default() });
+        let media = app.calls.sfu.get().filter(|sfu| sfu.tcp_candidate.is_some()).map(|sfu| Media { inbox: sfu.inbox.clone(), open: Arc::default() });
         Split { inner, media }
     }
 }
@@ -117,8 +116,8 @@ impl Media {
         }
         let _ = stream.set_nodelay(true);
         let (mut read, mut write) = stream.into_split();
-        let (writer, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        if self.inbox.send(In::TcpOpen { source, writer }).is_err() {
+        let (writer, mut outgoing) = tokio::sync::mpsc::channel::<Vec<u8>>(TCP_QUEUE);
+        if !self.inbox.control(Ctl::TcpOpen { source, writer }) {
             self.open.fetch_sub(1, Ordering::Relaxed);
             return;
         }
@@ -144,11 +143,11 @@ impl Media {
                 if len > MAX_PACKET || read.read_exact(&mut packet[..len]).await.is_err() {
                     break;
                 }
-                if self.inbox.send(In::Packet { tcp: true, source, contents: packet[..len].to_vec() }).is_err() {
+                if !self.inbox.packet(true, source, packet[..len].to_vec()) {
                     break;
                 }
             }
-            let _ = self.inbox.send(In::TcpClosed { source });
+            self.inbox.control(Ctl::TcpClosed { source });
             self.open.fetch_sub(1, Ordering::Relaxed);
         });
     }

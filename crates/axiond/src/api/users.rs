@@ -41,10 +41,7 @@ pub async fn login(State(app): State<App>, request_headers: HeaderMap, Json(body
     let mfa = found.as_ref().is_some_and(|f| f.2);
     let (id, hash) = found.map(|(id, hash, _)| (id, hash)).unzip();
     let password = body.password;
-    // argon2 is deliberately slow: keep it off the async threads.
-    let ok = tokio::task::spawn_blocking(move || auth::verify_password(hash.as_deref(), &password))
-        .await
-        .map_err(|_| Error::internal())?;
+    let ok = auth::check_password(hash, password).await;
     let Some(id) = id.filter(|_| ok) else {
         app.guard.failed(login);
         return Err(Error {

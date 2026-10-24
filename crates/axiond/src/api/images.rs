@@ -25,6 +25,8 @@ use crate::{App, ids};
 const MAX_EMOJI_BYTES: usize = 1024 * 1024;
 const MAX_EMOJI_SIDE: u32 = 1024;
 const MAX_PICTURE_BYTES: usize = 10 * 1024 * 1024;
+/// The largest request with a profile picture: the picture and the form around it.
+pub const PICTURE_BODY: usize = MAX_PICTURE_BYTES + 64 * 1024;
 const PICTURE_SIDE: u32 = 256;
 
 /// Where an emoji is kept. Only well-formed ids get a path, so nothing like
@@ -46,12 +48,17 @@ fn picture_path(app: &App, user_id: &str) -> Result<PathBuf> {
 
 /// The picture's format, if it's one we accept and its size is sane.
 fn check_picture(bytes: &[u8], max_side: u32) -> Option<image::ImageFormat> {
+    picture_size(bytes, max_side).map(|(format, _, _)| format)
+}
+
+/// The picture's format and size, if it's one we accept and its size is sane.
+fn picture_size(bytes: &[u8], max_side: u32) -> Option<(image::ImageFormat, u32, u32)> {
     let format = image::guess_format(bytes).ok()?;
     if !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::Gif | image::ImageFormat::WebP) {
         return None;
     }
     let (w, h) = image::ImageReader::with_format(std::io::Cursor::new(bytes), format).into_dimensions().ok()?;
-    (w > 0 && h > 0 && w <= max_side && h <= max_side).then_some(format)
+    (w > 0 && h > 0 && w <= max_side && h <= max_side).then_some((format, w, h))
 }
 
 fn mime(format: image::ImageFormat) -> &'static str {
@@ -124,16 +131,19 @@ fn io_error(e: std::io::Error) -> Error {
 /// Reads the named part of a form, up to `max` bytes.
 async fn read_part(form: &mut Multipart, wanted: &str, max: usize, text: &mut Option<String>) -> Result<Vec<u8>> {
     let mut found = None;
-    while let Some(field) = form.next_field().await.map_err(|_| Error::bad_request("Couldn't read the upload."))? {
+    while let Some(mut field) = form.next_field().await.map_err(|_| Error::bad_request("Couldn't read the upload."))? {
         match field.name() {
             Some(name) if name == wanted => {
-                let bytes = field.bytes().await.map_err(|_| Error::bad_request("The picture is too big."))?;
-                if bytes.len() > max {
-                    return Err(Error::bad_request("The picture is too big."));
+                let mut bytes = Vec::new();
+                while let Some(chunk) = field.chunk().await.map_err(|_| Error::bad_request("The picture is too big."))? {
+                    if bytes.len() + chunk.len() > max {
+                        return Err(Error::bad_request("The picture is too big."));
+                    }
+                    bytes.extend_from_slice(&chunk);
                 }
-                found = Some(bytes.to_vec());
+                found = Some(bytes);
             }
-            Some("emoji") => *text = Some(field.text().await.map_err(|_| Error::bad_request("Couldn't read the upload."))?),
+            Some("emoji") => *text = Some(super::files::text_part(&mut field, super::files::MAX_TEXT_PART).await?),
             _ => {}
         }
     }
@@ -147,6 +157,16 @@ struct EmojiForm {
 
 /// `POST emoji`: multipart with `image` and `emoji` (`{"name": …}`).
 pub async fn create(State(app): State<App>, me: Me, mut form: Multipart) -> Result<(StatusCode, Json<CustomEmoji>)> {
+    if !me.is_admin() {
+        if app.config.emoji_admins_only {
+            return Err(Error { message: "Only admins add custom emoji on this server.".into(), ..Error::forbidden() });
+        }
+        let limit = app.config.emoji_per_account;
+        let mine: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emoji WHERE creator_id = ? AND delete_at = 0").bind(&me.user_id).fetch_one(&app.db).await?;
+        if limit > 0 && mine >= i64::from(limit) {
+            return Err(Error::bad_request(format!("You can add at most {limit} custom emoji. Delete one of yours to add another.")));
+        }
+    }
     let mut meta = None;
     let bytes = read_part(&mut form, "image", MAX_EMOJI_BYTES, &mut meta).await?;
     let meta: EmojiForm = serde_json::from_str(meta.as_deref().unwrap_or("{}")).map_err(|_| Error::bad_request("Name the emoji."))?;
@@ -213,11 +233,15 @@ fn picture_response(bytes: Vec<u8>) -> Result<Response> {
 
 /// Sets someone's picture; used by the API and by `axiond user picture`.
 pub async fn set_picture(app: &App, user_id: &str, bytes: Vec<u8>) -> Result<()> {
-    if bytes.len() > MAX_PICTURE_BYTES || check_picture(&bytes, 16_384).is_none() {
+    let size = (bytes.len() <= MAX_PICTURE_BYTES).then(|| picture_size(&bytes, 16_384)).flatten();
+    let Some((_, w, h)) = size else {
         return Err(Error::bad_request("Pictures must be PNG, JPEG, GIF or WebP, at most 10 MB."));
+    };
+    if u64::from(w) * u64::from(h) > crate::limits::MAX_PIXELS {
+        return Err(Error::bad_request("That picture has too many pixels: at most 40 megapixels."));
     }
     let path = picture_path(app, user_id)?;
-    let png = tokio::task::spawn_blocking(move || square_png(&bytes)).await.map_err(|_| Error::internal())?;
+    let png = app.decoding.run(w, h, move || square_png(&bytes)).await;
     let png = png.ok_or_else(|| Error::bad_request("Couldn't read that picture."))?;
     write_file(&path, &png).await?;
     picture_changed(app, user_id).await
@@ -226,9 +250,7 @@ pub async fn set_picture(app: &App, user_id: &str, bytes: Vec<u8>) -> Result<()>
 /// The middle square of a picture, at 256 pixels, as PNG.
 fn square_png(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(512 * 1024 * 1024);
-    reader.limits(limits);
+    reader.limits(crate::limits::image_limits());
     let img = reader.decode().ok()?;
     let side = img.width().min(img.height());
     let square = img.crop_imm((img.width() - side) / 2, (img.height() - side) / 2, side, side);

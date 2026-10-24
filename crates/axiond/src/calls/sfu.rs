@@ -3,15 +3,19 @@
 //! to the others in its call without being decoded. Built on str0m, from its
 //! `chat` example (see spikes/calls for the measurements).
 //!
-//! It runs on a thread of its own. The registry (`super`) adds and removes
-//! devices with [`Cmd`]s and hears back when one drops off by itself. New
-//! tracks are offered to the others over a data channel each device opens.
+//! It runs on a thread of its own, started again if it panics. The registry
+//! (`super`) adds and removes devices with [`Cmd`]s and hears back when one
+//! drops off by itself. New tracks are offered to the others over a data
+//! channel each device opens.
+//!
+//! Media waits in a bounded queue, and what doesn't fit is dropped, as a
+//! congested network would: anyone can send UDP, signed in or not.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -29,22 +33,80 @@ pub enum Cmd {
     Add { peer: u64, user: String, room: String, rtc: Box<Rtc> },
     /// A device leaves.
     Remove { peer: u64 },
+    /// Panics the thread, as a bug would.
+    #[cfg(test)]
+    Crash,
 }
 
-/// What reaches the SFU's thread: the registry's commands, and media from
-/// every device, by UDP or TCP.
+/// Packets waiting for the SFU, at most; more are dropped.
+pub const QUEUE: usize = 4096;
+/// Packets waiting to go out on one TCP connection, at most.
+pub const TCP_QUEUE: usize = 256;
+
+/// What reaches the SFU's thread by its bounded queue: media from every
+/// device, by UDP or TCP.
 pub enum In {
-    Cmd(Cmd),
     Packet { tcp: bool, source: SocketAddr, contents: Vec<u8> },
+    /// Something is waiting in the control queue.
+    Wake,
+}
+
+/// What reaches it by its control queue, which is never dropped from (and
+/// only the server itself sends to): the registry's commands, and TCP
+/// connections coming and going.
+pub enum Ctl {
+    Cmd(Cmd),
     /// A device connected over TCP: what it's sent goes to `writer`.
-    TcpOpen { source: SocketAddr, writer: tokio::sync::mpsc::UnboundedSender<Vec<u8>> },
+    TcpOpen { source: SocketAddr, writer: tokio::sync::mpsc::Sender<Vec<u8>> },
     TcpClosed { source: SocketAddr },
+}
+
+/// What the registry hears back.
+#[derive(Debug, PartialEq)]
+pub enum Gone {
+    /// A device left, however it left.
+    Peer(u64),
+    /// The SFU started again after a panic: every device left.
+    All,
+}
+
+/// Sends to the SFU: media, which is dropped when its queue is full, and
+/// control, which isn't.
+#[derive(Clone)]
+pub struct Inbox {
+    media: SyncSender<In>,
+    ctl: std::sync::mpsc::Sender<Ctl>,
+}
+
+impl Inbox {
+    /// Queues a packet. False once the SFU has stopped for good; a full
+    /// queue drops it.
+    pub fn packet(&self, tcp: bool, source: SocketAddr, contents: Vec<u8>) -> bool {
+        !matches!(self.media.try_send(In::Packet { tcp, source, contents }), Err(TrySendError::Disconnected(_)))
+    }
+
+    /// False once the SFU has stopped for good.
+    pub fn control(&self, ctl: Ctl) -> bool {
+        if self.ctl.send(ctl).is_err() {
+            return false;
+        }
+        // If the queue's full the SFU is busy, and reads control next anyway.
+        let _ = self.media.try_send(In::Wake);
+        true
+    }
+}
+
+/// An SFU's queues: its [`Inbox`], and the ends it reads.
+pub fn queues() -> (Inbox, Receiver<In>, Receiver<Ctl>) {
+    let (media, rx) = std::sync::mpsc::sync_channel(QUEUE);
+    let (ctl, ctl_rx) = std::sync::mpsc::channel();
+    (Inbox { media, ctl }, rx, ctl_rx)
 }
 
 /// Where packets go out: the UDP socket, or a device's TCP connection.
 struct Out {
     udp: UdpSocket,
-    tcp: HashMap<SocketAddr, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    tcp: HashMap<SocketAddr, tokio::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl Out {
@@ -54,19 +116,20 @@ impl Out {
                 debug!("send to {}: {e}", t.destination);
             }
         } else if let Some(writer) = self.tcp.get(&t.destination) {
-            let _ = writer.send(t.contents.to_vec());
+            // A connection that can't keep up loses packets, like UDP.
+            let _ = writer.try_send(t.contents.to_vec());
         }
     }
 }
 
 /// Reads the UDP socket into the SFU's inbox, until the SFU stops.
-fn read_udp(socket: UdpSocket, inbox: Sender<In>, stopped: Arc<AtomicBool>) {
+fn read_udp(socket: UdpSocket, inbox: Inbox, stopped: Arc<AtomicBool>) {
     let mut buf = vec![0; 2000];
     let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
     while !stopped.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((n, source)) => {
-                if inbox.send(In::Packet { tcp: false, source, contents: buf[..n].to_vec() }).is_err() {
+                if !inbox.packet(false, source, buf[..n].to_vec()) {
                     return;
                 }
             }
@@ -77,12 +140,34 @@ fn read_udp(socket: UdpSocket, inbox: Sender<In>, stopped: Arc<AtomicBool>) {
     }
 }
 
+/// Runs the SFU until the registry goes away, starting it again if it
+/// panics: `gone` then hears [`Gone::All`], and devices join again.
+pub fn supervise(socket: UdpSocket, candidate: SocketAddr, tcp_candidate: Option<SocketAddr>, inbox: Inbox, rx: Receiver<In>, ctl: Receiver<Ctl>, gone: UnboundedSender<Gone>) {
+    loop {
+        let socket = match socket.try_clone() {
+            Ok(socket) => socket,
+            Err(e) => return tracing::error!("calls: can't use the media socket: {e}"),
+        };
+        let run = std::panic::AssertUnwindSafe(|| run(socket, candidate, tcp_candidate, inbox.clone(), &rx, &ctl, &gone));
+        if std::panic::catch_unwind(run).is_ok() {
+            return;
+        }
+        tracing::error!("calls: the media thread panicked; starting it again (devices in calls join again)");
+        // What was queued was for the devices that are gone.
+        while rx.try_recv().is_ok() {}
+        if gone.send(Gone::All).is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Runs until the registry goes away. `gone` hears of every device that
 /// left, however it left. `candidate` and `tcp_candidate` are the addresses
 /// devices send to: what each packet arrived at, as far as str0m is
 /// concerned, though the sockets may be bound to others (0.0.0.0, or a port
 /// forwarded to this one). `inbox` is `rx`'s sender, for the UDP reader.
-pub fn run(socket: UdpSocket, candidate: SocketAddr, tcp_candidate: Option<SocketAddr>, inbox: Sender<In>, rx: Receiver<In>, gone: UnboundedSender<u64>) {
+fn run(socket: UdpSocket, candidate: SocketAddr, tcp_candidate: Option<SocketAddr>, inbox: Inbox, rx: &Receiver<In>, ctl: &Receiver<Ctl>, gone: &UnboundedSender<Gone>) {
     let mut clients: Vec<Client> = vec![];
     let mut queue: VecDeque<Propagated> = VecDeque::new();
     // Which device a source address belongs to, so a packet isn't offered
@@ -117,6 +202,14 @@ pub fn run(socket: UdpSocket, candidate: SocketAddr, tcp_candidate: Option<Socke
             Err(RecvTimeoutError::Disconnected) => return,
         };
         loop {
+            match ctl.try_recv() {
+                Ok(c) => {
+                    control(c, &mut clients, &mut out, &mut by_addr);
+                    continue;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => return,
+            }
             let m = match first.take() {
                 Some(m) => m,
                 None => match rx.try_recv() {
@@ -126,7 +219,9 @@ pub fn run(socket: UdpSocket, candidate: SocketAddr, tcp_candidate: Option<Socke
                 },
             };
             match m {
+                In::Wake => {}
                 In::Packet { tcp, source, contents } => {
+                    let stun = is_stun(&contents);
                     let Ok(contents) = contents.as_slice().try_into() else { continue };
                     let (proto, destination) = match tcp_candidate {
                         Some(tcp_candidate) if tcp => (Protocol::Tcp, tcp_candidate),
@@ -135,33 +230,16 @@ pub fn run(socket: UdpSocket, candidate: SocketAddr, tcp_candidate: Option<Socke
                     };
                     let input = Input::Receive(Instant::now(), Receive { proto, source, destination, contents });
                     let known = by_addr.get(&(tcp, source)).and_then(|id| clients.iter().position(|c| c.id == *id)).filter(|&i| clients[i].rtc.accepts(&input));
-                    match known.or_else(|| clients.iter().position(|c| c.rtc.accepts(&input))) {
+                    // A device is first heard from by STUN (ICE checks come
+                    // first), so only STUN from a new address is offered
+                    // to every device in turn.
+                    match known.or_else(|| stun.then(|| clients.iter().position(|c| c.rtc.accepts(&input))).flatten()) {
                         Some(i) => {
                             by_addr.insert((tcp, source), clients[i].id);
                             clients[i].handle_input(input);
                             clients[i].dirty = true;
                         }
                         None => debug!("no call device for a packet from {source}"),
-                    }
-                }
-                In::TcpOpen { source, writer } => {
-                    out.tcp.insert(source, writer);
-                }
-                In::TcpClosed { source } => {
-                    out.tcp.remove(&source);
-                    by_addr.remove(&(true, source));
-                }
-                In::Cmd(Cmd::Add { peer, user, room, rtc }) => {
-                    let mut client = Client::new(peer, user, room, *rtc);
-                    let open: Vec<_> = clients.iter().filter(|c| c.room == client.room).flat_map(|c| c.tracks_in.iter()).map(|t| Arc::downgrade(&t.id)).collect();
-                    for track in open {
-                        client.handle_track_open(track);
-                    }
-                    clients.push(client);
-                }
-                In::Cmd(Cmd::Remove { peer }) => {
-                    if let Some(c) = clients.iter_mut().find(|c| c.id.0 == peer) {
-                        c.rtc.disconnect();
                     }
                 }
             }
@@ -187,7 +265,7 @@ pub fn run(socket: UdpSocket, candidate: SocketAddr, tcp_candidate: Option<Socke
         clients.retain(|c| {
             let alive = c.rtc.is_alive();
             if !alive {
-                let _ = gone.send(c.id.0);
+                let _ = gone.send(Gone::Peer(c.id.0));
             }
             alive
         });
@@ -211,6 +289,40 @@ pub fn run(socket: UdpSocket, candidate: SocketAddr, tcp_candidate: Option<Socke
             client.rtc.disconnect();
         }
     }
+}
+
+/// Acts on one thing from the control queue.
+fn control(c: Ctl, clients: &mut Vec<Client>, out: &mut Out, by_addr: &mut HashMap<(bool, SocketAddr), ClientId>) {
+    match c {
+        Ctl::TcpOpen { source, writer } => {
+            out.tcp.insert(source, writer);
+        }
+        Ctl::TcpClosed { source } => {
+            out.tcp.remove(&source);
+            by_addr.remove(&(true, source));
+        }
+        Ctl::Cmd(Cmd::Add { peer, user, room, rtc }) => {
+            let mut client = Client::new(peer, user, room, *rtc);
+            let open: Vec<_> = clients.iter().filter(|c| c.room == client.room).flat_map(|c| c.tracks_in.iter()).map(|t| Arc::downgrade(&t.id)).collect();
+            for track in open {
+                client.handle_track_open(track);
+            }
+            clients.push(client);
+        }
+        Ctl::Cmd(Cmd::Remove { peer }) => {
+            if let Some(c) = clients.iter_mut().find(|c| c.id.0 == peer) {
+                c.rtc.disconnect();
+            }
+        }
+        #[cfg(test)]
+        Ctl::Cmd(Cmd::Crash) => panic!("crash, as asked"),
+    }
+}
+
+/// Whether a datagram is STUN (RFC 7983: a first byte under 4, and STUN's
+/// magic cookie).
+fn is_stun(b: &[u8]) -> bool {
+    b.len() >= 20 && b[0] < 4 && b[4..8] == super::tcp::STUN_COOKIE
 }
 
 fn poll_until_timeout(client: &mut Client, queue: &mut VecDeque<Propagated>, out: &Out) -> Instant {
@@ -517,5 +629,56 @@ impl Propagated {
             Propagated::TrackOpen(c, _) | Propagated::MediaData(c, _) | Propagated::KeyframeRequest(c, ..) => Some(*c),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_queue_drops_media_but_not_control() {
+        let (inbox, rx, ctl) = queues();
+        let source: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        // Nobody reads: the queue fills, and more is dropped without waiting.
+        for _ in 0..QUEUE * 2 {
+            assert!(inbox.packet(false, source, vec![0; 100]));
+        }
+        assert_eq!(rx.try_iter().count(), QUEUE);
+        for _ in 0..QUEUE {
+            assert!(inbox.packet(false, source, vec![0; 100]));
+        }
+        assert!(inbox.control(Ctl::Cmd(Cmd::Remove { peer: 1 })));
+        assert!(matches!(ctl.try_recv(), Ok(Ctl::Cmd(Cmd::Remove { peer: 1 }))));
+        drop((rx, ctl));
+        assert!(!inbox.packet(false, source, vec![]), "stopped for good");
+    }
+
+    async fn next(gone: &mut tokio::sync::mpsc::UnboundedReceiver<Gone>) -> Option<Gone> {
+        tokio::time::timeout(Duration::from_secs(5), gone.recv()).await.expect("heard back")
+    }
+
+    #[tokio::test]
+    async fn the_sfu_starts_again_after_a_panic() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let candidate = socket.local_addr().unwrap();
+        let (inbox, rx, ctl) = queues();
+        let (gone_tx, mut gone) = tokio::sync::mpsc::unbounded_channel();
+        let reader = inbox.clone();
+        let thread = std::thread::spawn(move || supervise(socket, candidate, None, reader, rx, ctl, gone_tx));
+        for _ in 0..2 {
+            inbox.control(Ctl::Cmd(Cmd::Crash));
+            assert_eq!(next(&mut gone).await, Some(Gone::All));
+        }
+        // Still running: UDP from strangers is read and dropped.
+        let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..1000 {
+            stranger.send_to(&[0x80; 200], candidate).unwrap();
+        }
+        inbox.control(Ctl::Cmd(Cmd::Crash));
+        assert_eq!(next(&mut gone).await, Some(Gone::All));
+        // The registry going away stops it.
+        drop((inbox, gone));
+        tokio::task::spawn_blocking(move || thread.join().unwrap()).await.unwrap();
     }
 }

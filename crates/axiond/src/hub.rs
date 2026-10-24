@@ -21,6 +21,9 @@ const BACKLOG: usize = 256;
 const RESUME_WINDOW: Duration = Duration::from_secs(120);
 /// Events queued for a slow socket before it's cut off (it resumes from the backlog).
 const QUEUE: usize = 64;
+/// Sockets one person may have open at once; a new one past that closes
+/// their oldest.
+pub const SOCKETS_PER_USER: usize = 10;
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Broadcast {
@@ -149,6 +152,20 @@ impl Hub {
                 (id, Vec::new())
             }
         };
+        // Past the limit, this person's oldest sockets close.
+        let mut theirs: Vec<(u64, String)> = inner
+            .conns
+            .iter()
+            .filter(|(id, c)| c.user_id == user_id && **id != connection_id)
+            .filter_map(|(id, c)| c.live.as_ref().map(|(g, _)| (*g, id.clone())))
+            .collect();
+        theirs.sort();
+        let over = (theirs.len() + 1).saturating_sub(SOCKETS_PER_USER);
+        for (_, id) in theirs.into_iter().take(over) {
+            let conn = inner.conns.get_mut(&id).unwrap();
+            conn.live = None;
+            conn.left_at = Some(Instant::now());
+        }
         let conn = inner.conns.get_mut(&connection_id).unwrap();
         // A socket the app gave up on stops getting events.
         conn.live = None;
@@ -241,6 +258,25 @@ mod tests {
         let late = hub.attach("u", "s", Some((&a.connection_id, 99)), "t");
         assert_ne!(late.connection_id, a.connection_id);
         assert_eq!(seq(&late.first[0]), 0);
+    }
+
+    #[test]
+    fn a_new_socket_past_the_limit_closes_the_oldest() {
+        let hub = Hub::default();
+        let mut sockets: Vec<Attached> = (0..SOCKETS_PER_USER).map(|_| hub.attach("u", "s", None, "t")).collect();
+        let other = hub.attach("v", "s2", None, "t");
+        let newest = hub.attach("u", "s", None, "t");
+        assert!(matches!(sockets[0].rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)), "the oldest closed");
+        for s in &mut sockets[1..] {
+            assert!(matches!(s.rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        }
+        let live = hub.inner.lock().unwrap().conns.values().filter(|c| c.user_id == "u" && c.live.is_some()).count();
+        assert_eq!(live, SOCKETS_PER_USER);
+        // The oldest can still resume, closing the next oldest.
+        let back = hub.attach("u", "s", Some((&sockets[0].connection_id, 1)), "t");
+        assert_eq!(back.connection_id, sockets[0].connection_id);
+        assert!(matches!(sockets[1].rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)));
+        drop((other, newest));
     }
 
     #[test]
