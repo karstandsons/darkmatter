@@ -371,3 +371,64 @@ async fn key_packages_only_of_people_you_share_a_channel_with() {
     }
     assert!(refused);
 }
+
+/// Sends a whole upload of `bytes` as `name`, then hangs up without waiting
+/// for the answer.
+async fn upload_and_hang_up(s: &Server, c: &Client, channel: &str, name: &str, bytes: &[u8]) {
+    let b = "XXboundaryXX";
+    let mut body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"channel_id\"\r\n\r\n{channel}\r\n\
+         --{b}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{name}\"\r\nContent-Type: image/png\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{b}--\r\n").as_bytes());
+    let head = format!(
+        "POST /api/v4/files HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {}\r\nContent-Type: multipart/form-data; boundary={b}\r\nContent-Length: {}\r\n\r\n",
+        c.token().unwrap(),
+        body.len()
+    );
+    let mut conn = tokio::net::TcpStream::connect(s.url.trim_start_matches("http://")).await.unwrap();
+    conn.write_all(head.as_bytes()).await.unwrap();
+    conn.write_all(&body).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+#[tokio::test]
+async fn uploads_whose_app_hangs_up_are_recorded_and_tidied() {
+    let s = server_with(|c| c.uploads_per_hour = 0).await;
+    let alice = login(&s, "alice").await;
+    let town = town_square(&alice).await;
+    let picture = png(2000, 2000);
+    for i in 0..8 {
+        upload_and_hang_up(&s, &alice, &town, &format!("p{i}.png"), &picture).await;
+    }
+    // Half an upload, then gone: nothing of it stays on disk.
+    let mut half = tokio::net::TcpStream::connect(s.url.trim_start_matches("http://")).await.unwrap();
+    let head = format!(
+        "POST /api/v4/files HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {}\r\nContent-Type: multipart/form-data; boundary=B\r\nContent-Length: 999999\r\n\r\n\
+         --B\r\nContent-Disposition: form-data; name=\"channel_id\"\r\n\r\n{town}\r\n--B\r\nContent-Disposition: form-data; name=\"files\"; filename=\"h.bin\"\r\n\r\n",
+        alice.token().unwrap()
+    );
+    half.write_all(head.as_bytes()).await.unwrap();
+    half.write_all(&[7; 50_000]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(half);
+
+    // Each upload that got a turn (three at once: the others were refused)
+    // is recorded with its previews, so it's counted and tidied away if
+    // never posted. No file is left on disk without a row.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut settled = 0;
+    loop {
+        let rows: Vec<(String, bool)> = sqlx::query_as("SELECT id, has_preview_image FROM files").fetch_all(&s.app.db).await.unwrap();
+        let on_disk = stored_files(&s);
+        settled = if rows.len() >= 3 && on_disk == rows.len() * 3 { settled + 1 } else { 0 };
+        if settled == 10 {
+            assert!(rows.iter().all(|(_, preview)| *preview));
+            break;
+        }
+        assert!(Instant::now() < deadline, "{} rows, {on_disk} files", rows.len());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}

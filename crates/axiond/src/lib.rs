@@ -44,6 +44,7 @@ pub struct State {
     guard: auth::Guard,
     limiter: limits::Limiter,
     uploads: limits::Turns,
+    uploading: limits::InFlight,
     decoding: limits::Decoding,
 }
 
@@ -60,7 +61,7 @@ impl App {
     pub async fn open(config: Config) -> anyhow::Result<Self> {
         let db = db::open(&config.data_dir).await?;
         let e2ee = e2ee::init(&db).await?;
-        Ok(App(Arc::new(State { config, db, hub: Default::default(), e2ee, calls: Default::default(), guard: Default::default(), limiter: Default::default(), uploads: Default::default(), decoding: Default::default() })))
+        Ok(App(Arc::new(State { config, db, hub: Default::default(), e2ee, calls: Default::default(), guard: Default::default(), limiter: Default::default(), uploads: Default::default(), uploading: Default::default(), decoding: Default::default() })))
     }
 
     /// Serves the API on `listener` until Ctrl+C or SIGTERM: HTTPS if the

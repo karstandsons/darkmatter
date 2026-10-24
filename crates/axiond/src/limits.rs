@@ -65,6 +65,47 @@ impl Limiter {
     }
 }
 
+/// Bytes under way per key (uploads being written), until dropped.
+#[derive(Clone, Default)]
+pub struct InFlight(Arc<Mutex<HashMap<String, u64>>>);
+
+/// Some of them: added to as they come, taken off when dropped.
+pub struct Held {
+    in_flight: InFlight,
+    key: String,
+    bytes: u64,
+}
+
+impl InFlight {
+    pub fn hold(&self, key: &str) -> Held {
+        Held { in_flight: self.clone(), key: key.to_string(), bytes: 0 }
+    }
+
+    /// All the bytes under way for `key`.
+    pub fn total(&self, key: &str) -> u64 {
+        self.0.lock().unwrap().get(key).copied().unwrap_or(0)
+    }
+}
+
+impl Held {
+    pub fn add(&mut self, bytes: u64) {
+        *self.in_flight.0.lock().unwrap().entry(self.key.clone()).or_default() += bytes;
+        self.bytes += bytes;
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut map = self.in_flight.0.lock().unwrap();
+        if let Some(n) = map.get_mut(&self.key) {
+            *n = n.saturating_sub(self.bytes);
+            if *n == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// Things under way per key, at most `max` at once each.
 #[derive(Clone, Default)]
 pub struct Turns(Arc<Mutex<HashMap<String, usize>>>);
@@ -111,28 +152,40 @@ const DECODES_AT_ONCE: usize = 2;
 /// Decoding pictures, within [`MAX_PIXELS`] each and a total budget, so a
 /// burst of big pictures waits instead of using up the memory.
 pub struct Decoding {
-    slots: tokio::sync::Semaphore,
-    pixels: tokio::sync::Semaphore,
+    slots: Arc<tokio::sync::Semaphore>,
+    pixels: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for Decoding {
     fn default() -> Self {
-        Decoding { slots: tokio::sync::Semaphore::new(DECODES_AT_ONCE), pixels: tokio::sync::Semaphore::new(PIXEL_BUDGET as usize) }
+        Decoding {
+            slots: Arc::new(tokio::sync::Semaphore::new(DECODES_AT_ONCE)),
+            pixels: Arc::new(tokio::sync::Semaphore::new(PIXEL_BUDGET as usize)),
+        }
     }
 }
 
 impl Decoding {
     /// Runs `decode` (on a blocking thread) for a `width` × `height`
-    /// picture once there's room. `None` if it's too big or failed.
+    /// picture once there's room. `None` if it's too big or failed. The
+    /// room is the blocking thread's until it's done: a request dropped
+    /// while it waits (the app hung up) doesn't stop the decode, so it
+    /// mustn't give the room back early.
     pub async fn run<T: Send + 'static>(&self, width: u32, height: u32, decode: impl FnOnce() -> Option<T> + Send + 'static) -> Option<T> {
         let pixels = u64::from(width) * u64::from(height);
         if pixels == 0 || pixels > MAX_PIXELS {
             return None;
         }
         let megapixels = pixels.div_ceil(1_000_000).min(u64::from(PIXEL_BUDGET)) as u32;
-        let _slot = self.slots.acquire().await.ok()?;
-        let _pixels = self.pixels.acquire_many(megapixels).await.ok()?;
-        tokio::task::spawn_blocking(decode).await.ok().flatten()
+        let slot = self.slots.clone().acquire_owned().await.ok()?;
+        let room = self.pixels.clone().acquire_many_owned(megapixels).await.ok()?;
+        tokio::task::spawn_blocking(move || {
+            let _held = (slot, room);
+            decode()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Megapixels free right now (for tests).
@@ -250,5 +303,49 @@ mod tests {
         assert_eq!(first.await.unwrap(), Some(1));
         assert_eq!(second.await.unwrap(), Some(2));
         assert_eq!(d.free(), PIXEL_BUDGET as usize);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_request_keeps_its_room_until_the_decode_ends() {
+        let d = Arc::new(Decoding::default());
+        let (started, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(std::sync::Barrier::new(2)));
+        let waiting = {
+            let (d, started, release) = (d.clone(), started.clone(), release.clone());
+            tokio::spawn(async move {
+                d.run(6_000, 5_000, move || {
+                    started.notify_one();
+                    release.wait();
+                    Some(())
+                })
+                .await
+            })
+        };
+        started.notified().await;
+        // The app hangs up: its request (and this future) is dropped.
+        waiting.abort();
+        let _ = waiting.await;
+        assert_eq!(d.free(), (PIXEL_BUDGET - 30) as usize, "still decoding, still counted");
+        release.wait();
+        for _ in 0..100 {
+            if d.free() == PIXEL_BUDGET as usize {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the room never came back");
+    }
+
+    #[test]
+    fn bytes_in_flight_are_counted_until_dropped() {
+        let f = InFlight::default();
+        let mut a = f.hold("u");
+        a.add(10);
+        let mut b = f.hold("u");
+        b.add(5);
+        assert_eq!((f.total("u"), f.total("v")), (15, 0));
+        drop(a);
+        assert_eq!(f.total("u"), 5);
+        drop(b);
+        assert!(f.0.lock().unwrap().is_empty());
     }
 }

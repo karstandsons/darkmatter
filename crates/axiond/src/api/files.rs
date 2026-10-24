@@ -132,7 +132,8 @@ pub struct UploadQuery {
 /// `POST files` (multipart): a `channel_id` field (or query parameter) first,
 /// then one or more `files`.
 pub async fn upload(State(app): State<App>, me: Me, Query(q): Query<UploadQuery>, mut form: Multipart) -> Result<(StatusCode, Json<UploadResult>)> {
-    let _turn = app.uploads.start(&me.user_id, UPLOADS_AT_ONCE).ok_or_else(|| Error::too_many("Too many uploads at once. Wait for the others to finish."))?;
+    let turn = app.uploads.start(&me.user_id, UPLOADS_AT_ONCE).ok_or_else(|| Error::too_many("Too many uploads at once. Wait for the others to finish."))?;
+    let turn = std::sync::Arc::new(turn);
     let mut channel = None;
     if let Some(id) = q.channel_id {
         channel = Some(upload_channel(&app, &me, &id).await?);
@@ -166,15 +167,24 @@ pub async fn upload(State(app): State<App>, me: Me, Query(q): Query<UploadQuery>
                 let name = clean_name(field.file_name().unwrap_or("file"));
                 let id = ids::new_id();
                 let path = file_path(&app, &id, Kind::Original);
-                let size = save(&app, &path, &mut field, room).await?;
-                let info = describe(&app, channel, &me.user_id, id, name, size, &path).await;
-                match info {
-                    Ok(info) => result.file_infos.push(info),
-                    Err(e) => {
+                let mut held = app.uploading.hold(&me.user_id);
+                let size = save(&app, &me.user_id, &path, &mut field, room, &mut held).await?;
+                // From here it runs to the end even if the app hangs up
+                // (which drops this request): the file is recorded (and
+                // counted, and tidied away if it's never posted), and the
+                // upload's turn lasts until its pictures are made.
+                let (app2, channel, user, turn) = (app.clone(), channel.clone(), me.user_id.clone(), turn.clone());
+                let info = tokio::spawn(async move {
+                    let info = describe(&app2, &channel, &user, id, name, size, &path).await;
+                    if info.is_err() {
                         let _ = tokio::fs::remove_file(&path).await;
-                        return Err(e);
                     }
-                }
+                    drop((held, turn));
+                    info
+                })
+                .await
+                .map_err(|_| Error::internal())?;
+                result.file_infos.push(info?);
             }
             _ => {}
         }
@@ -226,43 +236,56 @@ fn quota_full(app: &App) -> Error {
     }
 }
 
+/// A file being written, removed if it's dropped before it's done (the app
+/// hung up mid-upload).
+struct Partial<'a>(Option<&'a FsPath>);
+
+impl Drop for Partial<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Streams one part to disk, stopping at the size limit or once it would
-/// take more than `room` (what's left of the account's quota).
-async fn save(app: &App, path: &FsPath, field: &mut axum::extract::multipart::Field<'_>, room: Option<u64>) -> Result<i64> {
+/// take more than `room` (what's left of the account's quota, as stored)
+/// with what this account's other uploads are writing (`held`, counted in
+/// `app.uploading`).
+async fn save(
+    app: &App,
+    user_id: &str,
+    path: &FsPath,
+    field: &mut axum::extract::multipart::Field<'_>,
+    room: Option<u64>,
+    held: &mut crate::limits::Held,
+) -> Result<i64> {
     let limit = app.config.max_file_mb.saturating_mul(1024 * 1024);
     let dir = path.parent().ok_or_else(Error::internal)?;
     tokio::fs::create_dir_all(dir).await.map_err(io_error)?;
+    // Declared first so it goes last, after the file is closed.
+    let mut partial = Partial(Some(path));
     let mut out = tokio::fs::File::create(path).await.map_err(io_error)?;
     let mut size: u64 = 0;
     loop {
         let chunk = match tokio::time::timeout(UPLOAD_IDLE, field.chunk()).await {
             Ok(Ok(Some(chunk))) => chunk,
             Ok(Ok(None)) => break,
-            Ok(Err(_)) => {
-                drop(out);
-                let _ = tokio::fs::remove_file(path).await;
-                return Err(too_big(app));
-            }
-            Err(_) => {
-                drop(out);
-                let _ = tokio::fs::remove_file(path).await;
-                return Err(Error::bad_request("The upload stopped."));
-            }
+            Ok(Err(_)) => return Err(too_big(app)),
+            Err(_) => return Err(Error::bad_request("The upload stopped.")),
         };
         size += chunk.len() as u64;
         if size > limit {
-            drop(out);
-            let _ = tokio::fs::remove_file(path).await;
             return Err(too_big(app));
         }
-        if room.is_some_and(|room| size > room) {
-            drop(out);
-            let _ = tokio::fs::remove_file(path).await;
+        held.add(chunk.len() as u64);
+        if room.is_some_and(|room| app.uploading.total(user_id) > room) {
             return Err(quota_full(app));
         }
         out.write_all(&chunk).await.map_err(io_error)?;
     }
     out.sync_all().await.map_err(io_error)?;
+    partial.0 = None;
     Ok(size as i64)
 }
 

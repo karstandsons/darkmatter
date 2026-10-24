@@ -65,8 +65,8 @@ pub struct Config {
     /// How many custom emoji each person who isn't an admin may have added
     /// (0 = no limit).
     pub emoji_per_account: u32,
-    /// Connections open at once: HTTP(S), websockets and call media over
-    /// TCP.
+    /// HTTP(S) and websocket connections open at once. (Call media over
+    /// TCP has its own limit, of 512.)
     pub max_connections: usize,
     /// Connections open at once from one address (not counted behind a
     /// proxy, where every connection comes from the proxy).
