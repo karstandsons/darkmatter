@@ -111,6 +111,15 @@ docker compose exec axiond axiond user add sam --email sam@example.com --admin
 docker compose exec axiond axiond invite --note "for Jo"
 ```
 
+`setup` also measures the machine and sets how hard passwords are to
+check (argon2id, about a quarter of a second each). Wrong passwords for an
+account make the address they come from wait after five, doubling up to an
+hour, so someone guessing locks out only themselves; after fifty from
+everywhere together the whole account waits. A restart doesn't reset
+either count. Sessions end 90 days after signing in, however often they're
+used, and their open connections close then too. People change their own passwords in Darkmatter's Account
+window.
+
 Both admins should turn on two-factor codes for their accounts. Reports from
 people come in through `axiond reports`, and `axiond audit` shows what each
 admin did.
@@ -136,6 +145,13 @@ sudo systemctl start axiond-backup.service && journalctl -u axiond-backup -n 20
 Keep the restic password somewhere that isn't the server; both admins
 should have it. Without it the backups can't be read, by anyone.
 
+Keep **`data/secret.key`** the same way (in both admins' password
+managers, say). axiond makes it on first start and encrypts two-factor
+secrets with it; backups leave it out, so a stolen backup doesn't hold
+them. A restore without it still works, but axiond won't start until you
+put it back or turn off the codes of the people it names
+(`axiond user mfa-off <username>`).
+
 **Practise a restore** every few months on a spare machine, with Docker,
 restic, a checkout of this repository (`docker compose build` in
 `deploy/axiond` makes `axiond:local`) and copies of `/etc/axiond-backup.env`
@@ -150,7 +166,9 @@ docker run --rm -v /tmp/r:/r:ro -v /tmp/newdata:/data axiond:local \
   restore /r/opt/axiond/deploy/axiond/data/backups/axiond-<newest>.tar.gz
 ```
 
-Then point a test copy of the kit at `/tmp/newdata` and log in.
+Then copy your `secret.key` over the new one the restore made in
+`/tmp/newdata` (owned by 65532, mode 600), point a test copy of the kit at
+it and log in.
 
 ## 6. Updating
 

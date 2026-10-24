@@ -14,6 +14,8 @@ const PASSWORD: &str = "correct horse battery";
 struct Server {
     url: String,
     app: App,
+    /// The axiond serving the data folder now (`restarted` stops it).
+    running: tokio::sync::Mutex<tokio::task::JoinHandle<anyhow::Result<()>>>,
     _dir: tempfile::TempDir,
 }
 
@@ -33,8 +35,8 @@ async fn server_with(change: impl FnOnce(&mut Config)) -> Server {
     admin::add_channel(&app, "home", "rust", "Rust").await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(app.clone().serve(listener));
-    Server { url, app, _dir: dir }
+    let running = tokio::sync::Mutex::new(tokio::spawn(app.clone().serve(listener)));
+    Server { url, app, running, _dir: dir }
 }
 
 async fn login(s: &Server, name: &str) -> Client {
@@ -1093,4 +1095,277 @@ async fn plain_link_previews_are_checked() {
     assert!(alice.create_post(&post("no link here", serde_json::json!({ "url": "https://example.com/a", "title": "A" }))).await.is_err());
     let png = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x89PNG....");
     assert!(alice.create_post(&post("see https://example.com/b", serde_json::json!({ "url": "https://example.com/b", "image": png }))).await.is_err());
+}
+
+/// Stops the axiond serving the data folder and starts another on it, as a
+/// restart does. (Only one may serve a data folder at a time: the admin
+/// socket says so.)
+async fn restarted(s: &Server, change: impl FnOnce(&mut Config)) -> (String, App) {
+    let mut running = s.running.lock().await;
+    running.abort();
+    let _ = (&mut *running).await;
+    let mut config = Config { data_dir: s.app.config.data_dir.clone(), ..Config::default() };
+    change(&mut config);
+    let app = App::open(config).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    *running = tokio::spawn(app.clone().serve(listener));
+    (url, app)
+}
+
+#[tokio::test]
+async fn changing_your_password() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let laptop = login(&s, "alice").await;
+    let bob = login(&s, "bob").await;
+    let alice_id = alice.me().await.unwrap().id;
+    let new = "a much better passphrase";
+
+    assert!(alice.change_password(&alice_id, "wrong", new).await.unwrap_err().to_string().contains("current password"));
+    assert!(alice.change_password(&alice_id, PASSWORD, "short").await.unwrap_err().to_string().contains("10 characters"));
+    let theirs = bob.change_password(&alice_id, PASSWORD, new).await.unwrap_err();
+    assert!(matches!(&theirs, mm_api::Error::Api(e) if e.status_code == 403), "{theirs:?}");
+
+    alice.change_password("me", PASSWORD, new).await.unwrap();
+    assert!(laptop.me().await.unwrap_err().is_unauthorized(), "other apps are signed out");
+    alice.me().await.unwrap();
+    assert!(Client::new(&s.url).unwrap().login("alice", PASSWORD, None).await.is_err());
+    Client::new(&s.url).unwrap().login("alice", new, None).await.unwrap();
+    let log = axiond::audit::recent(&s.app.db, 5).await.unwrap();
+    assert_eq!((log[0].action.as_str(), log[0].actor.as_str()), ("user.password", "alice"));
+}
+
+#[tokio::test]
+async fn lockouts_count_the_account_and_survive_restarts() {
+    let s = server().await;
+    let try_login = |url: String, who: &'static str, password: &'static str| async move { Client::new(&url).unwrap().login(who, password, None).await };
+    // Username and email are one account: five wrong tries between them…
+    for who in ["bob", "bob@example.com", "BOB", "Bob@Example.com", "bob"] {
+        assert!(try_login(s.url.clone(), who, "wrong").await.unwrap_err().is_unauthorized());
+    }
+    // …and even the right password waits.
+    let locked = try_login(s.url.clone(), "bob@example.com", PASSWORD).await.unwrap_err();
+    assert!(matches!(&locked, mm_api::Error::Api(e) if e.status_code == 429 && e.message.contains("Try again in 1 minute")), "{locked:?}");
+    try_login(s.url.clone(), "alice", PASSWORD).await.expect("other accounts aren't locked");
+
+    // A restart doesn't unlock it.
+    let (url, _app) = restarted(&s, |_| {}).await;
+    let locked = try_login(url.clone(), "bob", PASSWORD).await.unwrap_err();
+    assert!(matches!(&locked, mm_api::Error::Api(e) if e.status_code == 429), "{locked:?}");
+
+    // Once the wait is over, the right password works and clears the count.
+    sqlx::query("UPDATE login_failures SET last_at = last_at - 31000").execute(&s.app.db).await.unwrap();
+    try_login(url, "bob", PASSWORD).await.unwrap();
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM login_failures").fetch_one(&s.app.db).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn retyping_your_password_is_throttled_like_a_login() {
+    let s = server().await;
+    let bob = login(&s, "bob").await;
+    let bob_id = bob.me().await.unwrap().id;
+    // A stolen session can't guess the password through DELETE users/me.
+    for _ in 0..5 {
+        let wrong = bob.delete_account("wrong", false).await.unwrap_err();
+        assert!(matches!(&wrong, mm_api::Error::Api(e) if e.status_code == 400), "{wrong:?}");
+    }
+    let locked = bob.delete_account(PASSWORD, false).await.unwrap_err();
+    assert!(matches!(&locked, mm_api::Error::Api(e) if e.status_code == 429), "{locked:?}");
+    bob.me().await.expect("not deleted");
+    // It's the same count as logging in and changing the password.
+    let locked = bob.change_password(&bob_id, PASSWORD, "another long password").await.unwrap_err();
+    assert!(matches!(&locked, mm_api::Error::Api(e) if e.status_code == 429), "{locked:?}");
+    let locked = Client::new(&s.url).unwrap().login("bob", PASSWORD, None).await.unwrap_err();
+    assert!(matches!(&locked, mm_api::Error::Api(e) if e.status_code == 429), "{locked:?}");
+}
+
+#[tokio::test]
+async fn sessions_have_an_absolute_lifetime() {
+    let s = server().await;
+    let day = 86_400_000i64;
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let old = login(&s, "alice").await;
+    let recent = login(&s, "alice").await;
+    let session = |c: &Client| sqlx::query_scalar::<_, String>("SELECT id FROM sessions WHERE token_hash = ?").bind(sha256_hex(c.token().unwrap()));
+    let (old_id, recent_id) = (session(&old).fetch_one(&s.app.db).await.unwrap(), session(&recent).fetch_one(&s.app.db).await.unwrap());
+
+    // Signed in 91 days ago and used every day since: still over.
+    sqlx::query("UPDATE sessions SET create_at = ?, last_activity_at = ? WHERE id = ?").bind(now() - 91 * day).bind(now() - 60 * 60_000).bind(&old_id).execute(&s.app.db).await.unwrap();
+    assert!(old.me().await.unwrap_err().is_unauthorized());
+
+    // Signed in 89 days ago: it works, but sliding stops at 90 days.
+    let created = now() - 89 * day;
+    sqlx::query("UPDATE sessions SET create_at = ?, last_activity_at = ? WHERE id = ?").bind(created).bind(now() - 60 * 60_000).bind(&recent_id).execute(&s.app.db).await.unwrap();
+    recent.me().await.unwrap();
+    let expires: i64 = sqlx::query_scalar("SELECT expires_at FROM sessions WHERE id = ?").bind(&recent_id).fetch_one(&s.app.db).await.unwrap();
+    assert_eq!(expires, created + 90 * day);
+    let listed = recent.sessions("me").await.unwrap();
+    assert_eq!(listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), [recent_id.as_str()], "the old one isn't listed");
+
+    // Housekeeping forgets the old one.
+    axiond::housekeeping::run(&s.app).await.unwrap();
+    assert!(session(&old).fetch_optional(&s.app.db).await.unwrap().is_none());
+}
+
+fn sha256_hex(token: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[tokio::test]
+async fn two_factor_secrets_are_encrypted_at_rest() {
+    let s = server().await;
+    let alice = login(&s, "alice").await;
+    let alice_id = alice.me().await.unwrap().id;
+    let secret = alice.mfa_generate(&alice_id).await.unwrap().secret;
+    let stored = |id: String| sqlx::query_scalar::<_, String>("SELECT mfa_secret FROM users WHERE id = ?").bind(id);
+    let sealed = stored(alice_id.clone()).fetch_one(&s.app.db).await.unwrap();
+    assert!(sealed.starts_with("enc1:") && !sealed.contains(&secret), "{sealed}");
+    let totp = |secret: &str| totp_rs::Builder::new().with_secret(totp_rs::Secret::try_from_base32(secret).unwrap()).build().unwrap();
+    let unix = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    alice.mfa_activate(&alice_id, true, &totp(&secret).generate_current().to_string()).await.unwrap();
+    Client::new(&s.url).unwrap().login("alice", PASSWORD, Some(&totp(&secret).generate(unix() + 30).to_string())).await.unwrap();
+
+    // A secret stored in plaintext by an older axiond is encrypted when the
+    // server starts, and still works.
+    let bob_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'bob'").fetch_one(&s.app.db).await.unwrap();
+    let plain = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+    sqlx::query("UPDATE users SET mfa_secret = ?, mfa_active = 1 WHERE id = ?").bind(plain).bind(&bob_id).execute(&s.app.db).await.unwrap();
+    let (url, app) = restarted(&s, |_| {}).await;
+    assert!(stored(bob_id.clone()).fetch_one(&s.app.db).await.unwrap().starts_with("enc1:"));
+    Client::new(&url).unwrap().login("bob", PASSWORD, Some(&totp(plain).generate_current().to_string())).await.unwrap();
+    assert!(app.unreadable_two_factor().await.unwrap().is_empty());
+
+    // Backups leave the key out, so a stolen backup doesn't open them.
+    assert!(s.app.config.data_dir.join("secret.key").exists());
+    let out = tempfile::tempdir().unwrap();
+    let backup = axiond::backup::create(&s.app.db, &s.app.config.data_dir, out.path()).await.unwrap();
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(std::fs::File::open(backup).unwrap()));
+    let names: Vec<String> = tar.entries().unwrap().map(|e| e.unwrap().path().unwrap().display().to_string()).collect();
+    assert!(names.contains(&"axiond.db".to_string()) && !names.iter().any(|n| n.contains("secret")), "{names:?}");
+
+    // With another key (a restore without secret.key) nothing opens, and
+    // the server says whose codes need turning off.
+    let other = tempfile::tempdir().unwrap();
+    let key_file = other.path().join("other.key");
+    let (url, app) = restarted(&s, |c| c.secret_key_file = Some(key_file.clone())).await;
+    assert!(key_file.exists(), "made where secret_key_file says");
+    let mut lost = app.unreadable_two_factor().await.unwrap();
+    lost.sort();
+    assert_eq!(lost, ["alice", "bob"]);
+    assert!(Client::new(&url).unwrap().login("alice", PASSWORD, Some(&totp(&secret).generate(unix() + 60).to_string())).await.is_err());
+}
+
+#[tokio::test]
+async fn password_hashing_is_tuned_and_old_hashes_are_redone() {
+    let s = server().await;
+    async fn hash(app: &App) -> String {
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE username = 'alice'").fetch_one(&app.db).await.unwrap()
+    }
+    assert!(!s.app.passwords_tuned().await.unwrap());
+    assert!(hash(&s.app).await.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"), "untuned: OWASP's minimum");
+
+    let chosen = s.app.tune_passwords().await.unwrap();
+    assert!(s.app.passwords_tuned().await.unwrap());
+    let cost: Vec<u32> = chosen.split(',').map(|kv| kv.split_once('=').unwrap().1.parse().unwrap()).collect();
+    assert!(cost == [19456, 2, 1] || (cost[0] == 65536 && cost[1] >= 1), "{chosen}");
+    // New passwords use it at once.
+    admin::set_password(&s.app, "bob", "bob's new password").await.unwrap();
+    let bob: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE username = 'bob'").fetch_one(&s.app.db).await.unwrap();
+    assert!(bob.starts_with(&format!("$argon2id$v=19${chosen}$")), "{bob}");
+
+    // Stored hashes at another cost are redone at the next login.
+    sqlx::query("UPDATE settings SET v = 'm=19456,t=3,p=1' WHERE k = 'argon2'").execute(&s.app.db).await.unwrap();
+    let (url, app) = restarted(&s, |_| {}).await;
+    Client::new(&url).unwrap().login("alice", PASSWORD, None).await.unwrap();
+    assert!(hash(&app).await.starts_with("$argon2id$v=19$m=19456,t=3,p=1$"));
+    Client::new(&url).unwrap().login("alice", PASSWORD, None).await.expect("the new hash verifies");
+}
+
+/// What reaches a socket in the next `secs` seconds.
+async fn arrivals(stream: &mut ws::EventStream, secs: u64) -> Vec<Message> {
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while let Ok(Some(m)) = tokio::time::timeout_at(deadline, stream.next()).await {
+        got.push(m);
+    }
+    got
+}
+
+#[tokio::test]
+async fn a_burst_of_password_guesses_gets_five() {
+    let s = server().await;
+    let bob = login(&s, "bob").await;
+    let bob_id = bob.me().await.unwrap().id;
+    // A stolen session sends 40 guesses at once.
+    let tries = futures_util::future::join_all((0..40).map(|i| {
+        let (bob, bob_id) = (&bob, &bob_id);
+        async move { bob.change_password(bob_id, &format!("guess {i}"), "another long password").await.unwrap_err() }
+    }))
+    .await;
+    let status = |e: &mm_api::Error| match e {
+        mm_api::Error::Api(a) => a.status_code,
+        other => panic!("{other:?}"),
+    };
+    let checked = tries.iter().filter(|e| status(e) == 400).count();
+    assert!(checked <= 5, "only five are checked, got {checked}");
+    assert!(tries.iter().all(|e| matches!(status(e), 400 | 429)));
+    let counted: i64 = sqlx::query_scalar("SELECT count FROM login_failures WHERE k = ?").bind(&bob_id).fetch_one(&s.app.db).await.unwrap();
+    assert_eq!(counted as usize, checked);
+}
+
+#[tokio::test]
+async fn an_open_socket_ends_with_its_session() {
+    let s = server().await;
+    let day = 86_400_000i64;
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let alice = login(&s, "alice").await;
+    let team = alice.my_teams().await.unwrap()[0].id.clone();
+    let town = alice.my_channels(&team).await.unwrap().into_iter().find(|c| c.name == "town-square").unwrap().id;
+    let token_hash = |c: &Client| sha256_hex(c.token().unwrap());
+
+    // Past the limit while connected: housekeeping deletes the session and
+    // closes its socket, so later events don't reach it.
+    let bob = login(&s, "bob").await;
+    let mut events = ws::connect(&bob).unwrap();
+    assert!(matches!(events.next().await, Some(Message::Connected { .. })));
+    sqlx::query("UPDATE sessions SET create_at = ? WHERE token_hash = ?").bind(now() - 91 * day).bind(token_hash(&bob)).execute(&s.app.db).await.unwrap();
+    axiond::housekeeping::run(&s.app).await.unwrap();
+    alice.create_post(&NewPost { channel_id: town.clone(), message: "after expiry".into(), ..Default::default() }).await.unwrap();
+    let got = arrivals(&mut events, 3).await;
+    assert!(got.contains(&Message::Disconnected), "{got:?}");
+    assert!(!got.iter().any(|m| matches!(m, Message::Event(Event::Posted { .. }))), "{got:?}");
+
+    // A socket closes at its session's limit by itself, without waiting
+    // for housekeeping.
+    let carol = login(&s, "bob").await;
+    sqlx::query("UPDATE sessions SET create_at = ? WHERE token_hash = ?").bind(now() - 90 * day + 2_000).bind(token_hash(&carol)).execute(&s.app.db).await.unwrap();
+    let mut events = ws::connect(&carol).unwrap();
+    assert!(matches!(events.next().await, Some(Message::Connected { .. })));
+    let got = arrivals(&mut events, 5).await;
+    assert!(got.contains(&Message::Disconnected), "{got:?}");
+    alice.create_post(&NewPost { channel_id: town, message: "after the limit".into(), ..Default::default() }).await.unwrap();
+    let got = arrivals(&mut events, 2).await;
+    assert!(!got.iter().any(|m| matches!(m, Message::Event(Event::Posted { .. }))), "{got:?}");
+}
+
+#[tokio::test]
+async fn a_guesser_locks_out_only_their_own_address() {
+    let s = server_with(|c| c.behind_proxy = true).await;
+    let http = reqwest::Client::new();
+    let try_login = |from: &'static str, password: &'static str| {
+        http.post(format!("{}/api/v4/users/login", s.url))
+            .header("x-forwarded-for", from)
+            .json(&serde_json::json!({ "login_id": "bob", "password": password }))
+            .send()
+    };
+    // Someone who only knows Bob's username guesses until they're made to wait…
+    for _ in 0..5 {
+        assert_eq!(try_login("203.0.113.9", "wrong").await.unwrap().status(), 401);
+    }
+    assert_eq!(try_login("203.0.113.9", PASSWORD).await.unwrap().status(), 429);
+    // …but Bob, somewhere else, still signs in.
+    assert_eq!(try_login("198.51.100.1", PASSWORD).await.unwrap().status(), 200);
+    assert_eq!(try_login("203.0.113.9", PASSWORD).await.unwrap().status(), 429, "the guesser still waits");
 }

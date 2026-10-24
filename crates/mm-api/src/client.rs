@@ -374,6 +374,12 @@ impl Client {
         self.send_unit(Method::PUT, &format!("users/{user_id}/mfa"), Some(&body)).await
     }
 
+    /// Changes your password; the server signs your other apps out.
+    pub async fn change_password(&self, user_id: &str, current: &str, new: &str) -> Result<(), Error> {
+        let body = json!({ "current_password": current, "new_password": new });
+        self.send_unit(Method::PUT, &format!("users/{user_id}/password"), Some(&body)).await
+    }
+
     /// People you've blocked (axiond).
     pub async fn blocked(&self) -> Result<Vec<Id>, Error> {
         self.get("users/me/blocked").await

@@ -149,6 +149,20 @@ async fn main() -> anyhow::Result<()> {
             config.check_transport()?;
             let listener = tokio::net::TcpListener::bind(config.listen).await.with_context(|| format!("listening on {}", config.listen))?;
             let app = App::open(config).await?;
+            let lost = app.unreadable_two_factor().await?;
+            if !lost.is_empty() {
+                bail!(
+                    "the secret key in {} isn't the one these people's two-factor secrets were encrypted with: {}. \
+                     Put the right secret.key back (it isn't in backups), or turn their codes off with \
+                     `axiond user mfa-off <username>` so they can sign in and set them up again.",
+                    app.config.secret_key_path().display(),
+                    lost.join(", ")
+                );
+            }
+            // A server set up before tuning existed gets tuned on its first start.
+            if !app.passwords_tuned().await? {
+                tracing::info!("password hashing tuned to this machine: argon2id {}", app.tune_passwords().await?);
+            }
             let users: i64 = sqlx_count(&app).await?;
             if users == 0 {
                 tracing::warn!("no one can log in yet: run `axiond setup` to make the first admin");
@@ -163,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Setup { admin, email, team, team_name } => {
             let app = App::open(config).await?;
             let password = new_password(&admin)?;
+            println!("Password hashing tuned to this machine: argon2id {}.", app.tune_passwords().await?);
             let display = team_name.unwrap_or_else(|| team.clone());
             admin::setup(&app, NewUser { username: admin.clone(), email, password }, &team, &display).await?;
             println!("Set up team {display} with admin {admin}. Start the server with `axiond`.");

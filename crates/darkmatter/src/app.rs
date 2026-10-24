@@ -943,6 +943,9 @@ impl App {
                 return ControlFlow::Continue(Message::Recovered(r));
             }
             Message::Escape if open => account::Msg::Close,
+            Message::Key(keyboard::Event::KeyPressed { key: Key::Named(Named::Tab), modifiers, .. }) if open => {
+                return ControlFlow::Break(account::tab(modifiers.shift()));
+            }
             // Swallow keys so the chat doesn't react (typing goes to its text boxes).
             Message::Key(_) if open => return ControlFlow::Break(Task::none()),
             other => return ControlFlow::Continue(other),

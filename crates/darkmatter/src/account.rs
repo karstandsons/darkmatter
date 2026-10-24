@@ -1,6 +1,6 @@
 //! The Account window: your signed-in apps, encryption (linking a new
-//! device), two-factor codes, the people you've blocked, and deleting your
-//! account. Encryption and the last two exist only on axiond.
+//! device), two-factor codes, your password, the people you've blocked, and
+//! deleting your account. Encryption and the last two exist only on axiond.
 
 use iced::widget::{Column, button, center, checkbox, column, container, image, mouse_area, opaque, row, scrollable, space, text, text_input};
 use iced::{Background, Border, Color, Element, Length, Task, Theme};
@@ -12,6 +12,11 @@ use crate::style::{Colors, bold};
 
 pub const CODE: &str = "account-code";
 pub const LINK_CODE: &str = "account-link-code";
+pub const CURRENT_PASSWORD: &str = "account-current-password";
+pub const NEW_PASSWORD: &str = "account-new-password";
+pub const NEW_PASSWORD_AGAIN: &str = "account-new-password-again";
+/// The password form's boxes, in Tab order.
+const PASSWORD_BOXES: [&str; 3] = [CURRENT_PASSWORD, NEW_PASSWORD, NEW_PASSWORD_AGAIN];
 
 #[derive(Debug, Clone)]
 pub enum Msg {
@@ -28,6 +33,16 @@ pub enum Msg {
     Code(String),
     MfaConfirm,
     Unblock(String),
+    /// Changing your password: the form, its three boxes, and saving.
+    PasswordForm,
+    OldPassword(String),
+    NewPassword(String),
+    NewPasswordAgain(String),
+    ChangePassword,
+    /// Tab (or Shift+Tab, `back`) from the box that has the keyboard.
+    Tab(iced::widget::Id, bool),
+    /// The new password was taken (or why not).
+    PasswordChanged(Result<(), String>),
     Password(String),
     DeleteMessages(bool),
     /// First press asks to confirm, the second deletes.
@@ -89,6 +104,9 @@ pub struct Account {
     loaded: Option<Loaded>,
     mfa: Mfa,
     code: String,
+    /// Changing the password: the form is open, and current, new, again.
+    password_form: bool,
+    new_password: (String, String, String),
     password: String,
     delete_messages: bool,
     confirm_delete: bool,
@@ -176,6 +194,8 @@ pub fn update(state: &mut Option<Account>, client: &Client, axiond: bool, crypto
             loaded: None,
             mfa: Mfa::Idle,
             code: String::new(),
+            password_form: false,
+            new_password: Default::default(),
             password: String::new(),
             delete_messages: false,
             confirm_delete: false,
@@ -273,6 +293,48 @@ pub fn update(state: &mut Option<Account>, client: &Client, axiond: bool, crypto
                 c.set_blocked(&user, false).await.map_err(|e| e.to_string())?;
                 Ok("Unblocked.".to_string())
             })
+        }
+        Msg::PasswordForm => {
+            a.password_form = !a.password_form;
+            a.new_password = Default::default();
+            if a.password_form { iced::widget::operation::focus(CURRENT_PASSWORD) } else { Task::none() }
+        }
+        Msg::OldPassword(p) => {
+            a.new_password.0 = p;
+            Task::none()
+        }
+        Msg::NewPassword(p) => {
+            a.new_password.1 = p;
+            Task::none()
+        }
+        Msg::NewPasswordAgain(p) => {
+            a.new_password.2 = p;
+            Task::none()
+        }
+        Msg::ChangePassword => {
+            a.busy = true;
+            let (c, current, new) = (a.client.clone(), a.new_password.0.clone(), a.new_password.1.clone());
+            Task::perform(async move { c.change_password(&me, &current, &new).await.map_err(|e| e.to_string()) }, |r| {
+                Message::Account(Msg::PasswordChanged(r))
+            })
+        }
+        Msg::Tab(from, back) => {
+            let Some(i) = PASSWORD_BOXES.iter().position(|b| iced::widget::Id::new(b) == from) else { return (Task::none(), false) };
+            iced::widget::operation::focus(PASSWORD_BOXES[next_box(i, back)])
+        }
+        Msg::PasswordChanged(Ok(())) => {
+            a.password_form = false;
+            a.new_password = Default::default();
+            // axiond signs the other apps out; the list reloads to show it.
+            let note = if a.axiond { "Password changed. Your other apps were signed out." } else { "Password changed." };
+            Task::done(Message::Account(Msg::Done(Ok(note.into()))))
+        }
+        Msg::PasswordChanged(Err(e)) => {
+            // The form stays, so a typo in the current one is quick to fix.
+            a.busy = false;
+            a.new_password.0.clear();
+            a.status = Some((true, e));
+            iced::widget::operation::focus(CURRENT_PASSWORD)
         }
         Msg::Password(p) => {
             a.password = p;
@@ -528,6 +590,7 @@ impl Account {
             Mfa::Stopping => column![text("Enter a current code to turn two-factor codes off.").size(13), self.code_row(c, "Turn off")].spacing(8).into(),
         };
         body = body.push(column![heading(c, "Two-factor codes"), mfa].spacing(8));
+        body = body.push(column![heading(c, "Password"), self.password_view(c)].spacing(8));
 
         if self.axiond {
             // Blocked people.
@@ -564,6 +627,61 @@ impl Account {
             );
         }
         self.frame(body, c)
+    }
+
+    /// Changing your password: the current one, then the new one twice.
+    fn password_view<'a>(&'a self, c: Colors) -> Element<'a, Message> {
+        let busy = self.busy;
+        if !self.password_form {
+            let note = if self.axiond { "Changing it signs your other apps out." } else { "Change the password you sign in with." };
+            return row![text(note).size(13).color(c.muted).width(Length::Fill), small(c, "Change…", (!busy).then_some(Message::Account(Msg::PasswordForm)))]
+                .align_y(iced::Center)
+                .into();
+        }
+        let (current, new, again) = &self.new_password;
+        let ok = !busy && password_ready(current, new, again);
+        let hint = if !again.is_empty() && new != again {
+            "The new passwords don't match."
+        } else if self.axiond {
+            "At least 10 characters; a few unusual words are best."
+        } else {
+            "A few unusual words are best."
+        };
+        column![
+            text_input("Current password", current)
+                .id(CURRENT_PASSWORD)
+                .secure(true)
+                .on_input(|p| Message::Account(Msg::OldPassword(p)))
+                .on_submit_maybe(ok.then_some(Message::Account(Msg::ChangePassword)))
+                .padding(8)
+                .size(13)
+                .style(c.input()),
+            text_input("New password", new)
+                .id(NEW_PASSWORD)
+                .secure(true)
+                .on_input(|p| Message::Account(Msg::NewPassword(p)))
+                .on_submit_maybe(ok.then_some(Message::Account(Msg::ChangePassword)))
+                .padding(8)
+                .size(13)
+                .style(c.input()),
+            row![
+                text_input("New password again", again)
+                    .id(NEW_PASSWORD_AGAIN)
+                    .secure(true)
+                    .on_input(|p| Message::Account(Msg::NewPasswordAgain(p)))
+                    .on_submit_maybe(ok.then_some(Message::Account(Msg::ChangePassword)))
+                    .padding(8)
+                    .size(13)
+                    .style(c.input()),
+                small(c, "Save", ok.then_some(Message::Account(Msg::ChangePassword))),
+                small(c, "Cancel", (!busy).then_some(Message::Account(Msg::PasswordForm))),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+            text(hint).size(12).color(if new != again && !again.is_empty() { c.yellow } else { c.muted }),
+        ]
+        .spacing(6)
+        .into()
     }
 
     /// Linking a new device from this one: type its code, check it's the
@@ -731,8 +849,41 @@ impl Account {
     }
 }
 
+/// Tab moves through the password form's boxes, around at the ends.
+pub fn tab(back: bool) -> Task<Message> {
+    iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::find_focused()).map(move |id| Message::Account(Msg::Tab(id, back)))
+}
+
+fn next_box(i: usize, back: bool) -> usize {
+    let n = PASSWORD_BOXES.len();
+    if back { (i + n - 1) % n } else { (i + 1) % n }
+}
+
+/// Whether the form can be sent: the current password, and a new one typed
+/// the same twice. The server has the final say on how long it must be.
+fn password_ready(current: &str, new: &str, again: &str) -> bool {
+    !current.is_empty() && !new.is_empty() && new == again && new != current
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tab_goes_round_the_password_boxes() {
+        use super::next_box;
+        assert_eq!([next_box(0, false), next_box(1, false), next_box(2, false)], [1, 2, 0]);
+        assert_eq!([next_box(0, true), next_box(1, true), next_box(2, true)], [2, 0, 1]);
+    }
+
+    #[test]
+    fn the_password_form_needs_the_new_one_twice() {
+        use super::password_ready;
+        assert!(password_ready("old", "a new password", "a new password"));
+        assert!(!password_ready("", "a new password", "a new password"), "the current one");
+        assert!(!password_ready("old", "a new password", "a new pasword"), "typed the same");
+        assert!(!password_ready("old", "", ""));
+        assert!(!password_ready("same", "same", "same"), "a new one");
+    }
+
     #[test]
     fn qr_codes_are_square_images() {
         assert!(super::qr("otpauth://totp/axiond:alice?secret=JBSWY3DPEHPK3PXP&issuer=axiond").is_some());
